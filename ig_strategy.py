@@ -75,26 +75,56 @@ class Strategy:
 
         Retrieves OHLC data for the configured epic and resolution, then
         calculates RSI, EMA, ATR, and Bollinger Bands using TA-Lib.
-        The result is stored in self.candles.
+        The result is stored in self.candles and also returned.
+
+        On a successful fetch the internal cache (self.candles) is updated
+        and the new DataFrame is returned. If self.ig.get_candles() returns
+        None explicitly the cache is NOT updated — the existing cached value
+        is returned unchanged.
+
+        On any exception the error is logged with a full traceback and the
+        existing cache is returned. If the cache is still an empty DataFrame
+        (no prior successful fetch) the run() loop will skip the cycle via
+        the self.candles.empty check.
+
+        Returns:
+            The current (possibly cached) candle DataFrame. May be an empty
+            DataFrame when no cache exists and the fetch fails.
         """
-        df = self.ig.get_candles(self.epic, '15min', self.lookback).copy()
+        try:
+            df = self.ig.get_candles(self.epic, "15min", self.lookback)
 
-        df['rsi'] = ta.RSI(df["Close"], timeperiod=self.rsi_period)
-        logger.info(f"RSI calculated: period={self.rsi_period}")
+            if df is not None:
+                df = df.copy()
 
-        df['ema'] = ta.EMA(df["Close"], timeperiod=self.ema_period)
-        logger.info(f"EMA calculated: period={self.ema_period}")
+                df["rsi"] = ta.RSI(df["Close"], timeperiod=self.rsi_period)
+                logger.info(f"RSI calculated: period={self.rsi_period}")
 
-        df['atr'] = ta.ATR(df["High"], df["Low"], df["Close"], timeperiod=self.atr_period)
-        logger.info(f"ATR calculated: period={self.atr_period}")
+                df["ema"] = ta.EMA(df["Close"], timeperiod=self.ema_period)
+                logger.info(f"EMA calculated: period={self.ema_period}")
 
-        df['bb_upper'], df['bb_middle'], df['bb_lower'] = ta.BBANDS(
-            df["Close"], timeperiod=self.bb_period,
-            nbdevup=self.bb_dev, nbdevdn=self.bb_dev, matype=0
-        )
-        logger.info(f"BBANDS calculated: period={self.bb_period}")
+                df["atr"] = ta.ATR(
+                    df["High"], df["Low"], df["Close"], timeperiod=self.atr_period
+                )
+                logger.info(f"ATR calculated: period={self.atr_period}")
 
-        self.candles = df.tail(self.lookback)
+                df["bb_upper"], df["bb_middle"], df["bb_lower"] = ta.BBANDS(
+                    df["Close"],
+                    timeperiod=self.bb_period,
+                    nbdevup=self.bb_dev,
+                    nbdevdn=self.bb_dev,
+                    matype=0,
+                )
+                logger.info(f"BBANDS calculated: period={self.bb_period}")
+
+                self.candles = df.tail(self.lookback)
+
+            return self.candles
+        except Exception as e:
+            logger.error(
+                "Candle fetch failed — using cached data: %s", e, exc_info=True
+            )
+            return self.candles
 
     def manage_positions(self):
         """Evaluate signals and manage the open position grid.
@@ -138,17 +168,24 @@ class Strategy:
 
         # Fetch live account state from the broker
         account_info = self.ig.get_account_summary()
-        open_pnl = account_info['profitLoss']
+        if not account_info:
+            logger.warning("Account data unavailable — skipping cycle")
+            return
+
+        open_pnl = account_info.get("profitLoss", 0.0)
 
         # --- 1. RISK & EQUITY (DEMO vs LIVE) ---
         if self.is_live_account:
             # LIVE mode: trust broker numbers directly
-            current_equity = account_info['balance'] + open_pnl
-            free_margin = account_info['available']
+            current_equity = account_info.get("balance", 0.0) + open_pnl
+            free_margin = account_info.get("available", 0.0)
         else:
             # DEMO mode: mirror realized P&L onto the simulated capital to
             # enforce strict 1:20 leverage against initial_cash_balance
-            realized_profit = account_info['balance'] - self.demo_starting_balance
+            realized_profit = (
+                account_info.get("balance", self.demo_starting_balance)
+                - self.demo_starting_balance
+            )
             virtual_balance = self.initial_cash_balance + realized_profit
 
             current_equity = virtual_balance + open_pnl
@@ -325,10 +362,44 @@ class Strategy:
                 IGClient.get_open_positions().
             reason: Label string logged with each close (e.g. 'BasketTP').
         """
+        failed = []
         for p in positions:
-            close_direction = 'SELL' if p['direction'] == 'BUY' else 'BUY'
-            self.ig.close_position(p['dealId'], close_direction, p['size'])
-            logger.info(f"Closing {p['dealId']} ({p['direction']}) -> {close_direction} reason={reason}")
+            deal_id = p.get("dealId", "unknown")
+            close_direction = "SELL" if p["direction"] == "BUY" else "BUY"
+            last_exc = None
+            for attempt in range(1, 4):
+                try:
+                    self.ig.close_position(deal_id, close_direction, p["size"])
+                    logger.info(
+                        f"Closing {deal_id} ({p['direction']}) -> {close_direction}"
+                        f" reason={reason}"
+                    )
+                    last_exc = None
+                    break
+                except Exception as e:
+                    last_exc = e
+                    logger.warning(
+                        "Close attempt %d/3 failed for position %s: %s",
+                        attempt,
+                        deal_id,
+                        e,
+                    )
+                    if attempt < 3:
+                        time.sleep(2 ** (attempt - 1))  # 1s, 2s
+
+            if last_exc is not None:
+                logger.error(
+                    "All 3 close attempts failed for position %s: %s",
+                    deal_id,
+                    last_exc,
+                    exc_info=True,
+                )
+                failed.append(deal_id)
+
+        if failed:
+            logger.warning(
+                "Could not close %d position(s) after retries: %s", len(failed), failed
+            )
 
     def log_account_status(self):
         """Log a structured account snapshot to the configured logger.
@@ -340,19 +411,26 @@ class Strategy:
         """
         try:
             account_info = self.ig.get_account_summary()
-            open_pnl = account_info['profitLoss']
+            if not account_info:
+                logger.warning("Account data unavailable — skipping status log")
+                return
+
+            open_pnl = account_info.get("profitLoss", 0.0)
             positions = self.ig.get_open_positions()
             n_trades = len(positions) if positions else 0
 
             if self.is_live_account:
                 # LIVE mode: use raw broker figures
-                current_equity = account_info['balance'] + open_pnl
-                used_margin = account_info['margin']
-                free_margin = account_info['available']
+                current_equity = account_info.get("balance", 0.0) + open_pnl
+                used_margin = account_info.get("margin", 0.0)
+                free_margin = account_info.get("available", 0.0)
                 modo = "LIVE"
             else:
                 # DEMO mode: strict 1:20 virtual simulation against initial_cash_balance
-                realized_profit = account_info['balance'] - self.demo_starting_balance
+                realized_profit = (
+                    account_info.get("balance", self.demo_starting_balance)
+                    - self.demo_starting_balance
+                )
                 virtual_balance = self.initial_cash_balance + realized_profit
 
                 current_equity = virtual_balance + open_pnl
@@ -407,15 +485,24 @@ class Strategy:
 
             if now.minute % freq == 0:
                 logger.info(f"Strategy execution at {now.strftime('%H:%M:%S')}")
-                self.get_candles()
+                try:
+                    self.get_candles()
 
-                if self.candles.empty:
-                    logger.info("No candles available to trade.")
-                else:
-                    logger.info("Last 5 candles.\n%s", self.candles.tail(5).to_string())
-                    self.manage_positions()
-
-                    # Log account snapshot after every cycle
-                    self.log_account_status()
+                    if not self.candles.empty:
+                        logger.info(
+                            "Last 5 candles.\n%s", self.candles.tail(5).to_string()
+                        )
+                        self.manage_positions()
+                        self.log_account_status()
+                    else:
+                        logger.info("No candles available — skipping cycle.")
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    logger.error(
+                        "Trading cycle failed — will retry next tick: %s",
+                        e,
+                        exc_info=True,
+                    )
 
             next_tick += timedelta(minutes=1)

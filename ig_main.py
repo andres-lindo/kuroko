@@ -112,6 +112,11 @@ def main():
     Reads the partition_key from the command line, loads parameters from
     Azure Table Storage, attaches Azure Blob log shipping, and then runs
     the strategy until interrupted.
+
+    If Azure Table Storage is unreachable or load_params() raises for any
+    reason, a CRITICAL log entry is written with the full traceback and the
+    process exits with code 1. No IGClient or Strategy initialisation is
+    attempted in that case.
     """
     # The partition key selects the Azure Table row set for this deployment
     parser = argparse.ArgumentParser(description="Start the trading bot")
@@ -121,9 +126,18 @@ def main():
     )
     args = parser.parse_args()
 
-    # Load all strategy parameters from Azure Table Storage
-    params = load_params(args.partition_key)
-    logging.info("Parameters loaded.")
+    # Load all strategy parameters from Azure Table Storage.
+    # A failure here is fatal — the bot cannot trade without its configuration.
+    try:
+        params = load_params(args.partition_key)
+        logging.info("Parameters loaded.")
+    except Exception as e:
+        logging.critical(
+            "Failed to load configuration from Azure Table Storage: %s",
+            e,
+            exc_info=True,
+        )
+        sys.exit(1)
 
     # Attach Azure Blob log handler so logs are shipped to cloud storage
     try:

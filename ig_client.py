@@ -4,6 +4,7 @@ Wraps the trading_ig library to provide authenticated REST API access,
 exponential-backoff retries, and a two-tier candle cache (in-memory +
 parquet on disk) that minimises API calls across restarts.
 """
+import json
 import os
 import logging
 import pandas as pd
@@ -80,21 +81,35 @@ class IGClient:
             ConnectionError: If all retry attempts are exhausted.
             RequestException: If all retry attempts are exhausted.
             IGException: If all retry attempts are exhausted.
+            json.JSONDecodeError: If all retry attempts are exhausted on an
+                empty/malformed HTTP body. Session refresh is NOT triggered
+                for this error type — it is a content error, not an auth error.
             Exception: For any unexpected error not covered by the retry logic.
         """
         for attempt in range(max_retries):
             try:
                 return func(*args, **kwargs)
-            except (ConnectionError, RequestException, IGException) as e:
-                # Refresh the session when the token has expired
-                if "token" in str(e).lower():
-                    log.warning("Token expired. Refreshing session...")
-                    try:
-                        self._svc.create_session()
-                        log.info("Session refreshed successfully.")
-                        continue  # Retry with the new session
-                    except Exception as refresh_error:
-                        log.error(f"Error refreshing session: {refresh_error}")
+            except (
+                ConnectionError,
+                RequestException,
+                IGException,
+                json.JSONDecodeError,
+            ) as e:
+                # Session refresh is only valid for connection/auth errors.
+                # json.JSONDecodeError indicates an empty body from the server
+                # (e.g. during a maintenance window) — refreshing the session
+                # would be incorrect and could trigger spurious re-auth.
+                if not isinstance(e, json.JSONDecodeError):
+                    if "token" in str(e).lower():
+                        log.warning("Token expired. Refreshing session...")
+                        try:
+                            self._svc.create_session()
+                            log.info("Session refreshed successfully.")
+                            continue  # Retry with the new session
+                        except Exception as refresh_error:
+                            log.error(
+                                "Error refreshing session: %s", refresh_error
+                            )
 
                 log.debug(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}")
 
@@ -163,7 +178,9 @@ class IGClient:
 
         Returns:
             DataFrame with columns Open/High/Low/Close and a datetime index,
-            containing at most num_points rows.
+            containing at most num_points rows. Returns None when the initial
+            load fails after all retries — callers must handle None explicitly
+            and treat it as "no data available for this tick."
         """
         cache_key = f"{epic}_{res}"
 
@@ -182,24 +199,30 @@ class IGClient:
         if cache_key not in self.candles_cache or self.candles_cache[cache_key].empty:
             log.info(f"Initial load: fetching {num_points} candles for {epic} {res}")
 
-            resp = self._safe_api_call(
-                self._svc.fetch_historical_prices_by_epic_and_num_points,
-                epic, res, num_points + 1  # Fetch one extra in case the last candle is incomplete
-            )
-            df = resp['prices']['bid']
-
-            # Drop the current (incomplete) candle if present
-            df = self._remove_incomplete_candle(df, res)
-
-            self.candles_cache[cache_key] = df
-
-            # Persist to disk so the cache survives restarts
             try:
-                df.to_parquet(self.cache_dir / f"{cache_key}.parquet")
-            except Exception as e:
-                log.warning(f"Error saving cache to disk: {e}")
+                resp = self._safe_api_call(
+                    self._svc.fetch_historical_prices_by_epic_and_num_points,
+                    epic,
+                    res,
+                    num_points + 1,  # one extra to guard against an incomplete bar
+                )
+                df = resp["prices"]["bid"]
 
-            return df.tail(num_points).copy()
+                # Drop the current (incomplete) candle if present
+                df = self._remove_incomplete_candle(df, res)
+
+                self.candles_cache[cache_key] = df
+
+                # Persist to disk so the cache survives restarts
+                try:
+                    df.to_parquet(self.cache_dir / f"{cache_key}.parquet")
+                except Exception as e:
+                    log.warning(f"Error saving cache to disk: {e}")
+
+                return df.tail(num_points).copy()
+            except Exception as e:
+                log.error("Initial candle load failed: %s", e, exc_info=True)
+                return None
 
         # Incremental update: fetch only the 3 most recent candles
         existing_df = self.candles_cache[cache_key]
