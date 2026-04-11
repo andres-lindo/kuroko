@@ -1,78 +1,123 @@
-# Set Up Python Virtual Environment (Windows)
-```sh
-C:\Python311\python.exe -m venv venv  # Create a virtual environment named 'venv'
-.\venv\Scripts\activate               # Activate the virtual environment
-python -m pip install --upgrade pip   # Upgrade pip to the latest version
-pip install -r requirements.txt       # Install required dependencies
-```
+# Backtest & Optimization
+
+Standalone module for historical strategy validation and parameter optimization. Runs in its **own isolated virtual environment** — do not share the root venv with this module, as the dependency versions are intentionally different (e.g. `pandas 1.5.3`, `numpy 1.26.4`).
 
 ---
 
-# Install Python 3.11 on Amazon Linux 2023
-```sh
-sudo dnf install -y python3.11  # Install Python 3.11
-sudo alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1  # Set Python 3.11 as an alternative
-sudo alternatives --config python3  # Select Python 3.11 as the default version
+## Prerequisites
+
+- Python 3.11
+- TA-Lib system library
+
+**macOS**
+```bash
+brew install ta-lib
 ```
 
-# Install pip for Python 3.11 on Amazon Linux 2023
-```sh
-curl -O https://bootstrap.pypa.io/get-pip.py  # Download get-pip.py script
-python3.11 get-pip.py --user  # Install pip for Python 3.11
+**Linux (Debian/Ubuntu)**
+```bash
+sudo apt-get install libta-lib-dev
 ```
 
-# Install dependencies on Amazon Linux 2023
-```sh
-python -m pip install --upgrade pip   # Upgrade pip to the latest version
-pip install -r requirements-linux.txt
+**Windows** — install the prebuilt wheel manually before the rest of the dependencies (see Setup below).
+
+---
+
+## Setup
+
+Create and activate a dedicated virtual environment from inside this directory.
+
+**macOS / Linux**
+```bash
+cd backtest
+python3.11 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
-# Invoke Backtesting
-```sh
+**Windows**
+```powershell
+cd backtest
+C:\Python311\python.exe -m venv venv
+.\venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install https://github.com/cgohlke/talib-build/releases/download/v0.6.8/ta_lib-0.6.8-cp311-cp311-win_amd64.whl
+pip install -r requirements.txt
+```
+
+> All commands below assume the backtest venv is active and you are inside the `backtest/` directory.
+
+---
+
+## Running a Backtest
+
+```bash
+python backtest.py --strategy RSIBollingerStrategy
 python backtest.py --strategy EMACrossoverStrategy
 ```
 
-# Run Hyperparameter Tuning with `screen`
-## Single-Objective Optimization
-```sh
-screen -S single_objective  # Create a new screen session named 'single_objective'
-python3 tuning.py --strategy EMACrossoverStrategy --start_date 2025-06-01 --end_date 2026-02-06 --objective_type single --trials 1000  # Run tuning
-screen -r single_objective  # Reattach to the session
-```
+Results are written to an HTML plot file in the current directory. Execution log is written to `{strategy}-backtest-last-execution.log`.
 
-## Multi-Objective Optimization
-```sh
-screen -S multiple_objective  # Create a new screen session named 'multiple_objective'
-python3 tuning.py --strategy EMACrossoverStrategy --start_date 2025-06-01 --end_date 2026-02-06 --objective_type multiple --trials 5000  # Run tuning
-screen -r multiple_objective  # Reattach to the session
-```
+**Available strategies**
 
-## Weighted-Objective Optimization
-```sh
-screen -S weighted_objective  # Create a new screen session named 'weighted_objective'
-python3 tuning.py --strategy EMACrossoverStrategy --start_date 2025-06-01 --end_date 2026-02-06 --objective_type weighted --trials 5000  # Run tuning
-screen -r weighted_objective  # Reattach to the session
-```
+| Strategy | Style | Key Indicators |
+|---|---|---|
+| `RSIBollingerStrategy` | Mean-reversion | RSI, Bollinger Bands, ATR |
+| `EMACrossoverStrategy` | Trend-following | EMA, RSI, ATR |
 
 ---
 
-## Managing `screen` Sessions
-```sh
-screen -ls  # List all active screen sessions
+## Parameter Optimization
+
+Uses [Optuna](https://optuna.org/) to search the parameter space defined in `tuning.py`.
+
+```bash
+python tuning.py \
+  --strategy RSIBollingerStrategy \
+  --start_date 2024-01-01 \
+  --end_date 2024-12-31 \
+  --objective_type multiple \
+  --trials 100
 ```
 
-## Detach from a session
-Press `Ctrl + A`, then `D`
+**Arguments**
 
-## Kill all `screen` Sessions
-```sh
-screen -ls | awk '/[0-9]+\./ {print $1}' | xargs -I {} screen -S {} -X quit
-```
+| Argument | Required | Description |
+|---|---|---|
+| `--strategy` | no | `RSIBollingerStrategy` or `EMACrossoverStrategy` (defaults to `EMACrossoverStrategy`) |
+| `--start_date` | yes | Backtest start date (`YYYY-MM-DD`) |
+| `--end_date` | yes | Backtest end date (`YYYY-MM-DD`) |
+| `--objective_type` | yes | `single` · `multiple` · `weighted` (see below) |
+| `--trials` | yes | Number of Optuna trials to run |
 
-# Use a calculation: 1 contract for every $3,000 of equity
-dynamic_size = int(self.equity // 3000) 
-position_size_contracts = max(1, dynamic_size)
+**Objective types**
 
+| Type | Description |
+|---|---|
+| `single` | Maximize final equity. Fast, suitable for grid search. |
+| `multiple` | Pareto front across 6 objectives: portfolio value (↑), max drawdown (↓), win rate (↑), avg loss (↓), Sortino ratio (↑), Sharpe ratio (↑). |
+| `weighted` | Composite score: 0.7 × equity − 0.3 × max_drawdown. |
 
-2026-02-13 23:21:06,010 - INFO - Trial 319 finished with values: [6038.8, -14.4, 72.4, -118.0, 6.575368156425812, 1.7760819640379988] and parameters: {'fast_ema': 6, 'take_profit_long': 0.8700000000000001, 'take_profit_short': 0.98, 'stop_loss_long': 1.97, 'stop_loss_short': 1.52, 'max_long_positions': 3, 'max_short_positions': 3, 'rsi_overbought': 70.0, 'rsi_oversold': 66.0, 'atr_percentile': 18.0}.
-2026-02-13 23:47:36,735 - INFO - Trial 414 finished with values: [6335.8, -16.4, 78.3, -122.0, 6.1765959246350794, 1.6672116121158578] and parameters: {'fast_ema': 6, 'take_profit_long': 0.8700000000000001, 'take_profit_short': 0.47, 'stop_loss_long': 1.97, 'stop_loss_short': 1.52, 'max_long_positions': 3, 'max_short_positions': 3, 'rsi_overbought': 67.0, 'rsi_oversold': 66.0, 'atr_percentile': 18.0}.
+Outputs are written to `tuning_output/` — one JSON file with trial results and one log file per run, both timestamped as `tuning_{strategy}_{objective}_{YYYYMMDD_HHMM}`.
+
+> **Note**: `tuning.py` hardcodes `nq_intraday-15min.csv` as the dataset regardless of the strategy selected. If you want to tune `EMACrossoverStrategy` against a different dataset, update `FILE_CONFIG['dataset_name']` in `tuning.py` before running.
+
+---
+
+## Datasets
+
+Historical OHLC data located in `datasets/`:
+
+| File | Resolution | Instrument | Used by |
+|---|---|---|---|
+| `nq_intraday-15min.csv` | 15-min | NASDAQ 100 futures | `RSIBollingerStrategy`, `EMACrossoverStrategy` (default) |
+| `es_intraday-15min.csv` | 15-min | S&P 500 futures | — |
+| `es_intraday-5min.csv` | 5-min | S&P 500 futures | `EMACrossoverStrategy` (required for 5-min resolution) |
+
+---
+
+## Further Reading
+
+- [`../docs/architecture.md`](../docs/architecture.md) — backtest engine internals and optimization pipeline design
+- [`../docs/development.md`](../docs/development.md) — pre-commit setup, conventions, and detailed instructions for adding a strategy
