@@ -25,7 +25,6 @@ warnings.filterwarnings('ignore', category=UserWarning, message='.*fractional tr
 
 # --- Registro de Estrategias ---
 STRATEGY_REGISTRY = {
-    "EMACrossoverStrategy": "strategies.ema_crossover",
     "RSIBollingerStrategy": "strategies.rsi_bollinger",
 }
 
@@ -51,30 +50,6 @@ def load_strategy_class(strategy_name):
 def get_strategy_params(strategy_name):
     """Devuelve los parámetros por defecto para la estrategia especificada"""
     STRATEGY_PARAMS = {
-        'EMACrossoverStrategy': {
-            # --- Fechas de Backtest ---
-            'start_date': '2025-06-01',
-            'end_date': '2026-02-13',
-            'dataset': 'es_intraday-5min.csv',
-            # --- Configuración del Motor ---
-            'initial_cash_balance': 3000,
-            'leverage': 20,
-            'commission': 0.00012,
-            'silent_mode': False,
-            'max_margin_equity_pct': 85,
-            'objective_type': 'single',
-            # --- Parámetros de la Estrategia ---
-            "fast_ema": 19,
-            "take_profit_long": 0.31,
-            "take_profit_short": 0.31,
-            "stop_loss_long": 1.6800000000000002,
-            "stop_loss_short": 1.4200000000000002,
-            "max_long_positions": 1,
-            "max_short_positions": 6,
-            "rsi_overbought": 67.0,
-            "rsi_oversold": 62.0,
-            "atr_percentile": 17.0
-        },
         "RSIBollingerStrategy": {
             # --- Fechas de Backtest ---
             "start_date": "2026-01-01",  # Fecha de inicio de la simulación.
@@ -227,7 +202,7 @@ def run(data, params, strategy_class=None):
 if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--strategy', nargs='?', default='EMACrossoverStrategy')
+    parser.add_argument('--strategy', nargs='?', default='RSIBollingerStrategy')
     args = parser.parse_args()
 
     setup_logging(f"{args.strategy}-backtest-last-execution.log")

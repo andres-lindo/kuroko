@@ -99,8 +99,7 @@ kuroko/
     │   └── nq_intraday-15min.csv  # NASDAQ 100 futures (15-min OHLC)
     └── strategies/
         ├── __init__.py
-        ├── rsi_bollinger.py        # RSI + Bollinger Bands (mean-reversion)
-        └── ema_crossover.py        # EMA crossover (trend-following)
+        └── rsi_bollinger.py        # RSI + Bollinger Bands (mean-reversion)
 ```
 
 ---
