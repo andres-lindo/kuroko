@@ -17,7 +17,7 @@ Kuroko is split into two independent execution contexts that share no runtime st
 
 ```
 ig_main.py  ← load_dotenv("credentials.env") runs at module scope, before main()
-├── open("strategy_parameters.json") → json.load() → types.SimpleNamespace
+├── ig_strategy.load_params("strategy_parameters.json") → types.SimpleNamespace
 │   └── keys: candle_frecuency, epic, max_positions, rsi_period, bb_period, ...
 │
 ├── AzureBlobHandler
@@ -127,7 +127,7 @@ while True:
 
 Each individual `close_position()` call is wrapped in its own retry loop: 3 attempts with 1s/2s backoff. A failure on one position does not block the remaining closes. Failed deal IDs are accumulated and reported in a single WARNING after all positions are processed.
 
-**Layer 6 — Startup config (`strategy_parameters.json` in `ig_main.py`)**
+**Layer 6 — Startup config (`strategy_parameters.json` in `ig_strategy.py`)**
 
 A failure here is fatal by design — the bot cannot trade without its configuration. `load_params()` handles three failure modes, each logging CRITICAL and calling `sys.exit(1)`:
 
