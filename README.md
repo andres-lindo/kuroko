@@ -67,9 +67,7 @@ table_storage_connection=DefaultEndpointsProtocol=https;AccountName=...
 
 > `ig_acc_type` accepts `DEMO` or `LIVE`. This must match `is_live_account` in `ig_strategy.py` — see [`docs/architecture.md`](docs/architecture.md#risk-controls) before switching to a live account.
 
-Strategy parameters are **not stored in code** — they live in Azure Table Storage (`ConfigParameters` table), keyed by `PartitionKey`. The `partition_key` argument selects which configuration set to load at runtime.
-
-> **Before running the bot**, the Azure Table Storage must be provisioned with at least a `BASE_CONF` partition and one strategy-specific partition (e.g. `DEV_US500`). Without these rows the bot will start and immediately fail to load parameters. See [`docs/architecture.md`](docs/architecture.md#configuration-flow) for the expected table structure.
+Strategy parameters are stored in `strategy_parameters.json` at the project root and committed to the repository. Edit that file to change any live-trading parameter before running the bot.
 
 ---
 
@@ -78,6 +76,7 @@ Strategy parameters are **not stored in code** — they live in Azure Table Stor
 ```
 kuroko/
 ├── credentials.env              # Secrets — never committed
+├── strategy_parameters.json         # Live trading strategy parameters
 ├── requirements.txt             # Live trading dependencies
 ├── .pre-commit-config.yaml      # pre-commit hooks
 │
@@ -115,7 +114,7 @@ source venv/bin/activate          # macOS/Linux
 python ig_main.py [partition_key]
 ```
 
-`partition_key` selects the configuration set from Azure Table Storage. Defaults to `DEV_US500` if omitted.
+`partition_key` is the label used to identify this deployment's log blob in Azure Blob Storage. Defaults to `DEV_US500` if omitted.
 
 ```bash
 python ig_main.py DEV_US500       # Development config for S&P 500
@@ -124,7 +123,7 @@ python ig_main.py PROD_NQ100      # Production config for NASDAQ 100
 
 Stop the bot with `CTRL+C`.
 
-> **Startup failure**: if the bot exits immediately with a `CRITICAL` log entry, verify that `table_storage_connection` in `credentials.env` is valid and that the `ConfigParameters` table contains both the `BASE_CONF` partition and your target partition. Startup config load is the only fatal failure — everything else is recovered automatically.
+> **Startup failure**: if the bot exits immediately with a `CRITICAL` log entry, verify that `strategy_parameters.json` exists at the project root, contains valid JSON, has all 23 required keys with the correct types, and that `candle_frecuency` matches the pattern `\d+min` (e.g. `"15min"`). The error log will list every missing key and type mismatch in one report. Startup parameter load is the only fatal failure — everything else is recovered automatically.
 
 > **Runtime failures**: the bot does not crash on IG API errors. If the IG API is unavailable (maintenance window, timeout, empty response), the bot skips the affected cycle, logs a WARNING or ERROR, and retries on the next tick (~1 minute). It recovers automatically when the API comes back. See [`docs/architecture.md`](docs/architecture.md#fault-tolerance-and-self-healing) for the full recovery model.
 

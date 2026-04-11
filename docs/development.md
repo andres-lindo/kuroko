@@ -99,7 +99,7 @@ pre-commit run --all-files
 - **Formatter**: black (enforced via pre-commit, line length default: 88)
 - **Language**: all code, variable names, inline comments, docstrings, and log messages must be in English
 - **Secrets**: never commit `credentials.env` or any file containing API keys or connection strings
-- **Config changes**: strategy parameters for live trading are modified in Azure Table Storage, not in source code
+- **Config changes**: strategy parameters for live trading are stored in `strategy_parameters.json` at the project root and committed to the repository. Edit that file directly and redeploy the bot to apply changes.
 - **Dependencies**: add new external packages to `requirements.txt` (root) or `backtest/requirements.txt` depending on which execution context requires them
 
 ### Logging
@@ -248,4 +248,4 @@ Modify `ig_strategy.py` directly. The strategy class is not pluggable in the liv
 
 **Always validate logic changes in the backtest module before touching the live strategy.** Port the change to a backtest strategy class, run it against historical data, and confirm the behaviour is correct before applying it to `ig_strategy.py`.
 
-After updating `ig_strategy.py`, provision the new strategy parameters as rows in Azure Table Storage under the appropriate `PartitionKey` before deploying.
+After updating `ig_strategy.py`, update the corresponding values in `strategy_parameters.json` at the project root and commit the file before deploying.

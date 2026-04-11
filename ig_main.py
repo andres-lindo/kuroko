@@ -1,16 +1,17 @@
 """Entry point for the Kuroko live trading bot.
 
-Loads configuration from Azure Table Storage, initialises logging (console
-and Azure Blob), connects to IG Markets, and starts the strategy loop.
+Loads strategy parameters from strategy_parameters.json, initialises logging
+(console and Azure Blob), connects to IG Markets, and starts the strategy loop.
 """
 import os
-import ast
 import sys
 import logging
 import argparse
+import json
+import types
+import re
 
 from dotenv import load_dotenv
-from azure.data.tables import TableServiceClient
 
 from ig_client import IGClient
 from ig_strategy import Strategy
@@ -54,95 +55,161 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="trading_ig.uti
 warnings.filterwarnings("ignore", category=FutureWarning, module="trading_ig.rest")
 
 
-def load_params(partition_key: str):
-    """Load strategy configuration from Azure Table Storage.
 
-    Queries the ConfigParameters table for rows matching partition_key or
-    the shared 'BASE_CONF' partition, then deserialises each value into the
-    correct Python type based on the key name.
+# Expected type for each parameter key.
+# float fields accept int values (e.g. 240 is valid for take_profit_ticks).
+# bool fields are checked before int because bool is a subclass of int in Python.
+_PARAMS_SCHEMA: dict[str, type] = {
+    "epic":                           str,
+    "candle_frecuency":               str,
+    "is_live_account":                bool,
+    "leverage":                       int,
+    "lookback":                       int,
+    "demo_starting_balance":          float,
+    "initial_cash_balance":           float,
+    "security_buffer":                float,
+    "max_positions":                  int,
+    "position_size":                  float,
+    "min_dist_between_entries_ticks": float,
+    "martingale_multiplier":          float,
+    "take_profit_ticks":              float,
+    "max_drawdown_pct":               float,
+    "bb_period":                      int,
+    "bb_dev":                         float,
+    "rsi_period":                     int,
+    "rsi_overbought":                 int,
+    "rsi_oversold":                   int,
+    "use_trend_filter":               bool,
+    "atr_period":                     int,
+    "atr_sl_multiplier":              float,
+    "ema_period":                     int,
+}
+
+
+def _validate_params(data: dict, path: str) -> None:
+    """Validate that all required keys are present and correctly typed.
+
+    Collects every missing key and every type mismatch before logging them
+    all at once, so a single bad file produces a complete error report.
 
     Args:
-        partition_key: Azure Table PartitionKey that selects the config set
-            (e.g. 'DEV_US500').
+        data: Parsed JSON dict to validate.
+        path: File path used in error messages.
+
+    Raises:
+        SystemExit: If any key is missing or has the wrong type.
+    """
+    errors: list[str] = []
+
+    for key, expected in _PARAMS_SCHEMA.items():
+        if key not in data:
+            errors.append(f"  missing key: '{key}'")
+            continue
+
+        value = data[key]
+
+        if expected is bool:
+            if not isinstance(value, bool):
+                errors.append(
+                    f"  '{key}': expected bool, got {type(value).__name__} ({value!r})"
+                )
+        elif expected is int:
+            # Reject bool (subclass of int) and non-int values
+            if isinstance(value, bool) or not isinstance(value, int):
+                errors.append(
+                    f"  '{key}': expected int, got {type(value).__name__} ({value!r})"
+                )
+        elif expected is float:
+            # Accept int as float (e.g. 240 is valid for take_profit_ticks)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                errors.append(
+                    f"  '{key}': expected float, got {type(value).__name__} ({value!r})"
+                )
+        elif not isinstance(value, expected):
+            errors.append(
+                f"  '{key}': expected {expected.__name__}, got {type(value).__name__} ({value!r})"
+            )
+
+    if errors:
+        logging.critical(
+            "Parameter validation failed for %s — %d error(s):\n%s",
+            path,
+            len(errors),
+            "\n".join(errors),
+        )
+        sys.exit(1)
+
+    if not re.match(r"^\d+min$", data["candle_frecuency"]):
+        logging.critical(
+            "Invalid candle_frecuency in %s — must match '<N>min' (e.g. '15min'), got: %r",
+            path,
+            data["candle_frecuency"],
+        )
+        sys.exit(1)
+
+
+def load_params(path: str = "strategy_parameters.json") -> types.SimpleNamespace:
+    """Load and validate strategy parameters from a JSON file.
+
+    Reads the JSON file at ``path``, validates all required keys and their
+    types, and returns the parameters as a SimpleNamespace for attribute-style
+    access.
+
+    Args:
+        path: Path to the JSON parameters file. Defaults to
+            ``strategy_parameters.json`` in the working directory.
 
     Returns:
-        Config object whose attributes correspond to each RowKey in the table,
-        with values cast to str, float, bool, or int as appropriate.
+        SimpleNamespace with one attribute per JSON key.
+
+    Raises:
+        SystemExit: If the file is missing, unreadable, contains invalid JSON,
+            has missing keys, type mismatches, or an invalid ``candle_frecuency``.
     """
-    # Connect to Azure Table Storage using the connection string from the environment
-    conn_str = os.getenv('table_storage_connection')
-    table_service = TableServiceClient.from_connection_string(conn_str=conn_str)
-    table_client = table_service.get_table_client(table_name="ConfigParameters")
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        logging.critical("Parameters file not found: %s", path)
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        logging.critical("Invalid JSON in %s: %s", path, e)
+        sys.exit(1)
+    except OSError as e:
+        logging.critical("Could not read %s: %s", path, e)
+        sys.exit(1)
 
-    # Fetch rows for the requested partition and the shared base config
-    entities = table_client.query_entities(f"PartitionKey eq '{partition_key}' or PartitionKey eq 'BASE_CONF'")
+    _validate_params(data, path)
 
-    # Flatten entity list into a {RowKey: Value} mapping
-    raw = {e['RowKey']: e['Value'] for e in entities}
-
-    class Config:
-        """Namespace object that holds configuration values as attributes."""
-        pass
-
-    cfg = Config()
-
-    # Dispatch each key to the correct Python type; keys not listed default to int
-    for key, val in raw.items():
-        if key in ('table_storage_name', 'table_log_name', 'cfd_symbol', 'candle_frecuency'):
-            setattr(cfg, key, val)
-        elif key in ('position_size_long', 'position_size_short',
-                     'default_volume', 'profit_threshold',
-                     'stop_loss_long', 'stop_loss_short',
-                     'take_profit_long', 'take_profit_short'):
-            setattr(cfg, key, float(val))
-        elif key == 'ema_crossover':
-            setattr(cfg, key, ast.literal_eval(val))
-        else:
-            setattr(cfg, key, int(val))
-
-    # Attach the raw connection string so downstream components can reuse it
-    setattr(cfg, 'table_storage_connection', conn_str)
-
-    return cfg
+    logging.info("Parameters loaded from %s.", path)
+    return types.SimpleNamespace(**data)
 
 
 def main():
     """Parse CLI arguments, bootstrap the bot, and start the strategy loop.
 
-    Reads the partition_key from the command line, loads parameters from
-    Azure Table Storage, attaches Azure Blob log shipping, and then runs
-    the strategy until interrupted.
+    Loads strategy parameters from ``strategy_parameters.json``, attaches
+    Azure Blob log shipping, and then runs the strategy until interrupted.
 
-    If Azure Table Storage is unreachable or load_params() raises for any
-    reason, a CRITICAL log entry is written with the full traceback and the
-    process exits with code 1. No IGClient or Strategy initialisation is
-    attempted in that case.
+    If parameter loading fails for any reason, a CRITICAL log entry is written
+    and the process exits with code 1. No IGClient or Strategy initialisation
+    is attempted in that case.
     """
-    # The partition key selects the Azure Table row set for this deployment
+    # The partition key is used as the log blob label in Azure Blob Storage
     parser = argparse.ArgumentParser(description="Start the trading bot")
     parser.add_argument(
         'partition_key', nargs='?', default="DEV_US500",
-        help="PartitionKey to filter parameters from Azure Table Storage"
+        help="Label used to identify this deployment's log blob in Azure Blob Storage"
     )
     args = parser.parse_args()
 
-    # Load all strategy parameters from Azure Table Storage.
-    # A failure here is fatal — the bot cannot trade without its configuration.
-    try:
-        params = load_params(args.partition_key)
-        logging.info("Parameters loaded.")
-    except Exception as e:
-        logging.critical(
-            "Failed to load configuration from Azure Table Storage: %s",
-            e,
-            exc_info=True,
-        )
-        sys.exit(1)
+    params = load_params()
 
     # Attach Azure Blob log handler so logs are shipped to cloud storage
     try:
+        conn_str = os.getenv("table_storage_connection")
         azure_handler = AzureBlobHandler(
-            connection_string=params.table_storage_connection,
+            connection_string=conn_str,
             blob_name=args.partition_key,
             container_name="logs"
         )

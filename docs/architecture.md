@@ -17,10 +17,8 @@ Kuroko is split into two independent execution contexts that share no runtime st
 
 ```
 ig_main.py  ← load_dotenv("credentials.env") runs at module scope, before main()
-├── load_params(partition_key)
-│   └── Azure Table Storage → ConfigParameters table
-│       ├── PartitionKey == partition_key  (strategy-specific config)
-│       └── PartitionKey == 'BASE_CONF'   (shared defaults)
+├── open("strategy_parameters.json") → json.load() → types.SimpleNamespace
+│   └── keys: candle_frecuency, epic, max_positions, rsi_period, bb_period, ...
 │
 ├── AzureBlobHandler
 │   └── Azure Blob Storage → container: logs
@@ -53,9 +51,9 @@ Key methods: `get_candles()`, `get_open_positions()`, `open_position()`, `close_
 
 #### `Strategy` (`ig_strategy.py`)
 
-Contains all trading logic. Initialized with the config object from Azure and an `IGClient` instance.
+Contains all trading logic. Initialized with the config object from `strategy_parameters.json` and an `IGClient` instance.
 
-**Indicators computed per cycle** (via TA-Lib on 15-min NASDAQ futures — epic `IX.D.NASDAQ.IFMM.IP`, hardcoded; the `cfd_symbol` config key is loaded but not used by `Strategy`):
+**Indicators computed per cycle** (via TA-Lib on 15-min NASDAQ futures — epic loaded from `strategy_parameters.json`):
 
 | Indicator | Parameter source |
 |---|---|
@@ -129,9 +127,15 @@ while True:
 
 Each individual `close_position()` call is wrapped in its own retry loop: 3 attempts with 1s/2s backoff. A failure on one position does not block the remaining closes. Failed deal IDs are accumulated and reported in a single WARNING after all positions are processed.
 
-**Layer 6 — Startup config (`load_params` in `ig_main.py`)**
+**Layer 6 — Startup config (`strategy_parameters.json` in `ig_main.py`)**
 
-A failure here is fatal by design — the bot cannot trade without its configuration. `load_params()` is wrapped in a `try/except` that logs CRITICAL with full traceback and calls `sys.exit(1)`. No retry is attempted; the process manager (systemd, supervisor, etc.) handles restart scheduling.
+A failure here is fatal by design — the bot cannot trade without its configuration. `load_params()` handles three failure modes, each logging CRITICAL and calling `sys.exit(1)`:
+
+1. **File errors** — missing file (`FileNotFoundError`), invalid JSON (`JSONDecodeError`), or unreadable file (`OSError`).
+2. **Schema errors** — `_validate_params()` checks that all 23 required keys are present and correctly typed (e.g. `int` fields reject `bool`, `float` fields accept `int`). All errors are collected and reported at once before exiting.
+3. **Format error** — `candle_frecuency` must match the regex `^\d+min$` (e.g. `"15min"`).
+
+No retry is attempted; the process manager (systemd, supervisor, etc.) handles restart scheduling.
 
 #### Behaviour during an IG maintenance window
 
@@ -167,17 +171,31 @@ Custom `logging.Handler` that ships all log records to Azure Blob Storage. Uses 
 
 ### Configuration Flow
 
-Strategy parameters are **not in code** — they are loaded at startup from Azure Table Storage and injected into `Strategy.__init__`. This allows changing parameters without redeployment.
+Strategy parameters are stored in `strategy_parameters.json` at the project root and loaded at startup. Changing a parameter requires editing the file and redeploying the bot.
 
 ```
-Azure Table Storage
-└── ConfigParameters table
-    ├── PartitionKey: BASE_CONF    → shared baseline values
-    └── PartitionKey: DEV_US500   → environment/instrument overrides
-        └── merged at runtime → Config object → Strategy
+strategy_parameters.json (project root)
+└── json.load() → dict
+    └── types.SimpleNamespace(**data) → params
+        └── Strategy(params=params, ig_client=ig)
+            └── self.params.candle_frecuency / .epic / .max_positions / ...
 ```
 
-Both partitions are queried together and merged at runtime. If the same `RowKey` exists in both, the strategy-specific partition (`DEV_US500`) is intended to take precedence — ensure `RowKey` values are unique across partitions to avoid relying on undefined iteration order from the Azure SDK.
+Key parameters and their roles:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `candle_frecuency` | string (`\d+min`) | Candle resolution used by the strategy (e.g. `"15min"`) |
+| `epic` | string | IG Markets instrument identifier |
+| `max_positions` | int | Maximum number of simultaneous open positions |
+| `is_live_account` | bool | `false` = DEMO (virtual equity mirror); `true` = LIVE (broker equity) |
+| `initial_cash_balance` | float | Simulated capital base for virtual margin calculation |
+| `demo_starting_balance` | float | IG demo account reference balance for realized P&L |
+| `take_profit_ticks` | float | Basket take-profit distance in price ticks |
+| `martingale_multiplier` | float | Position size multiplier for each grid level |
+| *(+ 15 more)* | — | See `strategy_parameters.json` for the full list |
+
+`table_storage_connection` is NOT in this file — it is read from the environment (`credentials.env`) exclusively for `AzureBlobHandler` log shipping.
 
 ---
 

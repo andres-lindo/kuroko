@@ -1,0 +1,27 @@
+{
+  "epic": "IX.D.NASDAQ.IFMM.IP",
+  "candle_frecuency": "15min",
+  "is_live_account": false,
+  "leverage": 20,
+  "lookback": 300,
+  "demo_starting_balance": 20000.0,
+  "initial_cash_balance": 4000.0,
+  "security_buffer": 1000.0,
+
+  "max_positions": 5,
+  "position_size": 0.13,
+  "min_dist_between_entries_ticks": 100.0,
+  "martingale_multiplier": 1.5,
+  "take_profit_ticks": 240.0,
+  "max_drawdown_pct": 75.75,
+
+  "bb_period": 20,
+  "bb_dev": 1.9,
+  "rsi_period": 11,
+  "rsi_overbought": 76,
+  "rsi_oversold": 25,
+  "use_trend_filter": false,
+  "atr_period": 12,
+  "atr_sl_multiplier": 11.0,
+  "ema_period": 200
+}

@@ -22,7 +22,7 @@ class Strategy:
     when the weighted average entry price reaches the take-profit target.
 
     Attributes:
-        params: Configuration object loaded from Azure Table Storage.
+        params: Configuration object loaded from strategy_parameters.json.
         ig: IGClient instance used for all broker interactions.
         candles: Most-recent OHLC DataFrame with computed indicators.
         max_drawdown_reached: Flag set when equity breaches the drawdown floor.
@@ -32,43 +32,43 @@ class Strategy:
         """Initialise strategy state and load parameters.
 
         Args:
-            params: Config object with attributes loaded from Azure Table
-                Storage (e.g. candle_frecuency).
+            params: Config object loaded from strategy_parameters.json
+                (e.g. candle_frecuency, max_positions, epic).
             ig_client: Authenticated IGClient instance.
         """
         self.params = params
         self.ig = ig_client
         self.candles = pd.DataFrame()
 
-        # Trading parameters — sourced from Azure Table Storage at startup
-        self.max_positions = 5
-        self.min_dist_between_entries_ticks = 100.0
-        self.martingale_multiplier = 1.5
-        self.bb_dev = 1.9
-        self.bb_period = 20
-        self.rsi_period = 11
-        self.rsi_overbought = 76
-        self.rsi_oversold = 25
-        self.use_trend_filter = False
-        self.take_profit_ticks = 240.0
-        self.atr_period = 12
-        self.atr_sl_multiplier = 11.0
+        # Trading parameters — loaded from strategy_parameters.json at startup
+        self.max_positions = params.max_positions
+        self.min_dist_between_entries_ticks = params.min_dist_between_entries_ticks
+        self.martingale_multiplier = params.martingale_multiplier
+        self.bb_dev = params.bb_dev
+        self.bb_period = params.bb_period
+        self.rsi_period = params.rsi_period
+        self.rsi_overbought = params.rsi_overbought
+        self.rsi_oversold = params.rsi_oversold
+        self.use_trend_filter = params.use_trend_filter
+        self.take_profit_ticks = params.take_profit_ticks
+        self.atr_period = params.atr_period
+        self.atr_sl_multiplier = params.atr_sl_multiplier
 
         # Internal state — managed at runtime
-        self.position_size = 0.13
-        self.max_drawdown_pct = 75.75
-        self.ema_period = 200
-        self.max_drawdown_reached = False
+        self.position_size = params.position_size
+        self.max_drawdown_pct = params.max_drawdown_pct
+        self.ema_period = params.ema_period
+        self.max_drawdown_reached = False  # runtime state, not a config param
 
         # System configuration — change is_live_account to True ONLY for real-money trading
-        self.is_live_account = False          # False = DEMO (virtual equity mirror); True = LIVE (broker equity)
-        self.demo_starting_balance = 20000.0  # IG demo account starting balance
-        self.initial_cash_balance = 4000.0    # Simulated capital to track (maps to demo via leverage)
+        self.is_live_account = params.is_live_account
+        self.demo_starting_balance = params.demo_starting_balance
+        self.initial_cash_balance = params.initial_cash_balance
 
-        self.leverage = 20
-        self.epic = "IX.D.NASDAQ.IFMM.IP"
-        self.lookback = 300
-        self.security_buffer = 1000.0
+        self.leverage = params.leverage
+        self.epic = params.epic
+        self.lookback = params.lookback
+        self.security_buffer = params.security_buffer
 
     def get_candles(self):
         """Fetch the latest candles from IG and compute all indicators.
