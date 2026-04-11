@@ -41,8 +41,9 @@ ig_main.py  ← load_dotenv("credentials.env") runs at module scope, before main
 
 Wrapper around the `trading-ig` library. All API calls go through `_safe_api_call`, which provides:
 
-- **Retry with backoff**: up to 3 attempts, waits 1 → 2 seconds between attempts (no wait before the final attempt)
-- **Token refresh**: detects expired session errors and calls `create_session()` before retrying
+- **Retry with backoff**: up to 3 attempts, waits 1 → 2 → 4 seconds between attempts
+- **Token refresh**: detects expired session errors and calls `create_session()` before retrying. Session refresh is NOT triggered for `json.JSONDecodeError` — empty-body responses are content errors, not auth errors
+- **Maintenance window handling**: `json.JSONDecodeError` (IG returning an empty HTTP body) is included in the retry clause so transient outages are retried automatically
 - **Candle caching**: two-layer cache
   - In-memory (`dict`): avoids redundant API calls within the same process lifetime
   - Parquet files (`./cache/`): survives restarts; cache key is `{epic}_{resolution}`
@@ -89,6 +90,78 @@ Contains all trading logic. Initialized with the config object from Azure and an
 - **Virtual margin** (`is_live_account = False`): simulates 1:20 leverage against `initial_cash_balance = 4000` (the virtual capital base) regardless of the actual IG demo balance. `demo_starting_balance = 20000` is the IG demo account reference used only for realized P&L calculation. Set `is_live_account = True` only when switching to a real account — this changes margin and equity calculations to use raw broker figures instead of the virtual simulation
 
 #### `AzureBlobHandler` (`azure_log_handler.py`)
+
+### Fault Tolerance and Self-Healing
+
+The live trading engine is designed to survive transient IG API failures (maintenance windows, timeouts, empty responses) without operator intervention. Recovery is layered — each layer handles failures at its own level and passes only unrecoverable conditions upward.
+
+#### Recovery layers (inner → outer)
+
+**Layer 1 — API call (`_safe_api_call`)**
+
+Every API call is retried up to 3 times with exponential backoff (1s, 2s, 4s). Handles: `ConnectionError`, `RequestException`, `IGException`, `json.JSONDecodeError`. Token-expired errors also trigger a session refresh before retrying. If all 3 attempts fail, the exception propagates to the caller.
+
+**Layer 2 — Candle fetch (`Strategy.get_candles`)**
+
+If `IGClient.get_candles()` raises after exhausting retries, `Strategy.get_candles()` catches the exception, logs an ERROR, and returns the last successfully fetched DataFrame from its internal cache. The strategy operates on stale data for that tick rather than crashing. If the cache is empty (first startup, first call ever failed), an empty DataFrame is returned and the cycle is skipped.
+
+**Layer 3 — Account data guard (`manage_positions`, `log_account_status`)**
+
+Both methods call `get_account_summary()` at the start of each cycle. If the API is down, `get_account_summary()` returns an empty dict `{}`. Both methods check `if not account_info` immediately and return with a WARNING log. The strategy does not trade on missing data — it skips the cycle entirely. All remaining key accesses use `.get(key, default)` so no `KeyError` can occur.
+
+**Layer 4 — Per-cycle recovery (`Strategy.run` loop)**
+
+The entire tick body — `get_candles()` + `manage_positions()` + `log_account_status()` — is wrapped in a `try/except Exception` block inside the `while True` loop. Any exception that reaches this layer is logged as ERROR with a full traceback, and the loop continues to the next tick. `KeyboardInterrupt` is explicitly re-raised before the generic handler to preserve clean Ctrl+C shutdown.
+
+```
+while True:
+    try:
+        get_candles() → manage_positions() → log_account_status()
+    except KeyboardInterrupt:
+        raise                       # clean shutdown
+    except Exception:
+        log ERROR with traceback    # cycle failed, do NOT exit
+    next_tick += 1 min              # always runs — correct clock advance
+    sleep until next_tick
+```
+
+**Layer 5 — Position close retry (`close_all_positions`)**
+
+Each individual `close_position()` call is wrapped in its own retry loop: 3 attempts with 1s/2s backoff. A failure on one position does not block the remaining closes. Failed deal IDs are accumulated and reported in a single WARNING after all positions are processed.
+
+**Layer 6 — Startup config (`load_params` in `ig_main.py`)**
+
+A failure here is fatal by design — the bot cannot trade without its configuration. `load_params()` is wrapped in a `try/except` that logs CRITICAL with full traceback and calls `sys.exit(1)`. No retry is attempted; the process manager (systemd, supervisor, etc.) handles restart scheduling.
+
+#### Behaviour during an IG maintenance window
+
+```
+IG API unavailable
+│
+├── Tick N:   _safe_api_call retries 3× in ~3s → raises
+│             get_candles()  → returns stale cache (or empty DataFrame)
+│             manage_positions() → account_info is {} → WARNING → return
+│             run() except → logs "Trading cycle failed — will retry next tick"
+│             sleeps ~1 min
+│
+├── Tick N+1: same — retries, skips, sleeps
+│   ...
+│
+└── Tick N+K: IG API recovers → _safe_api_call succeeds → normal cycle resumes
+```
+
+The process **never exits** on API failures. It retries every tick indefinitely until the API recovers, then resumes normal operation automatically. The only observable impact is WARNING/ERROR log entries and skipped trading cycles during the outage.
+
+#### What this does NOT cover
+
+| Scenario | Behaviour |
+|---|---|
+| Extended outage (hours) | Bot keeps retrying every tick; produces one log entry per cycle; no trades during the outage |
+| `get_open_positions()` returning `[]` on error | Strategy sees zero open positions for that cycle; state reconciles on the next successful call |
+| Stale candle cache | Signals computed on data up to N minutes old; negligible on a 15-min candle strategy |
+| No circuit breaker | No threshold for consecutive failures — the bot retries indefinitely; process manager handles restarts if needed |
+
+
 
 Custom `logging.Handler` that ships all log records to Azure Blob Storage. Uses append-blob mode so multiple writes don't overwrite existing content. Rotates to a new blob daily at midnight UTC. Blob name format: `{partition_key}_{YYYY-MM-DD}.log`.
 

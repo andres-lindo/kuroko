@@ -124,7 +124,9 @@ python ig_main.py PROD_NQ100      # Production config for NASDAQ 100
 
 Stop the bot with `CTRL+C`.
 
-> **Troubleshooting**: if the bot crashes immediately at startup with an Azure error, verify that `table_storage_connection` in `credentials.env` is valid and that the `ConfigParameters` table contains both the `BASE_CONF` partition and your strategy partition.
+> **Startup failure**: if the bot exits immediately with a `CRITICAL` log entry, verify that `table_storage_connection` in `credentials.env` is valid and that the `ConfigParameters` table contains both the `BASE_CONF` partition and your target partition. Startup config load is the only fatal failure — everything else is recovered automatically.
+
+> **Runtime failures**: the bot does not crash on IG API errors. If the IG API is unavailable (maintenance window, timeout, empty response), the bot skips the affected cycle, logs a WARNING or ERROR, and retries on the next tick (~1 minute). It recovers automatically when the API comes back. See [`docs/architecture.md`](docs/architecture.md#fault-tolerance-and-self-healing) for the full recovery model.
 
 ---
 
