@@ -114,6 +114,16 @@ logger = logging.getLogger(__name__)
 
 Never use `print()` for runtime output. Use `logger.debug/info/warning/error/exception` as appropriate.
 
+Always use f-strings for log message interpolation — never `%s`/`%d` formatting or `.format()`:
+
+```python
+# correct
+logger.info(f"Cache loaded from disk for {epic} {res}")
+
+# wrong
+logger.info("Cache loaded from disk for %s %s", epic, res)
+```
+
 ### Error Handling
 
 Handle exceptions individually in each function. Do not let exceptions propagate silently or catch broad `Exception` at the top level without logging:
