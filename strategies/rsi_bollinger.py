@@ -1,8 +1,10 @@
-"""Live trading strategy for IG Markets.
+"""RSI + Bollinger Bands mean-reversion live trading strategy.
 
 Implements a mean-reversion grid strategy using RSI and Bollinger Bands
 signals, martingale position sizing, and ATR-based dynamic stop-losses.
+Module name: rsi_bollinger. Logger name: rsi_bollinger.
 """
+import os
 import re
 import sys
 import json
@@ -14,7 +16,7 @@ import pandas as pd
 
 from datetime import datetime, timedelta, timezone
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rsi_bollinger")
 
 
 # Expected type for each parameter key.
@@ -23,7 +25,6 @@ logger = logging.getLogger(__name__)
 _PARAMS_SCHEMA: dict[str, type] = {
     "epic":                           str,
     "candle_frecuency":               str,
-    "is_live_account":                bool,
     "leverage":                       int,
     "lookback":                       int,
     "demo_starting_balance":          float,
@@ -102,7 +103,7 @@ def _validate_params(data: dict, path: str) -> None:
         sys.exit(1)
 
 
-def load_params(path: str = "strategy_parameters.json") -> types.SimpleNamespace:
+def load_params(path: str = "strategies/RSIBollingerStrategy.json") -> types.SimpleNamespace:
     """Load and validate strategy parameters from a JSON file.
 
     Reads the JSON file at ``path``, validates all required keys and their
@@ -111,7 +112,7 @@ def load_params(path: str = "strategy_parameters.json") -> types.SimpleNamespace
 
     Args:
         path: Path to the JSON parameters file. Defaults to
-            ``strategy_parameters.json`` in the working directory.
+            ``strategies/RSIBollingerStrategy.json`` in the working directory.
 
     Returns:
         SimpleNamespace with one attribute per JSON key.
@@ -139,7 +140,7 @@ def load_params(path: str = "strategy_parameters.json") -> types.SimpleNamespace
     return types.SimpleNamespace(**data)
 
 
-class Strategy:
+class RSIBollingerStrategy:
     """Mean-reversion grid strategy for IG Markets live trading.
 
     Enters long when price is below the lower Bollinger Band and RSI is
@@ -148,7 +149,7 @@ class Strategy:
     when the weighted average entry price reaches the take-profit target.
 
     Attributes:
-        params: Configuration object loaded from strategy_parameters.json.
+        params: Configuration object loaded from strategies/RSIBollingerStrategy.json.
         ig: IGClient instance used for all broker interactions.
         candles: Most-recent OHLC DataFrame with computed indicators.
         max_drawdown_reached: Flag set when equity breaches the drawdown floor.
@@ -158,7 +159,7 @@ class Strategy:
         """Initialise strategy state and load parameters.
 
         Args:
-            params: Config object loaded from strategy_parameters.json
+            params: Config object loaded from strategies/RSIBollingerStrategy.json
                 (e.g. candle_frecuency, max_positions, epic).
             ig_client: Authenticated IGClient instance.
         """
@@ -166,7 +167,7 @@ class Strategy:
         self.ig = ig_client
         self.candles = pd.DataFrame()
 
-        # Trading parameters — loaded from strategy_parameters.json at startup
+        # Trading parameters — loaded from strategies/RSIBollingerStrategy.json at startup
         self.max_positions = params.max_positions
         self.min_dist_between_entries_ticks = params.min_dist_between_entries_ticks
         self.martingale_multiplier = params.martingale_multiplier
@@ -186,8 +187,8 @@ class Strategy:
         self.ema_period = params.ema_period
         self.max_drawdown_reached = False  # runtime state, not a config param
 
-        # System configuration — change is_live_account to True ONLY for real-money trading
-        self.is_live_account = params.is_live_account
+        # Safety flag — True when ig_acc_type="LIVE", False otherwise (including "DEMO")
+        self.is_live_account = os.getenv("ig_acc_type") == "LIVE"
         self.demo_starting_balance = params.demo_starting_balance
         self.initial_cash_balance = params.initial_cash_balance
 

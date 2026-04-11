@@ -99,7 +99,7 @@ pre-commit run --all-files
 - **Formatter**: black (enforced via pre-commit, line length default: 88)
 - **Language**: all code, variable names, inline comments, docstrings, and log messages must be in English
 - **Secrets**: never commit `credentials.env` or any file containing API keys or connection strings
-- **Config changes**: strategy parameters for live trading are stored in `strategy_parameters.json` at the project root and committed to the repository. Edit that file directly and redeploy the bot to apply changes.
+- **Config changes**: strategy parameters for live trading are stored in `strategies/RSIBollingerStrategy.json` and committed to the repository. Edit that file directly and redeploy the bot to apply changes. See [RSIBollingerStrategy documentation](../docs/strategies/RSIBollingerStrategy.md) for the full parameter reference.
 - **Dependencies**: add new external packages to `requirements.txt` (root) or `backtest/requirements.txt` depending on which execution context requires them
 
 ### Logging
@@ -254,8 +254,15 @@ Omit sections (`Args`, `Returns`, `Raises`) that do not apply. One-liners are ac
 
 ### To the live trading bot
 
-Modify `ig_strategy.py` directly. The strategy class is not pluggable in the live context — there is one strategy per deployment, selected via the `partition_key` at startup.
+Live strategies are pluggable via the `--strategy` CLI flag. Each live strategy consists of two artifacts:
 
-**Always validate logic changes in the backtest module before touching the live strategy.** Port the change to a backtest strategy class, run it against historical data, and confirm the behaviour is correct before applying it to `ig_strategy.py`.
+- A Python module inside the `strategies/` package (e.g. `strategies/rsi_bollinger.py`) exporting a strategy class and a `load_params` callable.
+- A JSON config file at `strategies/<StrategyClassName>.json`.
 
-After updating `ig_strategy.py`, update the corresponding values in `strategy_parameters.json` at the project root and commit the file before deploying.
+The `strategies/` directory is a Python package (contains `__init__.py`). The module name is derived from the class name by convention: strip the `Strategy` suffix and convert to snake_case (e.g. `RSIBollingerStrategy` → `rsi_bollinger`), and the module is imported as `strategies.rsi_bollinger`.
+
+**Always validate logic changes in the backtest module before modifying any live strategy.** Port the change to a backtest strategy class, run it against historical data, and confirm the behaviour is correct before applying it to the live module.
+
+After updating the live strategy module, update the corresponding values in `strategies/<StrategyClassName>.json` and commit before deploying.
+
+See [RSIBollingerStrategy documentation](../docs/strategies/RSIBollingerStrategy.md) for the reference implementation.

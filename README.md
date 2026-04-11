@@ -65,9 +65,9 @@ ig_acc_type=DEMO
 table_storage_connection=DefaultEndpointsProtocol=https;AccountName=...
 ```
 
-> `ig_acc_type` accepts `DEMO` or `LIVE`. This must match `is_live_account` in `ig_strategy.py` — see [`docs/architecture.md`](docs/architecture.md#risk-controls) before switching to a live account.
+> `ig_acc_type` controls live vs demo mode (`DEMO` or `LIVE`). See [`docs/architecture.md`](docs/architecture.md#risk-controls) before switching to a live account.
 
-Strategy parameters are stored in `strategy_parameters.json` at the project root and committed to the repository. Edit that file to change any live-trading parameter before running the bot.
+Strategy parameters are stored in `strategies/RSIBollingerStrategy.json` and committed to the repository. Edit that file to change any live-trading parameter before running the bot. See [RSIBollingerStrategy documentation](docs/strategies/RSIBollingerStrategy.md) for the full parameter reference.
 
 ---
 
@@ -76,18 +76,23 @@ Strategy parameters are stored in `strategy_parameters.json` at the project root
 ```
 kuroko/
 ├── credentials.env              # Secrets — never committed
-├── strategy_parameters.json         # Live trading strategy parameters
 ├── requirements.txt             # Live trading dependencies
 ├── .pre-commit-config.yaml      # pre-commit hooks
 │
-├── ig_main.py                   # Entry point for the live trading bot
+├── ig_main.py                   # Entry point — loads strategy dynamically
 ├── ig_client.py                 # IG Markets API wrapper (auth, retry, caching)
-├── ig_strategy.py               # Trading logic, signal generation, risk management
 ├── azure_log_handler.py         # Custom logging handler → Azure Blob Storage
+│
+├── strategies/                  # Python package — live strategy modules (.py) and config files (.json)
+│   ├── __init__.py
+│   ├── rsi_bollinger.py         # RSIBollingerStrategy: trading logic, signal generation, risk management
+│   └── RSIBollingerStrategy.json
 │
 ├── docs/
 │   ├── architecture.md          # Component breakdown, trading logic, config flow
-│   └── development.md           # Branching model, pre-commit, conventions, adding strategies
+│   ├── development.md           # Branching model, pre-commit, conventions, adding strategies
+│   └── strategies/
+│       └── RSIBollingerStrategy.md  # Strategy parameters, entry/exit logic, protection mechanisms
 │
 └── backtest/                    # Offline backtesting and optimization (isolated venv)
     ├── requirements.txt         # Backtest-specific dependencies
@@ -111,19 +116,21 @@ kuroko/
 source venv/bin/activate          # macOS/Linux
 .\venv\Scripts\activate           # Windows
 
-python ig_main.py [partition_key]
+python ig_main.py <partition_key> --strategy <StrategyName>
 ```
 
-`partition_key` is the label used to identify this deployment's log blob in Azure Blob Storage. Defaults to `DEV_NQ100` if omitted.
+`partition_key` is the label used to identify this deployment's log blob in Azure Blob Storage (required). `--strategy` is also required and must name the strategy class to run.
 
 ```bash
-python ig_main.py DEV_NQ100       # Development config for NASDAQ 100
-python ig_main.py PROD_NQ100      # Production config for NASDAQ 100
+python ig_main.py DEV_NQ100 --strategy RSIBollingerStrategy   # Development config for NASDAQ 100
+python ig_main.py PROD_NQ100 --strategy RSIBollingerStrategy  # Production config for NASDAQ 100
 ```
+
+See [RSIBollingerStrategy documentation](docs/strategies/RSIBollingerStrategy.md) for parameter reference.
 
 Stop the bot with `CTRL+C`.
 
-> **Startup failure**: if the bot exits immediately with a `CRITICAL` log entry, verify that `strategy_parameters.json` exists at the project root, contains valid JSON, has all 23 required keys with the correct types, and that `candle_frecuency` matches the pattern `\d+min` (e.g. `"15min"`). The error log will list every missing key and type mismatch in one report. Startup parameter load is the only fatal failure — everything else is recovered automatically.
+> **Startup failure**: if the bot exits immediately with a `CRITICAL` log entry, first check the strategy module name (e.g. `strategies/rsi_bollinger.py` must exist). Then verify that `strategies/RSIBollingerStrategy.json` contains valid JSON, has all 23 required keys with the correct types, and that `candle_frecuency` matches the pattern `\d+min` (e.g. `"15min"`). The error log will list every missing key and type mismatch in one report. Startup failure is the only fatal failure — everything else is recovered automatically.
 
 > **Runtime failures**: the bot does not crash on IG API errors. If the IG API is unavailable (maintenance window, timeout, empty response), the bot skips the affected cycle, logs a WARNING or ERROR, and retries on the next tick (~1 minute). It recovers automatically when the API comes back. See [`docs/architecture.md`](docs/architecture.md#fault-tolerance-and-self-healing) for the full recovery model.
 

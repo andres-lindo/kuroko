@@ -17,7 +17,8 @@ Kuroko is split into two independent execution contexts that share no runtime st
 
 ```
 ig_main.py  ← load_dotenv("credentials.env") runs at module scope, before main()
-├── ig_strategy.load_params("strategy_parameters.json") → types.SimpleNamespace
+├── load_strategy(args.strategy) → (RSIBollingerStrategy, load_params)
+├── load_params("strategies/RSIBollingerStrategy.json") → types.SimpleNamespace
 │   └── keys: candle_frecuency, epic, max_positions, rsi_period, bb_period, ...
 │
 ├── AzureBlobHandler
@@ -29,7 +30,7 @@ ig_main.py  ← load_dotenv("credentials.env") runs at module scope, before main
 │   ├── Creates IG Markets REST session
 │   └── Creates ./cache/ directory for parquet persistence
 │
-└── Strategy(params, ig_client).run()
+└── RSIBollingerStrategy(params, ig_client).run()
     └── main loop (15-min cadence, aligned to candle close)
 ```
 
@@ -49,11 +50,11 @@ Wrapper around the `trading-ig` library. All API calls go through `_safe_api_cal
 
 Key methods: `get_candles()`, `get_open_positions()`, `open_position()`, `close_position()`, `update_position()`.
 
-#### `Strategy` (`ig_strategy.py`)
+#### `RSIBollingerStrategy` (`strategies/rsi_bollinger.py`)
 
-Contains all trading logic. Initialized with the config object from `strategy_parameters.json` and an `IGClient` instance.
+Contains all trading logic. Initialized with the config object from `strategies/RSIBollingerStrategy.json` and an `IGClient` instance. See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for full parameter reference and logic details.
 
-**Indicators computed per cycle** (via TA-Lib on 15-min NASDAQ futures — epic loaded from `strategy_parameters.json`):
+**Indicators computed per cycle** (via TA-Lib on 15-min NASDAQ futures — epic loaded from `strategies/RSIBollingerStrategy.json`):
 
 | Indicator | Parameter source |
 |---|---|
@@ -85,7 +86,7 @@ Contains all trading logic. Initialized with the config object from `strategy_pa
 
 - **Max drawdown freeze**: if drawdown exceeds `max_drawdown_pct` (75.75%), no new entries are opened for the rest of the session
 - **Margin check**: verifies sufficient free margin before opening any position
-- **Virtual margin** (`is_live_account = False`): simulates 1:20 leverage against `initial_cash_balance = 4000` (the virtual capital base) regardless of the actual IG demo balance. `demo_starting_balance = 20000` is the IG demo account reference used only for realized P&L calculation. Set `is_live_account = True` only when switching to a real account — this changes margin and equity calculations to use raw broker figures instead of the virtual simulation
+- **Virtual margin** (when `is_live_account=False`): simulates 1:20 leverage against `initial_cash_balance = 4000` (the virtual capital base) regardless of the actual IG demo balance. `demo_starting_balance = 20000` is the IG demo account reference used only for realized P&L calculation. `is_live_account` is `True` only when `ig_acc_type=LIVE` (exact, case-sensitive match) — any other value, including `DEMO` or missing, results in `False` (virtual mode). Setting `ig_acc_type=LIVE` in `credentials.env` switches margin and equity calculations to use raw broker figures instead of the virtual simulation
 
 #### `AzureBlobHandler` (`azure_log_handler.py`)
 
@@ -127,12 +128,12 @@ while True:
 
 Each individual `close_position()` call is wrapped in its own retry loop: 3 attempts with 1s/2s backoff. A failure on one position does not block the remaining closes. Failed deal IDs are accumulated and reported in a single WARNING after all positions are processed.
 
-**Layer 6 — Startup config (`strategy_parameters.json` in `ig_strategy.py`)**
+**Layer 6 — Startup config (`strategies/RSIBollingerStrategy.json` in `rsi_bollinger.py`)**
 
 A failure here is fatal by design — the bot cannot trade without its configuration. `load_params()` handles three failure modes, each logging CRITICAL and calling `sys.exit(1)`:
 
 1. **File errors** — missing file (`FileNotFoundError`), invalid JSON (`JSONDecodeError`), or unreadable file (`OSError`).
-2. **Schema errors** — `_validate_params()` checks that all 23 required keys are present and correctly typed (e.g. `int` fields reject `bool`, `float` fields accept `int`). All errors are collected and reported at once before exiting.
+2. **Schema errors** — `_validate_params()` checks that all 22 required keys are present and correctly typed (e.g. `int` fields reject `bool`, `float` fields accept `int`). All errors are collected and reported at once before exiting.
 3. **Format error** — `candle_frecuency` must match the regex `^\d+min$` (e.g. `"15min"`).
 
 No retry is attempted; the process manager (systemd, supervisor, etc.) handles restart scheduling.
@@ -171,13 +172,13 @@ Custom `logging.Handler` that ships all log records to Azure Blob Storage. Uses 
 
 ### Configuration Flow
 
-Strategy parameters are stored in `strategy_parameters.json` at the project root and loaded at startup. Changing a parameter requires editing the file and redeploying the bot.
+Strategy parameters are stored in `strategies/RSIBollingerStrategy.json` and loaded at startup via `load_params()`. Changing a parameter requires editing the file and redeploying the bot.
 
 ```
-strategy_parameters.json (project root)
+strategies/RSIBollingerStrategy.json
 └── json.load() → dict
     └── types.SimpleNamespace(**data) → params
-        └── Strategy(params=params, ig_client=ig)
+        └── RSIBollingerStrategy(params=params, ig_client=ig)
             └── self.params.candle_frecuency / .epic / .max_positions / ...
 ```
 
@@ -188,12 +189,12 @@ Key parameters and their roles:
 | `candle_frecuency` | string (`\d+min`) | Candle resolution used by the strategy (e.g. `"15min"`) |
 | `epic` | string | IG Markets instrument identifier |
 | `max_positions` | int | Maximum number of simultaneous open positions |
-| `is_live_account` | bool | `false` = DEMO (virtual equity mirror); `true` = LIVE (broker equity) |
+| `ig_acc_type` | env var | `LIVE` (exact, case-sensitive) → `is_live_account=True` (broker equity). Any other value including `DEMO` or missing → `is_live_account=False` (virtual equity mirror). Set in `credentials.env`, not in the JSON config |
 | `initial_cash_balance` | float | Simulated capital base for virtual margin calculation |
 | `demo_starting_balance` | float | IG demo account reference balance for realized P&L |
 | `take_profit_ticks` | float | Basket take-profit distance in price ticks |
 | `martingale_multiplier` | float | Position size multiplier for each grid level |
-| *(+ 15 more)* | — | See `strategy_parameters.json` for the full list |
+| *(+ 15 more)* | — | See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for the full list |
 
 `table_storage_connection` is NOT in this file — it is read from the environment (`credentials.env`) exclusively for `AzureBlobHandler` log shipping.
 
