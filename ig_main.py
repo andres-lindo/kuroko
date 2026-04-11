@@ -1,4 +1,8 @@
-# main.py
+"""Entry point for the Kuroko live trading bot.
+
+Loads configuration from Azure Table Storage, initialises logging (console
+and Azure Blob), connects to IG Markets, and starts the strategy loop.
+"""
 import os
 import ast
 import sys
@@ -13,52 +17,76 @@ from ig_strategy import Strategy
 from azure_log_handler import AzureBlobHandler
 import warnings
 
-# Función para capturar excepciones no manejadas
+# Route unhandled exceptions through the standard logger instead of stderr
 def handle_exception(exc_type, exc_value, exc_traceback):
+    """Log unhandled exceptions before the interpreter exits.
+
+    Allows KeyboardInterrupt to pass through to the default handler so
+    CTRL+C still terminates the process cleanly.
+
+    Args:
+        exc_type: Exception class of the unhandled exception.
+        exc_value: Exception instance.
+        exc_traceback: Traceback object.
+    """
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
-    
-    logging.error("Excepción no manejada:", exc_info=(exc_type, exc_value, exc_traceback))
 
-# Carga variables de entorno de .env
+    logging.error("Unhandled exception:", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+# Load secrets from credentials.env before any module reads environment variables
 load_dotenv("credentials.env")
 
-# Logging del módulo principal
+# Configure root logger so all modules emit to stdout with a consistent format
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 
-# Se establece el nivel de logging a WARNING para evitar mensajes innecesarios
+# Suppress verbose INFO output from third-party libraries that are not actionable
 logging.getLogger("azure").setLevel(logging.WARNING)
 logging.getLogger("trading_ig.rest").setLevel(logging.WARNING)
 
-# Ignorar advertencias
+# Suppress FutureWarnings from trading_ig until the upstream library is updated
 warnings.filterwarnings("ignore", category=FutureWarning, module="trading_ig.utils")
 warnings.filterwarnings("ignore", category=FutureWarning, module="trading_ig.rest")
 
+
 def load_params(partition_key: str):
+    """Load strategy configuration from Azure Table Storage.
+
+    Queries the ConfigParameters table for rows matching partition_key or
+    the shared 'BASE_CONF' partition, then deserialises each value into the
+    correct Python type based on the key name.
+
+    Args:
+        partition_key: Azure Table PartitionKey that selects the config set
+            (e.g. 'DEV_US500').
+
+    Returns:
+        Config object whose attributes correspond to each RowKey in the table,
+        with values cast to str, float, bool, or int as appropriate.
     """
-    Carga los parámetros de configuración desde Azure Table Storage filtrando
-    por PartitionKey == partition_key o 'BASE_CONF', y retorna un objeto con atributos.
-    """
-    # Conectar al servicio de tablas de Azure
+    # Connect to Azure Table Storage using the connection string from the environment
     conn_str = os.getenv('table_storage_connection')
     table_service = TableServiceClient.from_connection_string(conn_str=conn_str)
     table_client = table_service.get_table_client(table_name="ConfigParameters")
 
-    # Consultar las entidades deseadas
+    # Fetch rows for the requested partition and the shared base config
     entities = table_client.query_entities(f"PartitionKey eq '{partition_key}' or PartitionKey eq 'BASE_CONF'")
 
-    # Leer todos los valores
+    # Flatten entity list into a {RowKey: Value} mapping
     raw = {e['RowKey']: e['Value'] for e in entities}
 
-    # Objeto contenedor de configuración
-    class Config: pass
+    class Config:
+        """Namespace object that holds configuration values as attributes."""
+        pass
+
     cfg = Config()
 
-    # Asignar atributos, convirtiendo tipos según la clave
+    # Dispatch each key to the correct Python type; keys not listed default to int
     for key, val in raw.items():
         if key in ('table_storage_name', 'table_log_name', 'cfd_symbol', 'candle_frecuency'):
             setattr(cfg, key, val)
@@ -72,25 +100,32 @@ def load_params(partition_key: str):
         else:
             setattr(cfg, key, int(val))
 
-    # También guardamos la cadena de conexión
+    # Attach the raw connection string so downstream components can reuse it
     setattr(cfg, 'table_storage_connection', conn_str)
 
     return cfg
 
+
 def main():
-    # Se espera que el primer argumento sea la clave de partición para Azure Table
-    parser = argparse.ArgumentParser(description="Inicia el bot de trading")
+    """Parse CLI arguments, bootstrap the bot, and start the strategy loop.
+
+    Reads the partition_key from the command line, loads parameters from
+    Azure Table Storage, attaches Azure Blob log shipping, and then runs
+    the strategy until interrupted.
+    """
+    # The partition key selects the Azure Table row set for this deployment
+    parser = argparse.ArgumentParser(description="Start the trading bot")
     parser.add_argument(
         'partition_key', nargs='?', default="DEV_US500",
-        help="PartitionKey para filtrar parámetros en Azure Table"
+        help="PartitionKey to filter parameters from Azure Table Storage"
     )
     args = parser.parse_args()
 
-    # Parámetros globales de Azure Table
+    # Load all strategy parameters from Azure Table Storage
     params = load_params(args.partition_key)
-    logging.info("Parámetros cargados")
-    
-    # Configurar Azure Blob Handler para logging
+    logging.info("Parameters loaded.")
+
+    # Attach Azure Blob log handler so logs are shipped to cloud storage
     try:
         azure_handler = AzureBlobHandler(
             connection_string=params.table_storage_connection,
@@ -98,32 +133,33 @@ def main():
             container_name="logs"
         )
 
-        # Usar el mismo formato que el handler de consola
+        # Reuse the same format as the console handler for consistency
         azure_handler.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
         ))
 
-        # Añadir el handler al root logger
+        # Attach to root logger so all modules ship their output to the blob
         logging.getLogger().addHandler(azure_handler)
-        logging.info(f"Logging configurado para Azure Blob Storage - {args.partition_key}")
+        logging.info(f"Azure Blob logging configured for partition: {args.partition_key}")
 
-        # Configurar el manejador de excepciones no manejadas
+        # Register the unhandled-exception hook after the blob handler is ready
         sys.excepthook = handle_exception
     except Exception as e:
-        logging.warning(f"No se pudo configurar Azure Blob logging: {e}")
+        logging.warning(f"Could not configure Azure Blob logging: {e}")
 
-    # Cliente IG
+    # Initialise broker client and strategy, then enter the main loop
     ig = IGClient()
     strat = Strategy(params=params, ig_client=ig)
 
-    logging.info('Bot IG iniciado. CTRL+C para detener.')
+    logging.info('IG bot started. Press CTRL+C to stop.')
     try:
         strat.run()
     except KeyboardInterrupt:
-        logging.info('CTRL+C detectado. Saliendo...')
+        logging.info('CTRL+C detected. Exiting...')
     except Exception as e:
-        logging.exception("Error crítico en la aplicación:")
+        logging.exception("Critical application error:")
         raise
+
 
 if __name__ == '__main__':
     main()

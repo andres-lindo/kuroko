@@ -1,3 +1,11 @@
+"""Backtest runner and helper utilities for the Kuroko strategy framework.
+
+Provides functions to load data, resolve strategy classes by name, retrieve
+default parameters, and execute a ``backtesting.py`` backtest. Intended to be
+invoked directly (``python backtest.py --strategy <Name>``) or imported by the
+Optuna tuning script.
+"""
+
 from backtesting import Backtest
 import pandas as pd
 import os
@@ -7,7 +15,19 @@ import warnings
 import logging
 import sys
 
+
 def setup_logging(filename="backtest-last-execution.log"):
+    """Configure root logger to write to a file and stdout simultaneously.
+
+    Clears any handlers registered by a previous call so the function is
+    safe to call multiple times (e.g. when the CLI re-runs with a different
+    strategy). The log file is opened in write mode, so each run starts with
+    a fresh file rather than appending to an old one.
+
+    Args:
+        filename: Path to the log file. Defaults to
+            ``'backtest-last-execution.log'`` in the current directory.
+    """
     for handler in logging.root.handlers[:]:
         logging.root.removeHandler(handler)
 
@@ -20,60 +40,114 @@ def setup_logging(filename="backtest-last-execution.log"):
         ]
     )
 
-# Suprimir warning de fractional trading cuando usamos leverage
+# Suppress the fractional-trading UserWarning that backtesting.py emits when
+# leverage-based margin accounts hold non-integer contract sizes.
 warnings.filterwarnings('ignore', category=UserWarning, message='.*fractional trading.*')
 
-# --- Registro de Estrategias ---
+# --- Strategy Registry ---
 STRATEGY_REGISTRY = {
     "RSIBollingerStrategy": "strategies.rsi_bollinger",
 }
 
 def load_raw_data(csv_file):
-    """Solo carga el CSV en memoria, sin procesar"""
+    """Load a CSV dataset into a DataFrame without any preprocessing.
+
+    Date parsing is intentionally deferred to the strategy's
+    ``prepare_data`` classmethod so that this function remains cheap even
+    when the caller only needs to inspect column names or row counts.
+
+    Args:
+        csv_file: Absolute or relative path to the OHLC CSV file.
+
+    Returns:
+        Raw :class:`pandas.DataFrame` with all columns as read from disk.
+
+    Raises:
+        FileNotFoundError: If ``csv_file`` does not exist.
+    """
     if not os.path.exists(csv_file):
         raise FileNotFoundError(f"File not found: {csv_file}")
-    
-    # Carga rápida, sin parsear fechas aun para no perder tiempo si la estrategia no lo necesita
+
+    # Skip date parsing here — the strategy's prepare_data is responsible
+    # for interpreting and filtering the index.
     return pd.read_csv(csv_file, low_memory=False)
 
 def load_strategy_class(strategy_name):
-    """Convierte el string 'strategy_name' en la clase real"""
+    """Resolve a strategy name string to the corresponding class object.
+
+    Uses :data:`STRATEGY_REGISTRY` to look up the module path, then imports
+    it dynamically. This keeps the backtest runner decoupled from concrete
+    strategy imports — adding a new strategy only requires a registry entry.
+
+    Args:
+        strategy_name: Registered name of the strategy (e.g.
+            ``'RSIBollingerStrategy'``).
+
+    Returns:
+        The strategy class (a subclass of
+        :class:`backtesting.Strategy`).
+
+    Raises:
+        ValueError: If ``strategy_name`` is not present in
+            :data:`STRATEGY_REGISTRY`.
+    """
     if strategy_name not in STRATEGY_REGISTRY:
         available = ", ".join(STRATEGY_REGISTRY.keys())
-        raise ValueError(f"Estrategia '{strategy_name}' no registrada. Disponibles: {available}")
-    
-    # Magia de importación dinámica
+        raise ValueError(
+            f"Strategy '{strategy_name}' not registered. Available: {available}"
+        )
+
+    # Dynamic import — the registry maps name → dotted module path.
     module_path = STRATEGY_REGISTRY[strategy_name]
     module = importlib.import_module(module_path)
     return getattr(module, strategy_name)
 
 def get_strategy_params(strategy_name):
-    """Devuelve los parámetros por defecto para la estrategia especificada"""
+    """Return the default run parameters for a registered strategy.
+
+    Parameters are split into two groups inside each entry:
+    engine parameters (cash, leverage, commission, mode flags) and
+    strategy parameters (indicator settings, risk limits). Both groups
+    are returned together in a single flat dict so callers can pass them
+    directly to :func:`run`.
+
+    Args:
+        strategy_name: Registered name of the strategy (e.g.
+            ``'RSIBollingerStrategy'``).
+
+    Returns:
+        A shallow copy of the parameter dict so callers can safely
+        ``pop`` keys without mutating the registry.
+
+    Raises:
+        ValueError: If ``strategy_name`` has no entry in
+            ``STRATEGY_PARAMS``.
+    """
     STRATEGY_PARAMS = {
         "RSIBollingerStrategy": {
-            # --- Fechas de Backtest ---
-            "start_date": "2026-01-01",  # Fecha de inicio de la simulación.
-            "end_date": "2026-04-10",  # Fecha de fin de la simulación.
-            "dataset": "nq_intraday-15min.csv",  # Archivo de datos (Futuros ES 15min).
-            # --- Configuración del Motor ---
-            "initial_cash_balance": 400000,  # Capital inicial en USD.
-            "leverage": 20.0,  # CRÍTICO: Apalancamiento RETAIL (1:20). Requiere 5% de margen ($345/contrato).
-            "commission": 0.00012,  # Comisión simulada por operación.
-            "silent_mode": False,  # False = Muestra logs detallados de cada compra/venta en consola.
-            "objective_type": "single",  # Optimización enfocada en un solo objetivo (Maximizar Equity).
-            # --- Parámetros de la Estrategia ---
-            "max_positions": 5,  # Límite de seguridad: Máximo 5 niveles de compras escalonadas para no quemar margen.
-            "min_dist_between_entries_ticks": 100.0,  # Espacio entre compras: 16 ticks = 4 Puntos ES. Evita comprar muy seguido.
-            "martingale_multiplier": 1.5,  # Factor de Martingala: Aumenta el tamaño (x1, x1.5, x2.25...) para promediar precio agresivamente.
-            "bb_dev": 1.9,  # Desviación Estándar. 1.7 es "sensible", entra antes de llegar a los extremos absolutos (2.0).
-            "bb_period": 20,  # Periodo base para las Bandas de Bollinger (Medición de volatilidad media).
-            "rsi_period": 11,  # Periodo estándar del oscilador RSI.
-            "rsi_overbought": 76,  # Umbral de VENTA (Short). Solo vende si el RSI sube de 77 (mercado muy caliente).
-            "rsi_oversold": 25,  # Umbral de COMPRA (Long). Solo compra si el RSI baja de 39 (mercado barato).
-            "use_trend_filter": False,  # False = Estrategia "Mean Reversion" pura (apuesta al rebote, ignora la tendencia general).
-            "take_profit_ticks": 240.0,  # Objetivo de Ganancia: 56 ticks = 14 Puntos desde el PRECIO PROMEDIO de la cesta.
-            "atr_period": 12,  # Periodo del ATR para medir qué tan "nervioso" está el mercado hoy.
-            "atr_sl_multiplier": 11.0,  # Stop Loss Dinámico: 12 veces el ATR. Es un Stop muy lejano para dejar respirar a la Martingala.
+            # --- Backtest Date Range ---
+            "start_date": "2026-01-01",  # Inclusive simulation start date.
+            "end_date": "2026-04-10",  # Inclusive simulation end date.
+            "dataset": "nq_intraday-15min.csv",  # OHLC dataset file (NQ futures, 15-min bars).
+            # --- Engine Configuration ---
+            "initial_cash_balance": 400000,  # Starting capital in USD.
+            "leverage": 20.0,  # CRITICAL: Retail leverage 1:20; requires 5% margin (~$345/contract).
+            "commission": 0.00012,  # Simulated round-trip commission per trade.
+            "silent_mode": False,  # False = emit detailed buy/sell logs to console.
+            "objective_type": "single",  # Optimisation target: single-objective (maximise equity).
+            # --- Strategy Parameters ---
+            "max_positions": 5,  # Safety cap: max 5 grid levels to prevent margin exhaustion.
+            "min_dist_between_entries_ticks": 100.0,  # Min tick gap between entries to avoid clustering.
+            "martingale_multiplier": 1.5,  # Grid size multiplier: contracts scale as x1, x1.5, x2.25 …
+            "bb_dev": 1.9,  # Bollinger Band standard deviation width (1.7 = tighter, 2.0 = wider).
+            "bb_period": 20,  # Bollinger Band and SMA lookback period.
+            "rsi_period": 11,  # RSI oscillator lookback period.
+            "rsi_overbought": 76,  # RSI level above which short entries are allowed.
+            "rsi_oversold": 25,  # RSI level below which long entries are allowed.
+            "use_trend_filter": False,  # False = pure mean-reversion (ignores trend direction).
+            "take_profit_ticks": 240.0,  # Profit target in ticks measured from the basket average price.
+            "atr_period": 12,  # ATR lookback period for dynamic stop-loss calculation.
+            "atr_sl_multiplier": 11.0,  # ATR multiplier for the stop-loss distance (wider = more room).
         },
         # Add more strategy configurations here
     }
@@ -96,9 +170,38 @@ def generate_plot(bt_instance, filename="backtest_result.html"):
         print(f"❌ Could not generate plot: {e}", end="\n\n")
 
 def run(data, params, strategy_class=None):
-    """Ejecuta el backtest con los parámetros especificados"""
+    """Execute a backtest and return results according to the active objective mode.
 
-    # 1. Extraer configuración del motor (con valores por defecto si no están en params)
+    The return value varies by the combination of ``silent_mode`` and
+    ``objective_type`` so that the Optuna tuning loop can consume results
+    directly without post-processing:
+
+    - ``silent_mode=False`` (normal): returns the full ``backtesting.py``
+      stats object and prints a human-readable summary.
+    - ``silent_mode=True, objective_type='single'``: returns a single
+      float (final equity) for fast single-objective Optuna trials.
+    - ``silent_mode=True, objective_type in ('multiple', 'weighted')``:
+      returns a dict of metric scalars for multi-objective Pareto trials.
+
+    Args:
+        data: Preprocessed :class:`pandas.DataFrame` ready for
+            ``backtesting.py`` (must have OHLCV columns and a
+            datetime index).
+        params: Flat parameter dict containing both engine keys
+            (``initial_cash_balance``, ``leverage``, ``commission``,
+            ``silent_mode``, ``objective_type``) and strategy-specific
+            keys. The function mutates this dict by popping engine keys.
+        strategy_class: The strategy class to run. Must be a subclass of
+            :class:`backtesting.Strategy`.
+
+    Returns:
+        Depends on ``silent_mode`` / ``objective_type`` — see above.
+        Returns a penalty value (``0.0`` or a dict of ``-100`` values)
+        when the strategy triggered its max-drawdown freeze.
+    """
+
+    # 1. Extract engine configuration keys from params before passing the
+    #    remainder to bt.run(), which only accepts strategy-level parameters.
     initial_cash = params.get('initial_cash_balance')
     leverage = params.get('leverage')
     commission = params.get('commission')
@@ -106,10 +209,11 @@ def run(data, params, strategy_class=None):
     silent_mode = params.pop('silent_mode')
     objective_type = params.pop('objective_type')
 
-    # Inyectar silent_mode a la clase (truco para que el log interno de la estrategia lo vea)
+    # Inject silent_mode into the class attribute so the strategy's internal
+    # log() method can read it without receiving it as a constructor argument.
     strategy_class.silent_mode = silent_mode
 
-    # 2. Instanciar Motor
+    # 2. Instantiate the backtesting engine
     bt = Backtest(
         data,
         strategy_class,
@@ -121,7 +225,8 @@ def run(data, params, strategy_class=None):
         hedging=True
     )
 
-    # 3. Ejecutar Backtest (pasando solo los parámetros de la estrategia)
+    # 3. Run the backtest, forwarding only strategy-level params (engine keys
+    #    were already popped above).
     stats = bt.run(**params)
 
     trades_df = stats._trades
@@ -142,13 +247,19 @@ def run(data, params, strategy_class=None):
         else:
             return stats
 
-    # Caso 1: Silent mode + Objective Single (Optimización rápida)
+    # Four-way branch on (silent_mode, objective_type):
+    #   silent + single   → return a single float for Optuna to maximise
+    #   silent + multiple → return a metric dict for Pareto optimisation
+    #   silent + weighted → return a metric dict for weighted scoring
+    #   normal (any)      → print the full report and return the stats object
+
+    # Case 1: Silent + single-objective (fast Optuna trial)
     if silent_mode and objective_type == 'single':
         portfolio_value = stats['Equity Final [$]']
         print(f"Equity: {portfolio_value:.2f}")
         return round(portfolio_value, 1)
 
-    # Cálculos de métricas
+    # Shared metric calculations used by both silent-multiple and normal modes.
     closed_trades = trades_df[trades_df["ExitTime"].notna()]
     n_winning = len(closed_trades[closed_trades["PnL"] > 0])
     n_losing = len(closed_trades[closed_trades["PnL"] < 0])
@@ -160,7 +271,7 @@ def run(data, params, strategy_class=None):
     sharpe_ratio = stats['Sharpe Ratio']
     sortino_ratio = stats['Sortino Ratio']
 
-    # Silent mode: objective multiple/weighted
+    # Case 2 & 3: Silent + multiple/weighted — return a metric dict for Optuna.
     if silent_mode and objective_type in ("multiple", "weighted"):
         print(
             f"Portfolio Value: {final_equity:.2f}. Trades: {len(trades_df)}. Closed: {len(closed_trades)}. Win: {n_winning} ({win_rate:.2f}%). Loss: {n_losing}. Drawdown: {max_dd:.2f}. Net Profit: {final_equity - params['initial_cash_balance']:.2f}."
@@ -174,7 +285,7 @@ def run(data, params, strategy_class=None):
             "sharpe_ratio": sharpe_ratio,
         }
 
-    # Caso 4: Modo Normal (Reporte Completo)
+    # Case 4: Normal mode — print full human-readable report.
     print(f"\n{stats}\n")
     print("="*60)
     print("Operations Summary:")
@@ -193,7 +304,7 @@ def run(data, params, strategy_class=None):
     print(f"Net Profit: {final_equity - params['initial_cash_balance']:.2f}")
     print("="*60)
 
-    # Generar gráfico interactivo
+    # Generate the interactive HTML chart only in normal (non-silent) mode.
     if not silent_mode:
         generate_plot(bt)
 
@@ -207,29 +318,30 @@ if __name__ == '__main__':
 
     setup_logging(f"{args.strategy}-backtest-last-execution.log")
 
-    # Obtener Clase
+    # 1. Resolve the strategy class from the registry.
     StrategyClass = load_strategy_class(args.strategy)
-    
-    # Obtener Parámetros del Panel de Control
+
+    # 2. Load default parameters from the control panel.
     params = get_strategy_params(args.strategy)
 
-    # Obtener configuracion de dataset y fechas
+    # 3. Extract dataset path and date range before passing params to run().
     csv_filename = params.pop('dataset')
     start_date = params.pop('start_date')
     end_date = params.pop('end_date')
 
-    # Rutas y Fechas
+    # Build the absolute path to the dataset file.
     script_dir = os.path.dirname(__file__)
     csv_file = os.path.join(script_dir, 'datasets', csv_filename)
 
     print(f"Running backtest with strategy: {args.strategy}")
-    
-    # 3. Cargar Data Cruda
+
+    # 4. Load raw CSV — date parsing is deferred to prepare_data.
     raw_df = load_raw_data(csv_file)
 
-    # 4. Preparar Data (Responsabilidad de la Estrategia)
-    # Si la estrategia no tiene prepare_data, fallará aquí (lo cual es deseado para forzar la implementación)
+    # 5. Preprocess data via the strategy's classmethod. If the strategy class
+    #    does not implement prepare_data, this will raise AttributeError, which
+    #    is intentional — every strategy must own its data contract.
     data = StrategyClass.prepare_data(raw_df, start_date, end_date)
 
-    # 5. Ejecutar
+    # 6. Execute the backtest.
     run(data, params, StrategyClass)
