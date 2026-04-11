@@ -91,18 +91,13 @@ def _validate_params(data: dict, path: str) -> None:
 
     if errors:
         logging.critical(
-            "Parameter validation failed for %s — %d error(s):\n%s",
-            path,
-            len(errors),
-            "\n".join(errors),
+            f"Parameter validation failed for {path} — {len(errors)} error(s):\n" + "\n".join(errors)
         )
         sys.exit(1)
 
     if not re.match(r"^\d+min$", data["candle_frecuency"]):
         logging.critical(
-            "Invalid candle_frecuency in %s — must match '<N>min' (e.g. '15min'), got: %r",
-            path,
-            data["candle_frecuency"],
+            f"Invalid candle_frecuency in {path} — must match '<N>min' (e.g. '15min'), got: {data['candle_frecuency']!r}"
         )
         sys.exit(1)
 
@@ -129,18 +124,18 @@ def load_params(path: str = "strategy_parameters.json") -> types.SimpleNamespace
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        logging.critical("Parameters file not found: %s", path)
+        logging.critical(f"Parameters file not found: {path}")
         sys.exit(1)
     except json.JSONDecodeError as e:
-        logging.critical("Invalid JSON in %s: %s", path, e)
+        logging.critical(f"Invalid JSON in {path}: {e}")
         sys.exit(1)
     except OSError as e:
-        logging.critical("Could not read %s: %s", path, e)
+        logging.critical(f"Could not read {path}: {e}")
         sys.exit(1)
 
     _validate_params(data, path)
 
-    logging.info("Parameters loaded from %s.", path)
+    logging.info(f"Parameters loaded from {path}.")
     return types.SimpleNamespace(**data)
 
 
@@ -252,9 +247,7 @@ class Strategy:
 
             return self.candles
         except Exception as e:
-            logger.error(
-                "Candle fetch failed — using cached data: %s", e, exc_info=True
-            )
+            logger.error(f"Candle fetch failed — using cached data: {e}", exc_info=True)
             return self.candles
 
     def manage_positions(self):
@@ -509,28 +502,19 @@ class Strategy:
                     break
                 except Exception as e:
                     last_exc = e
-                    logger.warning(
-                        "Close attempt %d/3 failed for position %s: %s",
-                        attempt,
-                        deal_id,
-                        e,
-                    )
+                    logger.warning(f"Close attempt {attempt}/3 failed for position {deal_id}: {e}")
                     if attempt < 3:
                         time.sleep(2 ** (attempt - 1))  # 1s, 2s
 
             if last_exc is not None:
                 logger.error(
-                    "All 3 close attempts failed for position %s: %s",
-                    deal_id,
-                    last_exc,
+                    f"All 3 close attempts failed for position {deal_id}: {last_exc}",
                     exc_info=True,
                 )
                 failed.append(deal_id)
 
         if failed:
-            logger.warning(
-                "Could not close %d position(s) after retries: %s", len(failed), failed
-            )
+            logger.warning(f"Could not close {len(failed)} position(s) after retries: {failed}")
 
     def log_account_status(self):
         """Log a structured account snapshot to the configured logger.
@@ -604,7 +588,7 @@ class Strategy:
         fetch candles → manage positions → log account status.
         """
         freq = int(self.params.candle_frecuency.replace("min", ""))
-        logger.info("Strategy running. Execution every %d minutes.", freq)
+        logger.info(f"Strategy running. Execution every {freq} minutes.")
         next_tick = (datetime.now() + timedelta(minutes=1)).replace(second=0, microsecond=0)
 
         while True:
@@ -620,9 +604,7 @@ class Strategy:
                     self.get_candles()
 
                     if not self.candles.empty:
-                        logger.info(
-                            "Last 5 candles.\n%s", self.candles.tail(5).to_string()
-                        )
+                        logger.info(f"Last 5 candles.\n{self.candles.tail(5).to_string()}")
                         self.manage_positions()
                         self.log_account_status()
                     else:
@@ -631,8 +613,7 @@ class Strategy:
                     raise
                 except Exception as e:
                     logger.error(
-                        "Trading cycle failed — will retry next tick: %s",
-                        e,
+                        f"Trading cycle failed — will retry next tick: {e}",
                         exc_info=True,
                     )
 

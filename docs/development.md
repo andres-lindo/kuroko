@@ -123,7 +123,7 @@ def fetch_data(self):
     try:
         return self._client.get(...)
     except SomeSpecificError as e:
-        logger.error("Failed to fetch data: %s", e)
+        logger.error(f"Failed to fetch data: {e}")
         return None
 ```
 

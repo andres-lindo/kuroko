@@ -107,9 +107,7 @@ class IGClient:
                             log.info("Session refreshed successfully.")
                             continue  # Retry with the new session
                         except Exception as refresh_error:
-                            log.error(
-                                "Error refreshing session: %s", refresh_error
-                            )
+                            log.error(f"Error refreshing session: {refresh_error}")
 
                 log.debug(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}")
 
@@ -221,7 +219,7 @@ class IGClient:
 
                 return df.tail(num_points).copy()
             except Exception as e:
-                log.error("Initial candle load failed: %s", e, exc_info=True)
+                log.error(f"Initial candle load failed: {e}", exc_info=True)
                 return None
 
         # Incremental update: fetch only the 3 most recent candles

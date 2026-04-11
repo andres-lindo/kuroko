@@ -105,7 +105,7 @@ def main():
     ig = IGClient()
     strat = Strategy(params=params, ig_client=ig)
 
-    logging.info('IG bot started. Press CTRL+C to stop.')
+    logging.info('Kuroko started. Press CTRL+C to stop.')
     try:
         strat.run()
     except KeyboardInterrupt:
