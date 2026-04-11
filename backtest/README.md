@@ -54,7 +54,6 @@ pip install -r requirements.txt
 
 ```bash
 python backtest.py --strategy RSIBollingerStrategy
-python backtest.py --strategy EMACrossoverStrategy
 ```
 
 Results are written to an HTML plot file in the current directory. Execution log is written to `{strategy}-backtest-last-execution.log`.
@@ -64,7 +63,6 @@ Results are written to an HTML plot file in the current directory. Execution log
 | Strategy | Style | Key Indicators |
 |---|---|---|
 | `RSIBollingerStrategy` | Mean-reversion | RSI, Bollinger Bands, ATR |
-| `EMACrossoverStrategy` | Trend-following | EMA, RSI, ATR |
 
 ---
 
@@ -85,7 +83,7 @@ python tuning.py \
 
 | Argument | Required | Description |
 |---|---|---|
-| `--strategy` | no | `RSIBollingerStrategy` or `EMACrossoverStrategy` (defaults to `EMACrossoverStrategy`) |
+| `--strategy` | no | `RSIBollingerStrategy` (default) |
 | `--start_date` | yes | Backtest start date (`YYYY-MM-DD`) |
 | `--end_date` | yes | Backtest end date (`YYYY-MM-DD`) |
 | `--objective_type` | yes | `single` · `multiple` · `weighted` (see below) |
@@ -101,7 +99,7 @@ python tuning.py \
 
 Outputs are written to `tuning_output/` — one JSON file with trial results and one log file per run, both timestamped as `tuning_{strategy}_{objective}_{YYYYMMDD_HHMM}`.
 
-> **Note**: `tuning.py` hardcodes `nq_intraday-15min.csv` as the dataset regardless of the strategy selected. If you want to tune `EMACrossoverStrategy` against a different dataset, update `FILE_CONFIG['dataset_name']` in `tuning.py` before running.
+> **Note**: `tuning.py` hardcodes `nq_intraday-15min.csv` as the dataset regardless of the strategy selected. To change the dataset, update `FILE_CONFIG['dataset_name']` in `tuning.py` before running.
 
 ---
 
@@ -111,9 +109,9 @@ Historical OHLC data located in `datasets/`:
 
 | File | Resolution | Instrument | Used by |
 |---|---|---|---|
-| `nq_intraday-15min.csv` | 15-min | NASDAQ 100 futures | `RSIBollingerStrategy`, `EMACrossoverStrategy` (default) |
+| `nq_intraday-15min.csv` | 15-min | NASDAQ 100 futures | `RSIBollingerStrategy` |
 | `es_intraday-15min.csv` | 15-min | S&P 500 futures | — |
-| `es_intraday-5min.csv` | 5-min | S&P 500 futures | `EMACrossoverStrategy` (required for 5-min resolution) |
+| `es_intraday-5min.csv` | 5-min | S&P 500 futures | — |
 
 ---
 
