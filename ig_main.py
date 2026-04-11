@@ -93,7 +93,7 @@ def main():
     # The partition key is used as the log blob label in Azure Blob Storage
     parser = argparse.ArgumentParser(description="Start the trading bot")
     parser.add_argument(
-        'partition_key', nargs='?', default="DEV_US500",
+        'partition_key', nargs='?', default="DEV_NQ100",
         help="Label used to identify this deployment's log blob in Azure Blob Storage"
     )
     args = parser.parse_args()

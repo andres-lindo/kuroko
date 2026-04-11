@@ -114,10 +114,10 @@ source venv/bin/activate          # macOS/Linux
 python ig_main.py [partition_key]
 ```
 
-`partition_key` is the label used to identify this deployment's log blob in Azure Blob Storage. Defaults to `DEV_US500` if omitted.
+`partition_key` is the label used to identify this deployment's log blob in Azure Blob Storage. Defaults to `DEV_NQ100` if omitted.
 
 ```bash
-python ig_main.py DEV_US500       # Development config for S&P 500
+python ig_main.py DEV_NQ100       # Development config for NASDAQ 100
 python ig_main.py PROD_NQ100      # Production config for NASDAQ 100
 ```
 
