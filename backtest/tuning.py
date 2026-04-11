@@ -25,6 +25,18 @@ ENGINE_CONFIG = {
 }
 
 STRATEGY_SEARCH_SPACES = {
+    'EMACrossoverStrategy': {
+        'fast_ema':            {'type': 'int',   'low': 5,   'high': 20},
+        'take_profit_long':    {'type': 'float', 'low': 0.3, 'high': 1.0, 'step': 0.01},
+        'take_profit_short':   {'type': 'float', 'low': 0.3, 'high': 1.0, 'step': 0.01},
+        'stop_loss_long':      {'type': 'float', 'low': 0.3, 'high': 1.5, 'step': 0.01},
+        'stop_loss_short':     {'type': 'float', 'low': 0.3, 'high': 1.5, 'step': 0.01},
+        'max_long_positions':  {'type': 'int',   'low': 0,   'high': 15},
+        'max_short_positions': {'type': 'int',   'low': 0,   'high': 15},
+        'rsi_overbought':      {'type': 'float', 'low': 60,  'high': 70,  'step': 1.0},
+        'rsi_oversold':        {'type': 'float', 'low': 60,  'high': 80,  'step': 1.0},
+        'atr_percentile':      {'type': 'float', 'low': 10,   'high': 20,  'step': 1.0},
+    },
     'RSIBollingerStrategy': {
         'position_size':                  {'type': 'int',   'low': 10,    'high': 15},
         'max_positions':                  {'type': 'int',   'low': 3,    'high': 5},
@@ -46,7 +58,7 @@ STRATEGY_SEARCH_SPACES = {
 
 # --- Setup & Args ---
 parser = argparse.ArgumentParser()
-parser.add_argument("--strategy", type=str, default="RSIBollingerStrategy")
+parser.add_argument("--strategy", type=str, default="EMACrossoverStrategy")
 parser.add_argument("--start_date", type=str, required=True)
 parser.add_argument("--end_date", type=str, required=True)
 parser.add_argument("--objective_type", type=str, choices=["single", "multiple", "weighted"], required=True)
