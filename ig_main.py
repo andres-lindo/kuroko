@@ -107,7 +107,9 @@ def load_strategy(strategy_name: str) -> tuple[type, callable]:
     try:
         load_params_fn = getattr(module, "load_params")
     except AttributeError:
-        logger.critical(f"Module '{module_name}' does not export 'load_params'.")
+        logger.critical(
+            f"Module 'strategies.{strategy_name}' does not export 'load_params'."
+        )
         sys.exit(1)
 
     return strategy_class, load_params_fn
@@ -171,7 +173,7 @@ def main():
         strat.run()
     except KeyboardInterrupt:
         logging.info("CTRL+C detected. Exiting...")
-    except Exception as e:
+    except Exception:
         logging.exception("Critical application error:")
         raise
 

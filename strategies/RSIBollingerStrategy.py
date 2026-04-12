@@ -14,7 +14,7 @@ import logging
 import talib as ta
 import pandas as pd
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
