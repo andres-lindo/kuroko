@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # float fields accept int values (e.g. 240 is valid for take_profit_ticks).
 # bool fields are checked before int because bool is a subclass of int in Python.
 _PARAMS_SCHEMA: dict[str, type] = {
+    "log_partition_key": str,
     "epic": str,
     "candle_frecuency": str,
     "leverage": int,
