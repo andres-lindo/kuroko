@@ -133,6 +133,7 @@ at startup via `load_params()` into a `types.SimpleNamespace`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `log_partition_key` | string | `"DEV_NQ100"` | Azure Blob Storage log blob label (`{key}_{YYYY-MM-DD}.log`) |
 | `epic` | string | `"IX.D.NASDAQ.IFMM.IP"` | IG Markets instrument identifier |
 | `candle_frecuency` | string | `"15min"` | Candle resolution; must match `\d+min` |
 | `leverage` | int | `20` | Leverage ratio used for virtual margin calculation in DEMO mode |

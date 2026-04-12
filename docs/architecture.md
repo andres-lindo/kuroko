@@ -19,11 +19,11 @@ Kuroko is split into two independent execution contexts that share no runtime st
 ig_main.py  ← load_dotenv("credentials.env") runs at module scope, before main()
 ├── load_strategy(args.strategy) → (RSIBollingerStrategy, load_params)
 ├── load_params("strategies/RSIBollingerStrategy.json") → types.SimpleNamespace
-│   └── keys: candle_frecuency, epic, max_positions, rsi_period, bb_period, ...
+│   └── keys: log_partition_key, candle_frecuency, epic, max_positions, rsi_period, bb_period, ...
 │
 ├── AzureBlobHandler
 │   └── Azure Blob Storage → container: logs
-│       └── append-blob per partition_key, rotates at midnight UTC
+│       └── append-blob per params.log_partition_key, rotates at midnight UTC
 │
 ├── IGClient()
 │   ├── Reads env vars set by load_dotenv (username, password, api_key, acc_number)
@@ -56,7 +56,7 @@ Contains all trading logic. Initialized with the config object from `strategies/
 
 #### `AzureBlobHandler` (`azure_log_handler.py`)
 
-Custom `logging.Handler` that ships all log records to Azure Blob Storage. Uses append-blob mode so multiple writes don't overwrite existing content. Rotates to a new blob daily at midnight UTC. Blob name format: `{partition_key}_{YYYY-MM-DD}.log`.
+Custom `logging.Handler` that ships all log records to Azure Blob Storage. Uses append-blob mode so multiple writes don't overwrite existing content. Rotates to a new blob daily at midnight UTC. Blob name format: `{log_partition_key}_{YYYY-MM-DD}.log`. The partition key is read from `log_partition_key` in `strategies/RSIBollingerStrategy.json`.
 
 ### Fault Tolerance and Self-Healing
 

@@ -1,4 +1,5 @@
 {
+  "log_partition_key": "DEV_NQ100",
   "epic": "IX.D.NASDAQ.IFMM.IP",
   "candle_frecuency": "15min",
   "leverage": 20,

@@ -1,3 +1,15 @@
+```
+  ██╗  ██╗██╗   ██╗██████╗  ██████╗ ██╗  ██╗ ██████╗
+  ██║ ██╔╝██║   ██║██╔══██╗██╔═══██╗██║ ██╔╝██╔═══██╗
+  █████╔╝ ██║   ██║██████╔╝██║   ██║█████╔╝ ██║   ██║
+  ██╔═██╗ ██║   ██║██╔══██╗██║   ██║██╔═██╗ ██║   ██║
+  ██║  ██╗╚██████╔╝██║  ██║╚██████╔╝██║  ██╗╚██████╔╝
+  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+              OPERATE IN THE SHADOWS
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
 # Kuroko
 
 Algorithmic trading bot for financial futures (NASDAQ 100, S&P 500) via [IG Markets](https://www.ig.com/). Includes a live trading engine, a historical backtesting framework, and a parameter optimization pipeline.
@@ -119,21 +131,20 @@ kuroko/
 source venv/bin/activate          # macOS/Linux
 .\venv\Scripts\activate           # Windows
 
-python ig_main.py <partition_key> --strategy <StrategyName>
+python ig_main.py --strategy <StrategyName>
 ```
 
-`partition_key` is the label used to identify this deployment's log blob in Azure Blob Storage (required). `--strategy` is also required and must name the strategy class to run.
+`--strategy` is required and must name the strategy class to run. The Azure Blob log partition key is read from `log_partition_key` in the strategy JSON config.
 
 ```bash
-python ig_main.py DEV_NQ100 --strategy RSIBollingerStrategy   # Development config for NASDAQ 100
-python ig_main.py PROD_NQ100 --strategy RSIBollingerStrategy  # Production config for NASDAQ 100
+python ig_main.py --strategy RSIBollingerStrategy
 ```
 
 See [RSIBollingerStrategy documentation](docs/strategies/RSIBollingerStrategy.md) for parameter reference.
 
 Stop the bot with `CTRL+C`.
 
-> **Startup failure**: if the bot exits immediately with a `CRITICAL` log entry, first check the strategy module name (e.g. `strategies/RSIBollingerStrategy.py` must exist). Then verify that `strategies/RSIBollingerStrategy.json` contains valid JSON, has all 23 required keys with the correct types, and that `candle_frecuency` matches the pattern `\d+min` (e.g. `"15min"`). The error log will list every missing key and type mismatch in one report. Startup failure is the only fatal failure — everything else is recovered automatically.
+> **Startup failure**: if the bot exits immediately with a `CRITICAL` log entry, first check the strategy module name (e.g. `strategies/RSIBollingerStrategy.py` must exist). Then verify that `strategies/RSIBollingerStrategy.json` contains valid JSON, has all 24 required keys with the correct types, and that `candle_frecuency` matches the pattern `\d+min` (e.g. `"15min"`). The error log will list every missing key and type mismatch in one report. Startup failure is the only fatal failure — everything else is recovered automatically.
 
 > **Runtime failures**: the bot does not crash on IG API errors. If the IG API is unavailable (maintenance window, timeout, empty response), the bot skips the affected cycle, logs a WARNING or ERROR, and retries on the next tick (~1 minute). It recovers automatically when the API comes back. See [`docs/architecture.md`](docs/architecture.md#fault-tolerance-and-self-healing) for the full recovery model.
 

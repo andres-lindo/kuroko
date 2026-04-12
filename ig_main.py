@@ -16,6 +16,18 @@ from dotenv import load_dotenv
 from azure_log_handler import AzureBlobHandler
 from ig_client import IGClient
 
+BANNER = r"""
+  ██╗  ██╗██╗   ██╗██████╗  ██████╗ ██╗  ██╗ ██████╗
+  ██║ ██╔╝██║   ██║██╔══██╗██╔═══██╗██║ ██╔╝██╔═══██╗
+  █████╔╝ ██║   ██║██████╔╝██║   ██║█████╔╝ ██║   ██║
+  ██╔═██╗ ██║   ██║██╔══██╗██║   ██║██╔═██╗ ██║   ██║
+  ██║  ██╗╚██████╔╝██║  ██║╚██████╔╝██║  ██╗╚██████╔╝
+  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+              OPERATE IN THE SHADOWS
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
 
 # Route unhandled exceptions through the standard logger instead of stderr
 def handle_exception(exc_type, exc_value, exc_traceback):
@@ -130,18 +142,15 @@ def main():
     """Parse CLI arguments, bootstrap the bot, and start the strategy loop.
 
     Dynamically loads the configured strategy and its parameters, attaches
-    Azure Blob log shipping, and then runs the strategy until interrupted.
+    Azure Blob log shipping (using ``log_partition_key`` from the strategy
+    JSON), and then runs the strategy until interrupted.
 
     If the strategy module cannot be loaded or parameter loading fails, a
     CRITICAL log entry is written and the process exits with code 1.
     No IGClient or strategy instantiation is attempted in that case.
     """
-    # The partition key is used as the log blob label in Azure Blob Storage
+    print(BANNER)
     parser = argparse.ArgumentParser(description="Kuroko live trading bot")
-    parser.add_argument(
-        "partition_key",
-        help="Label used to identify this deployment's log blob in Azure Blob Storage",
-    )
     parser.add_argument(
         "--strategy",
         required=True,
@@ -151,7 +160,7 @@ def main():
 
     strategy_class, load_params = load_strategy(args.strategy)
     params = load_params(f"strategies/{args.strategy}.json")
-    setup_azure_logging(args.partition_key)
+    setup_azure_logging(params.log_partition_key)
 
     # Initialise broker client and strategy, then enter the main loop
     ig = IGClient()
