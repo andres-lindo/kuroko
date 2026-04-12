@@ -65,7 +65,7 @@ ig_acc_type=DEMO
 table_storage_connection=DefaultEndpointsProtocol=https;AccountName=...
 ```
 
-> `ig_acc_type` controls live vs demo mode (`DEMO` or `LIVE`). See [`docs/architecture.md`](docs/architecture.md#risk-controls) before switching to a live account.
+> `ig_acc_type` controls live vs demo mode (`DEMO` or `LIVE`). See [`docs/strategies/RSIBollingerStrategy.md`](docs/strategies/RSIBollingerStrategy.md#account-mode) before switching to a live account.
 
 Strategy parameters are stored in `strategies/RSIBollingerStrategy.json` (live trading) and `backtest/strategies/RSIBollingerStrategy.json` (backtesting) — both committed to the repository. Edit the corresponding file before running. See [RSIBollingerStrategy documentation](docs/strategies/RSIBollingerStrategy.md) for the full parameter reference.
 

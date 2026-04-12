@@ -52,43 +52,11 @@ Key methods: `get_candles()`, `get_open_positions()`, `open_position()`, `close_
 
 #### `RSIBollingerStrategy` (`strategies/rsi_bollinger.py`)
 
-Contains all trading logic. Initialized with the config object from `strategies/RSIBollingerStrategy.json` and an `IGClient` instance. See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for full parameter reference and logic details.
-
-**Indicators computed per cycle** (via TA-Lib on 15-min NASDAQ futures — epic loaded from `strategies/RSIBollingerStrategy.json`):
-
-| Indicator | Parameter source |
-|---|---|
-| RSI | `rsi_period` |
-| EMA (trend filter) | `ema_period = 200` (fixed) |
-| ATR | `atr_period` |
-| Bollinger Bands | `bb_period`, `bb_dev` |
-
-**Entry logic (RSI + Bollinger Bands, mean-reversion)**
-
-- Buy when: `close < bb_lower` AND `rsi < rsi_oversold`
-- Sell when: `close > bb_upper` AND `rsi > rsi_overbought`
-- Minimum distance between entries: `min_dist_between_entries_ticks` (prevents stacking on fast moves)
-- Optional trend filter: only buy when `close > ema_200`
-
-**Position sizing (martingale grid)**
-
-- Up to `max_positions` (default: 5) open simultaneously
-- Each new position uses `position_size × martingale_multiplier^n` where `n` is the current open count
-- Default multiplier: `1.5` (1×, 1.5×, 2.25×, 3.375×, 5.06×)
-
-**Exit logic**
-
-- **Basket take-profit**: closes all positions when the average entry price + `take_profit_ticks` is reached
-- **Per-position limit order**: a broker-level TP is set at the time of `open_position` as a secondary safety net
-- **Dynamic stop-loss**: per-position stop at `entry_price - (atr × atr_sl_multiplier)`
-
-**Risk controls**
-
-- **Max drawdown freeze**: if drawdown exceeds `max_drawdown_pct` (75.75%), no new entries are opened for the rest of the session
-- **Margin check**: verifies sufficient free margin before opening any position
-- **Virtual margin** (when `is_live_account=False`): simulates 1:20 leverage against `initial_cash_balance = 4000` (the virtual capital base) regardless of the actual IG demo balance. `demo_starting_balance = 20000` is the IG demo account reference used only for realized P&L calculation. `is_live_account` is `True` only when `ig_acc_type=LIVE` (exact, case-sensitive match) — any other value, including `DEMO` or missing, results in `False` (virtual mode). Setting `ig_acc_type=LIVE` in `credentials.env` switches margin and equity calculations to use raw broker figures instead of the virtual simulation
+Contains all trading logic. Initialized with the config object from `strategies/RSIBollingerStrategy.json` and an `IGClient` instance. See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for entry logic, position sizing, exit logic, risk controls, and parameter reference.
 
 #### `AzureBlobHandler` (`azure_log_handler.py`)
+
+Custom `logging.Handler` that ships all log records to Azure Blob Storage. Uses append-blob mode so multiple writes don't overwrite existing content. Rotates to a new blob daily at midnight UTC. Blob name format: `{partition_key}_{YYYY-MM-DD}.log`.
 
 ### Fault Tolerance and Self-Healing
 
@@ -166,10 +134,6 @@ The process **never exits** on API failures. It retries every tick indefinitely 
 | Stale candle cache | Signals computed on data up to N minutes old; negligible on a 15-min candle strategy |
 | No circuit breaker | No threshold for consecutive failures — the bot retries indefinitely; process manager handles restarts if needed |
 
-
-
-Custom `logging.Handler` that ships all log records to Azure Blob Storage. Uses append-blob mode so multiple writes don't overwrite existing content. Rotates to a new blob daily at midnight UTC. Blob name format: `{partition_key}_{YYYY-MM-DD}.log`.
-
 ### Configuration Flow
 
 Strategy parameters are stored in `strategies/RSIBollingerStrategy.json` and loaded at startup via `load_params()`. Changing a parameter requires editing the file and redeploying the bot.
@@ -182,19 +146,7 @@ strategies/RSIBollingerStrategy.json
             └── self.params.candle_frecuency / .epic / .max_positions / ...
 ```
 
-Key parameters and their roles:
-
-| Key | Type | Description |
-|-----|------|-------------|
-| `candle_frecuency` | string (`\d+min`) | Candle resolution used by the strategy (e.g. `"15min"`) |
-| `epic` | string | IG Markets instrument identifier |
-| `max_positions` | int | Maximum number of simultaneous open positions |
-| `ig_acc_type` | env var | `LIVE` (exact, case-sensitive) → `is_live_account=True` (broker equity). Any other value including `DEMO` or missing → `is_live_account=False` (virtual equity mirror). Set in `credentials.env`, not in the JSON config |
-| `initial_cash_balance` | float | Simulated capital base for virtual margin calculation |
-| `demo_starting_balance` | float | IG demo account reference balance for realized P&L |
-| `take_profit_ticks` | float | Basket take-profit distance in price ticks |
-| `martingale_multiplier` | float | Position size multiplier for each grid level |
-| *(+ 15 more)* | — | See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for the full list |
+See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for the full parameter reference.
 
 `table_storage_connection` is NOT in this file — it is read from the environment (`credentials.env`) exclusively for `AzureBlobHandler` log shipping.
 

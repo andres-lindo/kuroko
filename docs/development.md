@@ -100,6 +100,9 @@ pre-commit run --all-files
 - **Language**: all code, variable names, inline comments, docstrings, and log messages must be in English
 - **Secrets**: never commit `credentials.env` or any file containing API keys or connection strings
 - **Config changes**: strategy parameters for live trading are stored in `strategies/RSIBollingerStrategy.json` and committed to the repository. Edit that file directly and redeploy the bot to apply changes. See [RSIBollingerStrategy documentation](../docs/strategies/RSIBollingerStrategy.md) for the full parameter reference.
+
+> **Note**: `strategies/RSIBollingerStrategy.json` (live) and `backtest/strategies/RSIBollingerStrategy.json` (backtest) are independent files. Tuning results from Optuna must be manually applied to the live config. See [backtest/README.md](../backtest/README.md) for details.
+
 - **Dependencies**: add new external packages to `requirements.txt` (root) or `backtest/requirements.txt` depending on which execution context requires them
 
 ### Logging

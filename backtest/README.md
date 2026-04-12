@@ -206,3 +206,4 @@ Historical OHLC data located in `datasets/`:
 
 - [`../docs/architecture.md`](../docs/architecture.md) — backtest engine internals and optimization pipeline design
 - [`../docs/development.md`](../docs/development.md) — pre-commit setup, conventions, and detailed instructions for adding a strategy
+- [`../docs/strategies/RSIBollingerStrategy.md`](../docs/strategies/RSIBollingerStrategy.md) — strategy parameters, entry/exit logic, and protection mechanisms
