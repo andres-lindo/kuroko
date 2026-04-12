@@ -2,8 +2,8 @@
 
 Implements a mean-reversion grid strategy using RSI and Bollinger Bands
 signals, martingale position sizing, and ATR-based dynamic stop-losses.
-Module name: rsi_bollinger. Logger name: rsi_bollinger.
 """
+
 import os
 import re
 import sys
@@ -16,35 +16,35 @@ import pandas as pd
 
 from datetime import datetime, timedelta, timezone
 
-logger = logging.getLogger("rsi_bollinger")
+logger = logging.getLogger(__name__)
 
 
 # Expected type for each parameter key.
 # float fields accept int values (e.g. 240 is valid for take_profit_ticks).
 # bool fields are checked before int because bool is a subclass of int in Python.
 _PARAMS_SCHEMA: dict[str, type] = {
-    "epic":                           str,
-    "candle_frecuency":               str,
-    "leverage":                       int,
-    "lookback":                       int,
-    "demo_starting_balance":          float,
-    "initial_cash_balance":           float,
-    "security_buffer":                float,
-    "max_positions":                  int,
-    "position_size":                  float,
+    "epic": str,
+    "candle_frecuency": str,
+    "leverage": int,
+    "lookback": int,
+    "demo_starting_balance": float,
+    "initial_cash_balance": float,
+    "security_buffer": float,
+    "max_positions": int,
+    "position_size": float,
     "min_dist_between_entries_ticks": float,
-    "martingale_multiplier":          float,
-    "take_profit_ticks":              float,
-    "max_drawdown_pct":               float,
-    "bb_period":                      int,
-    "bb_dev":                         float,
-    "rsi_period":                     int,
-    "rsi_overbought":                 int,
-    "rsi_oversold":                   int,
-    "use_trend_filter":               bool,
-    "atr_period":                     int,
-    "atr_sl_multiplier":              float,
-    "ema_period":                     int,
+    "martingale_multiplier": float,
+    "take_profit_ticks": float,
+    "max_drawdown_pct": float,
+    "bb_period": int,
+    "bb_dev": float,
+    "rsi_period": int,
+    "rsi_overbought": int,
+    "rsi_oversold": int,
+    "use_trend_filter": bool,
+    "atr_period": int,
+    "atr_sl_multiplier": float,
+    "ema_period": int,
 }
 
 
@@ -92,7 +92,8 @@ def _validate_params(data: dict, path: str) -> None:
 
     if errors:
         logging.critical(
-            f"Parameter validation failed for {path} — {len(errors)} error(s):\n" + "\n".join(errors)
+            f"Parameter validation failed for {path} — {len(errors)} error(s):\n"
+            + "\n".join(errors)
         )
         sys.exit(1)
 
@@ -103,7 +104,9 @@ def _validate_params(data: dict, path: str) -> None:
         sys.exit(1)
 
 
-def load_params(path: str = "strategies/RSIBollingerStrategy.json") -> types.SimpleNamespace:
+def load_params(
+    path: str = "strategies/RSIBollingerStrategy.json",
+) -> types.SimpleNamespace:
     """Load and validate strategy parameters from a JSON file.
 
     Reads the JSON file at ``path``, validates all required keys and their
@@ -264,30 +267,34 @@ class RSIBollingerStrategy:
             return
 
         current_candle = self.candles.iloc[-1]
-        current_price = current_candle['Close']
+        current_price = current_candle["Close"]
 
         positions = self.ig.get_open_positions()
         n_trades = len(positions)
 
         # --- 0. EXITS (TIME STOP & BASKET TP) ---
         if n_trades > 0:
-            positions.sort(key=lambda x: x['createdDate'])
+            positions.sort(key=lambda x: x["createdDate"])
             first_trade = positions[0]
 
-            total_size = sum(p['size'] for p in positions)
-            avg_price = sum(p['size'] * p['level'] for p in positions) / total_size
-            is_long = first_trade['direction'] == 'BUY'
+            total_size = sum(p["size"] for p in positions)
+            avg_price = sum(p["size"] * p["level"] for p in positions) / total_size
+            is_long = first_trade["direction"] == "BUY"
 
             if is_long:
                 if current_price >= avg_price + self.take_profit_ticks:
                     profit = (current_price - avg_price) * total_size
-                    logger.info(f"💰 WIN (LONG) | Size: {total_size} | Avg: {avg_price:.2f} | Curr: {current_price:.2f} | Profit: {profit:.2f}")
+                    logger.info(
+                        f"💰 WIN (LONG) | Size: {total_size} | Avg: {avg_price:.2f} | Curr: {current_price:.2f} | Profit: {profit:.2f}"
+                    )
                     self.close_all_positions(positions, reason="BasketTP")
                     return
             else:
                 if current_price <= avg_price - self.take_profit_ticks:
                     profit = (avg_price - current_price) * total_size
-                    logger.info(f"💰 WIN (SHORT) | Size: {total_size} | Avg: {avg_price:.2f} | Curr: {current_price:.2f} | Profit: {profit:.2f}")
+                    logger.info(
+                        f"💰 WIN (SHORT) | Size: {total_size} | Avg: {avg_price:.2f} | Curr: {current_price:.2f} | Profit: {profit:.2f}"
+                    )
                     self.close_all_positions(positions, reason="BasketTP")
                     return
 
@@ -314,7 +321,11 @@ class RSIBollingerStrategy:
             virtual_balance = self.initial_cash_balance + realized_profit
 
             current_equity = virtual_balance + open_pnl
-            used_margin = sum((p['size'] * p['level'] / self.leverage) for p in positions) if n_trades > 0 else 0
+            used_margin = (
+                sum((p["size"] * p["level"] / self.leverage) for p in positions)
+                if n_trades > 0
+                else 0
+            )
             free_margin = current_equity - used_margin
 
         # Drawdown floor: equity must not fall below this fraction of starting capital
@@ -322,10 +333,14 @@ class RSIBollingerStrategy:
 
         if current_equity < floor_value:
             if not self.max_drawdown_reached:
-                logger.error(f"⚠️ MAX DRAWDOWN | Equity ${current_equity:.2f} < Floor ${floor_value:.2f}. Freezing.")
+                logger.error(
+                    f"⚠️ MAX DRAWDOWN | Equity ${current_equity:.2f} < Floor ${floor_value:.2f}. Freezing."
+                )
                 self.max_drawdown_reached = True
         elif self.max_drawdown_reached and current_equity > floor_value:
-            logger.info(f"✅ RECOVERED | Equity ${current_equity:.2f} > Floor. Reactivating.")
+            logger.info(
+                f"✅ RECOVERED | Equity ${current_equity:.2f} > Floor. Reactivating."
+            )
             self.max_drawdown_reached = False
 
         # --- 2. ENTRIES (GRID) ---
@@ -333,16 +348,16 @@ class RSIBollingerStrategy:
             return
 
         if n_trades > 0:
-            dist_to_last = abs(current_price - positions[-1]['level'])
+            dist_to_last = abs(current_price - positions[-1]["level"])
             if dist_to_last < self.min_dist_between_entries_ticks:
                 return
 
         # Indicators and filters
-        current_atr = current_candle['atr']
+        current_atr = current_candle["atr"]
         sl_dist = current_atr * self.atr_sl_multiplier
 
         if self.use_trend_filter:
-            current_ema = current_candle['ema']
+            current_ema = current_candle["ema"]
             can_buy = current_price > current_ema
             can_sell = current_price < current_ema
         else:
@@ -351,7 +366,10 @@ class RSIBollingerStrategy:
 
         # Fractional martingale sizing: each grid level scales by multiplier^n,
         # floored at the base position_size to avoid sub-minimum orders
-        current_size = max(self.position_size, round(self.position_size * (self.martingale_multiplier ** n_trades), 2))
+        current_size = max(
+            self.position_size,
+            round(self.position_size * (self.martingale_multiplier**n_trades), 2),
+        )
 
         # --- 3. MARGIN CHECK (unified for DEMO and LIVE) ---
         cost_to_open = (current_price / self.leverage) * current_size
@@ -369,8 +387,8 @@ class RSIBollingerStrategy:
         # Pre-compute what the weighted average entry price would become if
         # this new order fills, so TP levels can be set correctly at open time
         if n_trades > 0:
-            total_size = sum(p['size'] for p in positions)
-            total_value = sum(p['size'] * p['level'] for p in positions)
+            total_size = sum(p["size"] for p in positions)
+            total_value = sum(p["size"] * p["level"] for p in positions)
         else:
             total_size = 0
             total_value = 0
@@ -380,16 +398,16 @@ class RSIBollingerStrategy:
         futuro_avg_price = futuro_total_value / futuro_total_size
 
         # --- 5. EXECUTION ---
-        bb_lower = current_candle['bb_lower']
-        bb_upper = current_candle['bb_upper']
-        current_rsi = current_candle['rsi']
+        bb_lower = current_candle["bb_lower"]
+        bb_upper = current_candle["bb_upper"]
+        current_rsi = current_candle["rsi"]
 
         # LONG
         if can_buy and current_price < bb_lower and current_rsi < self.rsi_oversold:
             if n_trades > 0:
-                if positions[0]['direction'] == 'SELL':
+                if positions[0]["direction"] == "SELL":
                     return
-                if current_price >= positions[-1]['level']:
+                if current_price >= positions[-1]["level"]:
                     return
 
             # 1. Target and stop as exact price levels (used to update existing positions)
@@ -402,8 +420,16 @@ class RSIBollingerStrategy:
 
             try:
                 # Open the new position
-                self.ig.open_position(epic=self.epic, size=current_size, side='BUY', stop=stop_dist, limit=limit_dist)
-                logger.info(f"⬆️ BUY #{n_trades + 1} | x{current_size} @ {current_price:.2f} | SL Level: {stop_price} | TP Level: {target_price}")
+                self.ig.open_position(
+                    epic=self.epic,
+                    size=current_size,
+                    side="BUY",
+                    stop=stop_dist,
+                    limit=limit_dist,
+                )
+                logger.info(
+                    f"⬆️ BUY #{n_trades + 1} | x{current_size} @ {current_price:.2f} | SL Level: {stop_price} | TP Level: {target_price}"
+                )
 
                 # Brief pause to avoid race conditions when updating positions immediately after open
                 time.sleep(2)
@@ -413,30 +439,36 @@ class RSIBollingerStrategy:
 
                 if len(upd_df) > 0:
                     # Recalculate the actual weighted average after the fill
-                    real_size = sum(p['size'] for p in upd_df)
-                    real_avg = sum(p['size'] * p['level'] for p in upd_df) / real_size
+                    real_size = sum(p["size"] for p in upd_df)
+                    real_avg = sum(p["size"] * p["level"] for p in upd_df) / real_size
 
                     # Derive TP and SL from the confirmed post-fill average
                     real_tp = round(real_avg + self.take_profit_ticks, 2)
                     real_sl = round(current_price - sl_dist, 2)
 
                     for p in upd_df:
-                        deal_id = p['dealId']
+                        deal_id = p["dealId"]
                         # Normalise floats to 2 decimal places to avoid IG API precision errors
                         safe_limit = round(float(real_tp), 2)
                         safe_stop = round(float(real_sl), 2)
 
-                        self.ig.update_position(dealid=deal_id, limit=safe_limit, stop=safe_stop)
-                        logger.info(f"🔄 Position {deal_id} updated -> New TP: {safe_limit} | New SL: {safe_stop}")
+                        self.ig.update_position(
+                            dealid=deal_id, limit=safe_limit, stop=safe_stop
+                        )
+                        logger.info(
+                            f"🔄 Position {deal_id} updated -> New TP: {safe_limit} | New SL: {safe_stop}"
+                        )
             except Exception as e:
                 logger.error(f"Error opening/updating LONG positions: {e}")
 
         # SHORT
-        elif can_sell and current_price > bb_upper and current_rsi > self.rsi_overbought:
+        elif (
+            can_sell and current_price > bb_upper and current_rsi > self.rsi_overbought
+        ):
             if n_trades > 0:
-                if positions[0]['direction'] == 'BUY':
+                if positions[0]["direction"] == "BUY":
                     return
-                if current_price <= positions[-1]['level']:
+                if current_price <= positions[-1]["level"]:
                     return
 
             # 1. Target and stop as exact price levels (used to update existing positions)
@@ -449,8 +481,16 @@ class RSIBollingerStrategy:
 
             try:
                 # Open the new position
-                self.ig.open_position(epic=self.epic, size=current_size, side='SELL', stop=stop_dist, limit=limit_dist)
-                logger.info(f"⬇️ SELL #{n_trades + 1} | x{current_size} @ {current_price:.2f} | SL Level: {stop_price} | TP Level: {target_price}")
+                self.ig.open_position(
+                    epic=self.epic,
+                    size=current_size,
+                    side="SELL",
+                    stop=stop_dist,
+                    limit=limit_dist,
+                )
+                logger.info(
+                    f"⬇️ SELL #{n_trades + 1} | x{current_size} @ {current_price:.2f} | SL Level: {stop_price} | TP Level: {target_price}"
+                )
 
                 # Brief pause to avoid race conditions when updating positions immediately after open
                 time.sleep(2)
@@ -461,21 +501,25 @@ class RSIBollingerStrategy:
                 # Update TP and SL on all existing positions
                 if len(upd_df) > 0:
                     # Recalculate the actual weighted average after the fill
-                    real_size = sum(p['size'] for p in upd_df)
-                    real_avg = sum(p['size'] * p['level'] for p in upd_df) / real_size
+                    real_size = sum(p["size"] for p in upd_df)
+                    real_avg = sum(p["size"] * p["level"] for p in upd_df) / real_size
 
                     # Derive TP and SL from the confirmed post-fill average
                     real_tp = round(real_avg - self.take_profit_ticks, 2)
                     real_sl = round(current_price + sl_dist, 2)
 
                     for p in upd_df:
-                        deal_id = p['dealId']
+                        deal_id = p["dealId"]
                         # Normalise floats to 2 decimal places to avoid IG API precision errors
                         safe_limit = round(float(real_tp), 2)
                         safe_stop = round(float(real_sl), 2)
 
-                        self.ig.update_position(dealid=deal_id, limit=safe_limit, stop=safe_stop)
-                        logger.info(f"🔄 Position {deal_id} updated -> New TP: {safe_limit} | New SL: {safe_stop}")
+                        self.ig.update_position(
+                            dealid=deal_id, limit=safe_limit, stop=safe_stop
+                        )
+                        logger.info(
+                            f"🔄 Position {deal_id} updated -> New TP: {safe_limit} | New SL: {safe_stop}"
+                        )
             except Exception as e:
                 logger.error(f"Error opening/updating SHORT positions: {e}")
 
@@ -503,7 +547,9 @@ class RSIBollingerStrategy:
                     break
                 except Exception as e:
                     last_exc = e
-                    logger.warning(f"Close attempt {attempt}/3 failed for position {deal_id}: {e}")
+                    logger.warning(
+                        f"Close attempt {attempt}/3 failed for position {deal_id}: {e}"
+                    )
                     if attempt < 3:
                         time.sleep(2 ** (attempt - 1))  # 1s, 2s
 
@@ -515,7 +561,9 @@ class RSIBollingerStrategy:
                 failed.append(deal_id)
 
         if failed:
-            logger.warning(f"Could not close {len(failed)} position(s) after retries: {failed}")
+            logger.warning(
+                f"Could not close {len(failed)} position(s) after retries: {failed}"
+            )
 
     def log_account_status(self):
         """Log a structured account snapshot to the configured logger.
@@ -550,7 +598,11 @@ class RSIBollingerStrategy:
                 virtual_balance = self.initial_cash_balance + realized_profit
 
                 current_equity = virtual_balance + open_pnl
-                used_margin = sum((p['size'] * p['level'] / self.leverage) for p in positions) if n_trades > 0 else 0
+                used_margin = (
+                    sum((p["size"] * p["level"] / self.leverage) for p in positions)
+                    if n_trades > 0
+                    else 0
+                )
                 free_margin = current_equity - used_margin
                 modo = f"VIRTUAL (1:{self.leverage})"
 
@@ -590,7 +642,9 @@ class RSIBollingerStrategy:
         """
         freq = int(self.params.candle_frecuency.replace("min", ""))
         logger.info(f"Strategy running. Execution every {freq} minutes.")
-        next_tick = (datetime.now() + timedelta(minutes=1)).replace(second=0, microsecond=0)
+        next_tick = (datetime.now() + timedelta(minutes=1)).replace(
+            second=0, microsecond=0
+        )
 
         while True:
             sleep_seconds = (next_tick - datetime.now()).total_seconds()
@@ -605,7 +659,9 @@ class RSIBollingerStrategy:
                     self.get_candles()
 
                     if not self.candles.empty:
-                        logger.info(f"Last 5 candles.\n{self.candles.tail(5).to_string()}")
+                        logger.info(
+                            f"Last 5 candles.\n{self.candles.tail(5).to_string()}"
+                        )
                         self.manage_positions()
                         self.log_account_status()
                     else:

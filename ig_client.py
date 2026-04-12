@@ -4,6 +4,7 @@ Wraps the trading_ig library to provide authenticated REST API access,
 exponential-backoff retries, and a two-tier candle cache (in-memory +
 parquet on disk) that minimises API calls across restarts.
 """
+
 import json
 import os
 import logging
@@ -42,8 +43,8 @@ class IGClient:
                 not set in the environment.
         """
         user = os.getenv("ig_username")
-        pwd  = os.getenv("ig_password")
-        key  = os.getenv("ig_api_key")
+        pwd = os.getenv("ig_password")
+        key = os.getenv("ig_api_key")
         accn = os.getenv("ig_acc_number")
         acc_type = os.getenv("ig_acc_type")  # DEMO | LIVE
 
@@ -109,11 +110,13 @@ class IGClient:
                         except Exception as refresh_error:
                             log.error(f"Error refreshing session: {refresh_error}")
 
-                log.debug(f"Connection error (attempt {attempt + 1}/{max_retries}): {e}")
+                log.debug(
+                    f"Connection error (attempt {attempt + 1}/{max_retries}): {e}"
+                )
 
                 if attempt < max_retries - 1:
                     # Exponential backoff: 1 s, 2 s, 4 s between attempts
-                    wait_time = 2 ** attempt
+                    wait_time = 2**attempt
                     log.debug(f"Waiting {wait_time} seconds before retrying...")
                     sleep(wait_time)
                 else:
@@ -123,7 +126,9 @@ class IGClient:
                 log.error(f"Unexpected error: {e}")
                 raise
 
-    def _remove_incomplete_candle(self, df: pd.DataFrame, resolution: str) -> pd.DataFrame:
+    def _remove_incomplete_candle(
+        self, df: pd.DataFrame, resolution: str
+    ) -> pd.DataFrame:
         """Strip the current (incomplete) candle from a price DataFrame.
 
         A candle whose timestamp matches the current execution minute is still
@@ -146,7 +151,9 @@ class IGClient:
         last_candle_time = pd.to_datetime(df.index[-1]).replace(second=0, microsecond=0)
 
         # Derive timeframe width from resolution string
-        timeframe_minutes = int(resolution.replace("min", "")) if "min" in resolution else 60
+        timeframe_minutes = (
+            int(resolution.replace("min", "")) if "min" in resolution else 60
+        )
         expected_complete_time = exec_time - timedelta(minutes=timeframe_minutes)
 
         # Last candle == now → it is still forming → drop it
@@ -158,7 +165,9 @@ class IGClient:
             log.debug(f"Last candle is complete: {last_candle_time}")
             return df
         else:
-            log.debug(f"Unexpected timestamp. Last candle: {last_candle_time}, expected: {expected_complete_time}")
+            log.debug(
+                f"Unexpected timestamp. Last candle: {last_candle_time}, expected: {expected_complete_time}"
+            )
             return df
 
     def get_candles(self, epic: str, res: str, num_points: int = 200) -> pd.DataFrame:
@@ -229,10 +238,9 @@ class IGClient:
 
         try:
             resp = self._safe_api_call(
-                self._svc.fetch_historical_prices_by_epic_and_num_points,
-                epic, res, 3
+                self._svc.fetch_historical_prices_by_epic_and_num_points, epic, res, 3
             )
-            new_df = resp['prices']['bid']
+            new_df = resp["prices"]["bid"]
 
             # Drop the incomplete candle from the freshly fetched slice
             new_df = self._remove_incomplete_candle(new_df, res)
@@ -242,12 +250,14 @@ class IGClient:
                 # Merge new rows into the cache, deduplicate (keep last seen),
                 # drop all-NaN rows, sort chronologically, and trim to num_points
                 combined_df = pd.concat([existing_df, new_df])
-                combined_df = combined_df[~combined_df.index.duplicated(keep='last')]
-                combined_df = combined_df.dropna(how='all')
+                combined_df = combined_df[~combined_df.index.duplicated(keep="last")]
+                combined_df = combined_df.dropna(how="all")
                 combined_df = combined_df.sort_index().tail(num_points)
 
                 # Persist only when the cache has actually changed
-                if len(combined_df) > len(existing_df) or not combined_df.equals(existing_df.tail(num_points)):
+                if len(combined_df) > len(existing_df) or not combined_df.equals(
+                    existing_df.tail(num_points)
+                ):
                     log.info(f"Updating cache for {epic} {res}")
                     self.candles_cache[cache_key] = combined_df
                     try:
@@ -287,7 +297,9 @@ class IGClient:
             if open_positions.empty:
                 return []
 
-            return open_positions[["dealReference", "dealId", "level", "size", "createdDate", "direction"]].to_dict(orient="records")
+            return open_positions[
+                ["dealReference", "dealId", "level", "size", "createdDate", "direction"]
+            ].to_dict(orient="records")
         except Exception as e:
             log.error(f"Error fetching open positions: {e}")
             return []
@@ -303,14 +315,22 @@ class IGClient:
             accounts = self._safe_api_call(self._svc.fetch_accounts)
             cols = ["accountId", "balance", "deposit", "profitLoss", "available"]
 
-            return accounts.loc[
-                accounts["accountId"] == self.accountId, cols
-            ].to_dict(orient="records")[0]
+            return accounts.loc[accounts["accountId"] == self.accountId, cols].to_dict(
+                orient="records"
+            )[0]
         except Exception as e:
             log.error(f"Error fetching account summary: {e}")
             return {}
 
-    def open_position(self, epic: str, size: float, side: str, currency: str = 'USD', stop: float = None, limit: float = None):
+    def open_position(
+        self,
+        epic: str,
+        size: float,
+        side: str,
+        currency: str = "USD",
+        stop: float = None,
+        limit: float = None,
+    ):
         """Open a new market-order position.
 
         Args:
@@ -330,10 +350,10 @@ class IGClient:
             currency_code=currency,
             direction=side,
             epic=epic,
-            order_type='MARKET',
-            expiry='-',
-            force_open='true',
-            guaranteed_stop='false',
+            order_type="MARKET",
+            expiry="-",
+            force_open="true",
+            guaranteed_stop="false",
             size=float(size),
             level=None,
             limit_distance=limit,
@@ -342,7 +362,7 @@ class IGClient:
             stop_level=None,
             stop_distance=stop,
             trailing_stop=None,
-            trailing_stop_increment=None
+            trailing_stop_increment=None,
         )
 
     def update_position(self, dealid: str, stop: float = None, limit: float = None):
@@ -360,7 +380,7 @@ class IGClient:
             self._svc.update_open_position,
             limit_level=limit,
             stop_level=stop,
-            deal_id=dealid
+            deal_id=dealid,
         )
 
     def close_position(self, deal_id: str, side: str, size: float):
@@ -379,9 +399,9 @@ class IGClient:
             deal_id=deal_id,
             direction=side,
             epic=None,
-            expiry='-',
+            expiry="-",
             level=None,
-            order_type='MARKET',
+            order_type="MARKET",
             quote_id=None,
             size=float(size),
         )

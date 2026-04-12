@@ -50,7 +50,7 @@ Wrapper around the `trading-ig` library. All API calls go through `_safe_api_cal
 
 Key methods: `get_candles()`, `get_open_positions()`, `open_position()`, `close_position()`, `update_position()`.
 
-#### `RSIBollingerStrategy` (`strategies/rsi_bollinger.py`)
+#### `RSIBollingerStrategy` (`strategies/RSIBollingerStrategy.py`)
 
 Contains all trading logic. Initialized with the config object from `strategies/RSIBollingerStrategy.json` and an `IGClient` instance. See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for entry logic, position sizing, exit logic, risk controls, and parameter reference.
 
@@ -96,7 +96,7 @@ while True:
 
 Each individual `close_position()` call is wrapped in its own retry loop: 3 attempts with 1s/2s backoff. A failure on one position does not block the remaining closes. Failed deal IDs are accumulated and reported in a single WARNING after all positions are processed.
 
-**Layer 6 — Startup config (`strategies/RSIBollingerStrategy.json` in `rsi_bollinger.py`)**
+**Layer 6 — Startup config (`strategies/RSIBollingerStrategy.json` in `RSIBollingerStrategy.py`)**
 
 A failure here is fatal by design — the bot cannot trade without its configuration. `load_params()` handles three failure modes, each logging CRITICAL and calling `sys.exit(1)`:
 

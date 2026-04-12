@@ -42,9 +42,15 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--strategy", type=str, default="RSIBollingerStrategy")
 parser.add_argument("--start_date", type=str, required=True)
 parser.add_argument("--end_date", type=str, required=True)
-parser.add_argument("--objective_type", type=str, choices=["single", "multiple", "weighted"], required=True)
+parser.add_argument(
+    "--objective_type",
+    type=str,
+    choices=["single", "multiple", "weighted"],
+    required=True,
+)
 parser.add_argument("--trials", type=int, required=True)
 args = parser.parse_args()
+
 
 def get_trial_params(trial, strategy_name):
     """Convert the declarative search-space config into Optuna suggest calls.
@@ -65,31 +71,44 @@ def get_trial_params(trial, strategy_name):
     """
     config = STRATEGY_SEARCH_SPACES.get(strategy_name)
     params = {}
-    
+
     for param_name, specs in config.items():
-        p_type = specs['type']
-        
-        if p_type == 'int':
-            params[param_name] = trial.suggest_int(param_name, specs['low'], specs['high'], step=specs.get('step', 1))
-        elif p_type == 'float':
-            params[param_name] = trial.suggest_float(param_name, specs['low'], specs['high'], step=specs.get('step'))
-        elif p_type == 'categorical':
-            params[param_name] = trial.suggest_categorical(param_name, specs['choices'])
-            
+        p_type = specs["type"]
+
+        if p_type == "int":
+            params[param_name] = trial.suggest_int(
+                param_name, specs["low"], specs["high"], step=specs.get("step", 1)
+            )
+        elif p_type == "float":
+            params[param_name] = trial.suggest_float(
+                param_name, specs["low"], specs["high"], step=specs.get("step")
+            )
+        elif p_type == "categorical":
+            params[param_name] = trial.suggest_categorical(param_name, specs["choices"])
+
     return params
+
 
 if args.strategy not in STRATEGY_SEARCH_SPACES:
     raise ValueError(f"Optimization config not found for '{args.strategy}'")
 
 script_dir = os.path.dirname(__file__)
-output_dir = os.path.join(script_dir, FILE_CONFIG['output_folder'])
+output_dir = os.path.join(script_dir, FILE_CONFIG["output_folder"])
 os.makedirs(output_dir, exist_ok=True)
 
-timestamp = datetime.now().strftime('%Y%m%d_%H%M')
-tuning_output_file = os.path.join(output_dir, f"tuning_{args.strategy}_{args.objective_type}_{timestamp}.json")
-log_file = os.path.join(output_dir, f"tuning_{args.strategy}_{args.objective_type}_log_{timestamp}.txt")
+timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+tuning_output_file = os.path.join(
+    output_dir, f"tuning_{args.strategy}_{args.objective_type}_{timestamp}.json"
+)
+log_file = os.path.join(
+    output_dir, f"tuning_{args.strategy}_{args.objective_type}_log_{timestamp}.txt"
+)
 
-logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    filename=log_file,
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 optuna.logging.enable_propagation()
 optuna.logging.set_verbosity(optuna.logging.INFO)
 
@@ -97,7 +116,9 @@ optuna.logging.set_verbosity(optuna.logging.INFO)
 print(f"Loading Strategy: {args.strategy}...")
 StrategyClass = load_strategy_class(args.strategy)
 
-csv_path = os.path.join(script_dir, FILE_CONFIG['datasets_folder'], FILE_CONFIG['dataset_name'])
+csv_path = os.path.join(
+    script_dir, FILE_CONFIG["datasets_folder"], FILE_CONFIG["dataset_name"]
+)
 if not os.path.exists(csv_path):
     raise FileNotFoundError(f"Dataset not found: {csv_path}")
 
@@ -105,6 +126,7 @@ print(f"Processing Data ({args.start_date} to {args.end_date})...")
 raw_df = load_raw_data(csv_path)
 DATA_PROCESSED = StrategyClass.prepare_data(raw_df, args.start_date, args.end_date)
 print("Data ready.")
+
 
 # --- Optimization Loop ---
 def objective(trial):
@@ -129,14 +151,14 @@ def objective(trial):
     seed = trial.number
     random.seed(seed)
     np.random.seed(seed)
-    
+
     dynamic_params = get_trial_params(trial, args.strategy)
-    
+
     # Merge global static params + dynamic params + current objective type
     params = ENGINE_CONFIG.copy()
     params.update(dynamic_params)
-    params['objective_type'] = args.objective_type
-    
+    params["objective_type"] = args.objective_type
+
     result = run(DATA_PROCESSED, params, StrategyClass)
 
     # Handle missing or failed backtest results
@@ -155,12 +177,12 @@ def objective(trial):
 
     # Multi-objective (Pareto optimization)
     elif args.objective_type == "multiple":
-        portfolio_value = result.get('portfolio_value', 0)
-        max_drawdown = result.get('max_drawdown', -100)
-        win_rate = result.get('win_rate', 0)
-        avg_loss = result.get('avg_loss', -9999)
-        sortino_ratio = result.get('sortino_ratio', 0)
-        sharpe_ratio = result.get('sharpe_ratio', 0)
+        portfolio_value = result.get("portfolio_value", 0)
+        max_drawdown = result.get("max_drawdown", -100)
+        win_rate = result.get("win_rate", 0)
+        avg_loss = result.get("avg_loss", -9999)
+        sortino_ratio = result.get("sortino_ratio", 0)
+        sharpe_ratio = result.get("sharpe_ratio", 0)
 
         # Clamp degenerate ratios (e.g. zero losses → Inf) to 0 to avoid
         # poisoning the Pareto front with mathematically undefined values.
@@ -169,39 +191,59 @@ def objective(trial):
         if np.isinf(sharpe_ratio) or np.isnan(sharpe_ratio):
             sharpe_ratio = 0.0
 
-        return portfolio_value, max_drawdown, win_rate, avg_loss, sortino_ratio, sharpe_ratio
+        return (
+            portfolio_value,
+            max_drawdown,
+            win_rate,
+            avg_loss,
+            sortino_ratio,
+            sharpe_ratio,
+        )
 
     # Weighted combination
     elif args.objective_type == "weighted":
-        portfolio_value = result.get('portfolio_value', 0)
-        max_drawdown = result.get('max_drawdown', 100)
-        win_rate = result.get('win_rate', 0)
+        portfolio_value = result.get("portfolio_value", 0)
+        max_drawdown = result.get("max_drawdown", 100)
+        win_rate = result.get("win_rate", 0)
         score = (0.7 * portfolio_value) + (0.3 * -max_drawdown)
         return score
 
-if __name__ == '__main__':
 
-    logging.info("="*80)
+if __name__ == "__main__":
+
+    logging.info("=" * 80)
     logging.info(f"STARTING OPTIMIZATION STUDY")
     logging.info(f"Strategy: {args.strategy}")
     logging.info(f"Objective Type: {args.objective_type}")
     logging.info(f"Trials: {args.trials}")
     logging.info(f"Date Range: {args.start_date} to {args.end_date}")
-    
+
     search_space = STRATEGY_SEARCH_SPACES.get(args.strategy)
     logging.info(f"Search Space: {json.dumps(search_space, indent=2)}")
     logging.info(f"Engine Config: {json.dumps(ENGINE_CONFIG, indent=2)}")
-    logging.info("="*80)
+    logging.info("=" * 80)
 
     print(f"Starting optimization ({args.trials} trials)...")
-    
+
     if args.objective_type == "multiple":
-        #Metric Optimization Direction: portfolio_value, max_drawdown, win_rate, avg_loss, sortino_ratio, sharpe_ratio
-        study = optuna.create_study(directions=['maximize', 'maximize', 'maximize', 'maximize', 'maximize', 'maximize'])
+        # Metric Optimization Direction: portfolio_value, max_drawdown, win_rate, avg_loss, sortino_ratio, sharpe_ratio
+        study = optuna.create_study(
+            directions=[
+                "maximize",
+                "maximize",
+                "maximize",
+                "maximize",
+                "maximize",
+                "maximize",
+            ]
+        )
         study.optimize(objective, n_trials=args.trials, n_jobs=-1)
-        
+
         best_trials = sorted(
-            [{'trial_number': t.number, 'values': t.values, 'params': t.params} for t in study.best_trials],
+            [
+                {"trial_number": t.number, "values": t.values, "params": t.params}
+                for t in study.best_trials
+            ],
             # Three-priority sort key for Pareto-front ranking:
             #   Priority 1 — Efficiency ratio (net profit / worst drawdown):
             #     higher profit with lower drawdown scores better. The 0.0001
@@ -210,20 +252,25 @@ if __name__ == '__main__':
             #     preferring the trial that earned the most absolute profit.
             #   Priority 3 — Sortino ratio: secondary risk-adjusted tiebreaker.
             key=lambda x: (
-                (x['values'][0] - ENGINE_CONFIG['initial_cash_balance']) / abs(x['values'][1] - 0.0001),
-                x['values'][0],
-                x['values'][4],
+                (x["values"][0] - ENGINE_CONFIG["initial_cash_balance"])
+                / abs(x["values"][1] - 0.0001),
+                x["values"][0],
+                x["values"][4],
             ),
-            reverse=True 
+            reverse=True,
         )
-        with open(tuning_output_file, 'w') as f:
+        with open(tuning_output_file, "w") as f:
             json.dump(best_trials, f, indent=4)
         print(f"Optimization complete. Solutions: {len(best_trials)}")
-        
+
     else:
-        study = optuna.create_study(direction='maximize')
+        study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=args.trials, n_jobs=-1)
-        
-        with open(tuning_output_file, 'w') as f:
-            json.dump({'best_params': study.best_params, 'best_value': study.best_value}, f, indent=4)
+
+        with open(tuning_output_file, "w") as f:
+            json.dump(
+                {"best_params": study.best_params, "best_value": study.best_value},
+                f,
+                indent=4,
+            )
         print(f"Optimization complete. Best Value: {study.best_value}")

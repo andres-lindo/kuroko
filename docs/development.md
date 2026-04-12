@@ -259,10 +259,10 @@ Omit sections (`Args`, `Returns`, `Raises`) that do not apply. One-liners are ac
 
 Live strategies are pluggable via the `--strategy` CLI flag. Each live strategy consists of two artifacts:
 
-- A Python module inside the `strategies/` package (e.g. `strategies/rsi_bollinger.py`) exporting a strategy class and a `load_params` callable.
+- A Python module inside the `strategies/` package named after the class (e.g. `strategies/RSIBollingerStrategy.py`) exporting a strategy class and a `load_params` callable.
 - A JSON config file at `strategies/<StrategyClassName>.json`.
 
-The `strategies/` directory is a Python package (contains `__init__.py`). The module name is derived from the class name by convention: strip the `Strategy` suffix and convert to snake_case (e.g. `RSIBollingerStrategy` → `rsi_bollinger`), and the module is imported as `strategies.rsi_bollinger`.
+The `strategies/` directory is a Python package (contains `__init__.py`). The module file must be named exactly after the strategy class (e.g. `RSIBollingerStrategy.py`), and is imported as `strategies.RSIBollingerStrategy`.
 
 **Always validate logic changes in the backtest module before modifying any live strategy.** Port the change to a backtest strategy class, run it against historical data, and confirm the behaviour is correct before applying it to the live module.
 
