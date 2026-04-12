@@ -100,7 +100,9 @@ def load_strategy(strategy_name: str) -> tuple[type, callable]:
 
     try:
         module = importlib.import_module(f"strategies.{module_name}")
-    except ModuleNotFoundError:
+    except ModuleNotFoundError as e:
+        if e.name not in (f"strategies.{module_name}", "strategies"):
+            raise
         logger.critical(
             f"Strategy module '{module_name}' not found for strategy '{strategy_name}'. "
             f"Check that strategies/{module_name}.py exists."

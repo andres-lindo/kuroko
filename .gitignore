@@ -210,3 +210,4 @@ __marimo__/
 cache/*.parquet
 backtest/*.html
 .atl/*
+credentials.env
