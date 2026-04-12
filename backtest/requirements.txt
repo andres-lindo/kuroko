@@ -3,6 +3,3 @@ numpy
 optuna
 pandas
 bokeh
-
-# TA-Lib wheels for Windows
-TA-Lib @ https://github.com/cgohlke/talib-build/releases/download/v0.6.8/ta_lib-0.6.8-cp311-cp311-win_amd64.whl

@@ -1,6 +1,6 @@
 # Backtest & Optimization
 
-Standalone module for historical strategy validation and parameter optimization. Runs in its **own isolated virtual environment** — do not share the root venv with this module, as the dependency versions are intentionally different (e.g. `pandas 1.5.3`, `numpy 1.26.4`).
+Standalone module for historical strategy validation and parameter optimization. Runs in its **own isolated virtual environment** — do not share the root venv with this module, as the dependency versions and packages could be different.
 
 ---
 
@@ -33,6 +33,7 @@ cd backtest
 python3.11 -m venv venv
 source venv/bin/activate
 python -m pip install --upgrade pip
+pip install ta-lib
 pip install -r requirements.txt
 ```
 
@@ -68,7 +69,7 @@ Results are written to an HTML plot file in the current directory. Execution log
 
 ## Configuration
 
-Backtest parameters are stored in `strategies/RSIBollingerStrategy.json` and committed to the repository. Edit this file to change any parameter before running the backtest.
+Backtest parameters are stored in `strategies/RSIBollingerStrategy.json`. Edit this file to change any parameter before running the backtest.
 
 The file is organized into four categories:
 
@@ -114,7 +115,7 @@ The file is organized into four categories:
 
 ## Tuning Configuration
 
-Tuning engine settings and search spaces are stored in `tuning_params.json` (committed to the repository). Edit this file to change optimization behavior without modifying `tuning.py`.
+Tuning engine settings and search spaces are stored in `tuning_params.json`. Edit this file to change optimization behavior without modifying `tuning.py`.
 
 The file is organized into three sections:
 
