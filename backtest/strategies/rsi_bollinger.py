@@ -57,9 +57,21 @@ class RSIBollingerStrategy(Strategy):
             event (useful for debugging).
     """
 
+    # ---------------------------------------------------------------------------
+    # CLASS ATTRIBUTES — FALLBACK DEFAULTS ONLY
+    #
+    # These values are NOT used at runtime. backtest.py loads the actual values
+    # from strategies/RSIBollingerStrategy.json and passes them to bt.run(),
+    # which overrides every attribute listed here.
+    #
+    # They exist solely because backtesting.py requires class-level attributes
+    # to discover parameter names and infer types for Optuna optimisation.
+    # Editing these has no effect on a normal backtest run.
+    # ---------------------------------------------------------------------------
+
     # Parameters that also configure the engine
-    initial_cash_balance = 300000
-    leverage = 20
+    initial_cash_balance = 300000 # 300000 representing $3000 buffer in live scale
+    leverage = 20 # IG retail futures leverage is 20x.
     commission = 0.00012
     silent_mode = False
 
@@ -76,13 +88,13 @@ class RSIBollingerStrategy(Strategy):
     take_profit_ticks = 60.0
     atr_period = 11
     atr_sl_multiplier = 12.0
-    
+
     # Internal state variables — not included in Optuna search spaces.
     contract_multiplier = 1
-    position_size = 13           # 20 integer units representing 0.2 contracts in live
+    position_size = 13 # 13 integer units representing 0.13 contracts in live
     max_drawdown_pct = 80
     ema_period = 200
-    security_buffer = 100000.0    # 50000 representing $500 buffer in live scale
+    security_buffer = 100000 # 100000 representing $1000 buffer in live scale
 
     # Debugging flag
     log_all_candles = False
