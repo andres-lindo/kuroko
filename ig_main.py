@@ -1,129 +1,200 @@
-# main.py
-import os
-import ast
-import sys
+"""Entry point for the Kuroko live trading bot.
+
+Dynamically loads the configured strategy module, initialises logging
+(console and Azure Blob), connects to IG Markets, and starts the strategy loop.
+"""
+import importlib
 import logging
-import argparse
-
-from dotenv import load_dotenv
-from azure.data.tables import TableServiceClient
-
-from ig_client import IGClient
-from ig_strategy import Strategy
-from azure_log_handler import AzureBlobHandler
+import os
+import re
+import sys
 import warnings
 
-# Función para capturar excepciones no manejadas
+import argparse
+from dotenv import load_dotenv
+
+from azure_log_handler import AzureBlobHandler
+from ig_client import IGClient
+
+# Route unhandled exceptions through the standard logger instead of stderr
 def handle_exception(exc_type, exc_value, exc_traceback):
+    """Log unhandled exceptions before the interpreter exits.
+
+    Allows KeyboardInterrupt to pass through to the default handler so
+    CTRL+C still terminates the process cleanly.
+
+    Args:
+        exc_type: Exception class of the unhandled exception.
+        exc_value: Exception instance.
+        exc_traceback: Traceback object.
+    """
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc_value, exc_traceback)
         return
-    
-    logging.error("Excepción no manejada:", exc_info=(exc_type, exc_value, exc_traceback))
 
-# Carga variables de entorno de .env
+    logging.error("Unhandled exception:", exc_info=(exc_type, exc_value, exc_traceback))
+
+
+# Load secrets from credentials.env before any module reads environment variables
 load_dotenv("credentials.env")
 
-# Logging del módulo principal
+# Configure root logger so all modules emit to stdout with a consistent format
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 
-# Se establece el nivel de logging a WARNING para evitar mensajes innecesarios
+# Suppress verbose INFO output from third-party libraries that are not actionable
 logging.getLogger("azure").setLevel(logging.WARNING)
 logging.getLogger("trading_ig.rest").setLevel(logging.WARNING)
 
-# Ignorar advertencias
+# Suppress FutureWarnings from trading_ig until the upstream library is updated
 warnings.filterwarnings("ignore", category=FutureWarning, module="trading_ig.utils")
 warnings.filterwarnings("ignore", category=FutureWarning, module="trading_ig.rest")
 
-def load_params(partition_key: str):
+logger = logging.getLogger(__name__)
+
+
+def _class_to_module(class_name: str) -> str:
+    """Convert a PascalCase strategy class name to its snake_case module name.
+
+    Strips the 'Strategy' suffix, then applies a two-pass regex conversion
+    to correctly handle consecutive uppercase sequences (e.g. RSI -> rsi).
+
+    Args:
+        class_name: PascalCase strategy class name (e.g. 'RSIBollingerStrategy').
+
+    Returns:
+        snake_case module name (e.g. 'rsi_bollinger').
+
+    Examples:
+        >>> _class_to_module('RSIBollingerStrategy')
+        'rsi_bollinger'
+        >>> _class_to_module('SimpleStrategy')
+        'simple'
     """
-    Carga los parámetros de configuración desde Azure Table Storage filtrando
-    por PartitionKey == partition_key o 'BASE_CONF', y retorna un objeto con atributos.
+    base = re.sub(r"Strategy$", "", class_name)
+    s1 = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", base)
+    s2 = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s1)
+    return s2.lower()
+
+
+def load_strategy(strategy_name: str) -> tuple[type, callable]:
+    """Dynamically load a strategy module and return the class and load_params callable.
+
+    Resolves the module name from the strategy class name by convention
+    (PascalCase class name -> snake_case module file). Exits the process with
+    code 1 if the module is not found or does not export the expected names.
+
+    Args:
+        strategy_name: PascalCase strategy class name (e.g. 'RSIBollingerStrategy').
+
+    Returns:
+        A tuple of (StrategyClass, load_params_fn).
+
+    Raises:
+        SystemExit: If the module cannot be imported or does not export the
+            expected class or 'load_params' callable.
     """
-    # Conectar al servicio de tablas de Azure
-    conn_str = os.getenv('table_storage_connection')
-    table_service = TableServiceClient.from_connection_string(conn_str=conn_str)
-    table_client = table_service.get_table_client(table_name="ConfigParameters")
+    module_name = _class_to_module(strategy_name)
 
-    # Consultar las entidades deseadas
-    entities = table_client.query_entities(f"PartitionKey eq '{partition_key}' or PartitionKey eq 'BASE_CONF'")
-
-    # Leer todos los valores
-    raw = {e['RowKey']: e['Value'] for e in entities}
-
-    # Objeto contenedor de configuración
-    class Config: pass
-    cfg = Config()
-
-    # Asignar atributos, convirtiendo tipos según la clave
-    for key, val in raw.items():
-        if key in ('table_storage_name', 'table_log_name', 'cfd_symbol', 'candle_frecuency'):
-            setattr(cfg, key, val)
-        elif key in ('position_size_long', 'position_size_short',
-                     'default_volume', 'profit_threshold',
-                     'stop_loss_long', 'stop_loss_short',
-                     'take_profit_long', 'take_profit_short'):
-            setattr(cfg, key, float(val))
-        elif key == 'ema_crossover':
-            setattr(cfg, key, ast.literal_eval(val))
-        else:
-            setattr(cfg, key, int(val))
-
-    # También guardamos la cadena de conexión
-    setattr(cfg, 'table_storage_connection', conn_str)
-
-    return cfg
-
-def main():
-    # Se espera que el primer argumento sea la clave de partición para Azure Table
-    parser = argparse.ArgumentParser(description="Inicia el bot de trading")
-    parser.add_argument(
-        'partition_key', nargs='?', default="DEV_US500",
-        help="PartitionKey para filtrar parámetros en Azure Table"
-    )
-    args = parser.parse_args()
-
-    # Parámetros globales de Azure Table
-    params = load_params(args.partition_key)
-    logging.info("Parámetros cargados")
-    
-    # Configurar Azure Blob Handler para logging
     try:
+        module = importlib.import_module(f"strategies.{module_name}")
+    except ModuleNotFoundError as e:
+        if e.name not in (f"strategies.{module_name}", "strategies"):
+            raise
+        logger.critical(
+            f"Strategy module '{module_name}' not found for strategy '{strategy_name}'. "
+            f"Check that strategies/{module_name}.py exists."
+        )
+        sys.exit(1)
+
+    try:
+        strategy_class = getattr(module, strategy_name)
+    except AttributeError:
+        logger.critical(
+            f"Module '{module_name}' does not export class '{strategy_name}'."
+        )
+        sys.exit(1)
+
+    try:
+        load_params_fn = getattr(module, "load_params")
+    except AttributeError:
+        logger.critical(
+            f"Module '{module_name}' does not export 'load_params'."
+        )
+        sys.exit(1)
+
+    return strategy_class, load_params_fn
+
+
+def setup_azure_logging(partition_key: str) -> None:
+    """Attach the AzureBlobHandler to the root logger for cloud log shipping.
+
+    Also registers the unhandled-exception hook so crashes are captured in the
+    blob before the process exits. Fails gracefully — a warning is logged and
+    the bot continues without cloud shipping if the handler cannot be created.
+
+    Args:
+        partition_key: Label used to identify this deployment's log blob.
+    """
+    try:
+        conn_str = os.getenv("table_storage_connection")
         azure_handler = AzureBlobHandler(
-            connection_string=params.table_storage_connection,
-            blob_name=args.partition_key,
+            connection_string=conn_str,
+            blob_name=partition_key,
             container_name="logs"
         )
-
-        # Usar el mismo formato que el handler de consola
         azure_handler.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
         ))
-
-        # Añadir el handler al root logger
         logging.getLogger().addHandler(azure_handler)
-        logging.info(f"Logging configurado para Azure Blob Storage - {args.partition_key}")
-
-        # Configurar el manejador de excepciones no manejadas
+        logging.info(f"Azure Blob logging configured for partition: {partition_key}")
         sys.excepthook = handle_exception
     except Exception as e:
-        logging.warning(f"No se pudo configurar Azure Blob logging: {e}")
+        logging.warning(f"Could not configure Azure Blob logging: {e}")
 
-    # Cliente IG
+
+def main():
+    """Parse CLI arguments, bootstrap the bot, and start the strategy loop.
+
+    Dynamically loads the configured strategy and its parameters, attaches
+    Azure Blob log shipping, and then runs the strategy until interrupted.
+
+    If the strategy module cannot be loaded or parameter loading fails, a
+    CRITICAL log entry is written and the process exits with code 1.
+    No IGClient or strategy instantiation is attempted in that case.
+    """
+    # The partition key is used as the log blob label in Azure Blob Storage
+    parser = argparse.ArgumentParser(description="Kuroko live trading bot")
+    parser.add_argument(
+        "partition_key",
+        help="Label used to identify this deployment's log blob in Azure Blob Storage",
+    )
+    parser.add_argument(
+        "--strategy",
+        required=True,
+        help="Strategy class name (e.g. RSIBollingerStrategy)",
+    )
+    args = parser.parse_args()
+
+    strategy_class, load_params = load_strategy(args.strategy)
+    params = load_params(f"strategies/{args.strategy}.json")
+    setup_azure_logging(args.partition_key)
+
+    # Initialise broker client and strategy, then enter the main loop
     ig = IGClient()
-    strat = Strategy(params=params, ig_client=ig)
+    strat = strategy_class(params=params, ig_client=ig)
 
-    logging.info('Bot IG iniciado. CTRL+C para detener.')
+    logging.info('Kuroko started. Press CTRL+C to stop.')
     try:
         strat.run()
     except KeyboardInterrupt:
-        logging.info('CTRL+C detectado. Saliendo...')
+        logging.info('CTRL+C detected. Exiting...')
     except Exception as e:
-        logging.exception("Error crítico en la aplicación:")
+        logging.exception("Critical application error:")
         raise
+
 
 if __name__ == '__main__':
     main()

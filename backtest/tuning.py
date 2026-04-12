@@ -1,3 +1,18 @@
+"""Optuna-based hyperparameter optimisation driver for Kuroko backtest strategies.
+
+Supports three objective modes:
+
+- ``single``: maximise final equity (single scalar, fastest).
+- ``multiple``: Pareto-front optimisation across six metrics
+  (equity, drawdown, win rate, avg loss, Sortino, Sharpe).
+- ``weighted``: weighted linear combination of equity and drawdown.
+
+Run via:
+    python tuning.py --strategy RSIBollingerStrategy \\
+        --start_date 2026-01-01 --end_date 2026-04-10 \\
+        --objective_type single --trials 100
+"""
+
 import optuna
 import json
 import os
@@ -8,57 +23,23 @@ import random
 import numpy as np
 from backtest import load_raw_data, run, load_strategy_class
 
+
+def load_tuning_params() -> dict:
+    """Load tuning configuration from tuning_params.json."""
+    params_path = os.path.join(os.path.dirname(__file__), "tuning_params.json")
+    with open(params_path) as f:
+        return json.load(f)
+
+
 # --- Global Configurations ---
-FILE_CONFIG = {
-    'dataset_name': 'nq_intraday-15min.csv',
-    'output_folder': 'tuning_output',
-    'datasets_folder': 'datasets'
-}
-
-ENGINE_CONFIG = {
-    'initial_cash_balance': 400000,
-    'leverage': 20.0,
-    'commission': 0.00012,
-    'contract_multiplier': 1,
-    'max_drawdown_pct': 80,
-    'silent_mode': True
-}
-
-STRATEGY_SEARCH_SPACES = {
-    'EMACrossoverStrategy': {
-        'fast_ema':            {'type': 'int',   'low': 5,   'high': 20},
-        'take_profit_long':    {'type': 'float', 'low': 0.3, 'high': 1.0, 'step': 0.01},
-        'take_profit_short':   {'type': 'float', 'low': 0.3, 'high': 1.0, 'step': 0.01},
-        'stop_loss_long':      {'type': 'float', 'low': 0.3, 'high': 1.5, 'step': 0.01},
-        'stop_loss_short':     {'type': 'float', 'low': 0.3, 'high': 1.5, 'step': 0.01},
-        'max_long_positions':  {'type': 'int',   'low': 0,   'high': 15},
-        'max_short_positions': {'type': 'int',   'low': 0,   'high': 15},
-        'rsi_overbought':      {'type': 'float', 'low': 60,  'high': 70,  'step': 1.0},
-        'rsi_oversold':        {'type': 'float', 'low': 60,  'high': 80,  'step': 1.0},
-        'atr_percentile':      {'type': 'float', 'low': 10,   'high': 20,  'step': 1.0},
-    },
-    'RSIBollingerStrategy': {
-        'position_size':                  {'type': 'int',   'low': 10,    'high': 15},
-        'max_positions':                  {'type': 'int',   'low': 3,    'high': 5},
-        'min_dist_between_entries_ticks': {'type': 'float', 'low': 60.0,  'high': 150.0, 'step': 10.0},        
-        'martingale_multiplier':          {'type': 'float', 'low': 1.0,  'high': 1.5,  'step': 0.1},
-
-        'bb_dev':                         {'type': 'float', 'low': 1.5,  'high': 2.5,  'step': 0.1},
-        'bb_period':                      {'type': 'int',   'low': 18,   'high': 24},
-        'rsi_period':                     {'type': 'int',   'low': 10,   'high': 16},
-        'rsi_overbought':                 {'type': 'float', 'low': 65,   'high': 80,   'step': 1.0},
-        'rsi_oversold':                   {'type': 'float', 'low': 20,   'high': 40,   'step': 1.0},
-        'use_trend_filter':               {'type': 'categorical', 'choices': [True, False]},
-        
-        'take_profit_ticks':              {'type': 'float', 'low': 80.0, 'high': 250.0, 'step': 10.0},        
-        'atr_period':                     {'type': 'int', 'low': 10, 'high': 20},        
-        'atr_sl_multiplier':              {'type': 'float', 'low': 6.0,  'high': 15.0, 'step': 1.0},
-    }
-}
+_params = load_tuning_params()
+FILE_CONFIG = _params["file"]
+ENGINE_CONFIG = _params["engine"]
+STRATEGY_SEARCH_SPACES = _params["search_spaces"]
 
 # --- Setup & Args ---
 parser = argparse.ArgumentParser()
-parser.add_argument("--strategy", type=str, default="EMACrossoverStrategy")
+parser.add_argument("--strategy", type=str, default="RSIBollingerStrategy")
 parser.add_argument("--start_date", type=str, required=True)
 parser.add_argument("--end_date", type=str, required=True)
 parser.add_argument("--objective_type", type=str, choices=["single", "multiple", "weighted"], required=True)
@@ -66,7 +47,22 @@ parser.add_argument("--trials", type=int, required=True)
 args = parser.parse_args()
 
 def get_trial_params(trial, strategy_name):
-    """Convierte el diccionario declarativo en llamadas de Optuna"""
+    """Convert the declarative search-space config into Optuna suggest calls.
+
+    Iterates over :data:`STRATEGY_SEARCH_SPACES` for the given strategy and
+    dispatches each parameter to the appropriate ``trial.suggest_*`` method
+    based on its ``type`` key (``'int'``, ``'float'``, or ``'categorical'``).
+
+    Args:
+        trial: The current :class:`optuna.Trial` object provided by the
+            optimisation loop.
+        strategy_name: Registered strategy name used to look up the search
+            space in :data:`STRATEGY_SEARCH_SPACES`.
+
+    Returns:
+        Dict mapping parameter names to the values sampled by Optuna for
+        this trial.
+    """
     config = STRATEGY_SEARCH_SPACES.get(strategy_name)
     params = {}
     
@@ -112,6 +108,24 @@ print("Data ready.")
 
 # --- Optimization Loop ---
 def objective(trial):
+    """Optuna objective function — run one backtest trial and return its score.
+
+    Seeds both ``random`` and ``numpy`` with the trial number so results
+    are reproducible when Optuna re-evaluates the same parameter combination.
+    The return value matches the study's direction(s):
+
+    - ``single``: a single float (final equity).
+    - ``multiple``: a six-tuple of floats for Pareto optimisation.
+    - ``weighted``: a single float combining equity and drawdown.
+
+    Args:
+        trial: The current :class:`optuna.Trial` provided by
+            ``study.optimize``.
+
+    Returns:
+        Score(s) as described above. Returns a penalty (``float('-inf')``
+        or ``-100`` values) if the backtest returned ``None``.
+    """
     seed = trial.number
     random.seed(seed)
     np.random.seed(seed)
@@ -130,7 +144,7 @@ def objective(trial):
         if args.objective_type == "single":
             return float("-inf")
         elif args.objective_type == "multiple":
-            # Se requieren 6 valores de retorno (coincidiendo con las direcciones de Optuna)
+            # Must return 6 values matching the study's direction tuple.
             return float("-inf"), -100.0, 0.0, -9999.0, 0.0, 0.0
         elif args.objective_type == "weighted":
             return float("-inf")
@@ -148,7 +162,8 @@ def objective(trial):
         sortino_ratio = result.get('sortino_ratio', 0)
         sharpe_ratio = result.get('sharpe_ratio', 0)
 
-        # Si la estrategia es irreal (ej. 0 pérdidas genera Infinito), la castigamos con 0.0
+        # Clamp degenerate ratios (e.g. zero losses → Inf) to 0 to avoid
+        # poisoning the Pareto front with mathematically undefined values.
         if np.isinf(sortino_ratio) or np.isnan(sortino_ratio):
             sortino_ratio = 0.0
         if np.isinf(sharpe_ratio) or np.isnan(sharpe_ratio):
@@ -187,18 +202,18 @@ if __name__ == '__main__':
         
         best_trials = sorted(
             [{'trial_number': t.number, 'values': t.values, 'params': t.params} for t in study.best_trials],
+            # Three-priority sort key for Pareto-front ranking:
+            #   Priority 1 — Efficiency ratio (net profit / worst drawdown):
+            #     higher profit with lower drawdown scores better. The 0.0001
+            #     offset prevents division by zero when drawdown is exactly 0.
+            #   Priority 2 — Net capital: breaks ties in efficiency by
+            #     preferring the trial that earned the most absolute profit.
+            #   Priority 3 — Sortino ratio: secondary risk-adjusted tiebreaker.
             key=lambda x: (
-                # PRIORIDAD 1: "Ratio de Eficiencia" (Capital / Peor Drawdown)
-                
-                # Entre más dinero gane con menos drawdown, mayor será este puntaje.
                 (x['values'][0] - ENGINE_CONFIG['initial_cash_balance']) / abs(x['values'][1] - 0.0001),
-
-                # PRIORIDAD 2: Capital Neto (En caso de empate en eficiencia, dame el que da más dinero)
                 x['values'][0],
-
-                # PRIORIDAD 3: Sortino Ratio
-                x['values'][4]
-            ), 
+                x['values'][4],
+            ),
             reverse=True 
         )
         with open(tuning_output_file, 'w') as f:

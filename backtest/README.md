@@ -1,78 +1,209 @@
-# Set Up Python Virtual Environment (Windows)
-```sh
-C:\Python311\python.exe -m venv venv  # Create a virtual environment named 'venv'
-.\venv\Scripts\activate               # Activate the virtual environment
-python -m pip install --upgrade pip   # Upgrade pip to the latest version
-pip install -r requirements.txt       # Install required dependencies
-```
+# Backtest & Optimization
+
+Standalone module for historical strategy validation and parameter optimization. Runs in its **own isolated virtual environment** — do not share the root venv with this module, as the dependency versions and packages could be different.
 
 ---
 
-# Install Python 3.11 on Amazon Linux 2023
-```sh
-sudo dnf install -y python3.11  # Install Python 3.11
-sudo alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1  # Set Python 3.11 as an alternative
-sudo alternatives --config python3  # Select Python 3.11 as the default version
+## Prerequisites
+
+- Python 3.11
+- TA-Lib system library
+
+**macOS**
+```bash
+brew install ta-lib
 ```
 
-# Install pip for Python 3.11 on Amazon Linux 2023
-```sh
-curl -O https://bootstrap.pypa.io/get-pip.py  # Download get-pip.py script
-python3.11 get-pip.py --user  # Install pip for Python 3.11
+**Linux (Debian/Ubuntu)**
+```bash
+sudo apt-get install libta-lib-dev
 ```
 
-# Install dependencies on Amazon Linux 2023
-```sh
-python -m pip install --upgrade pip   # Upgrade pip to the latest version
-pip install -r requirements-linux.txt
-```
-
-# Invoke Backtesting
-```sh
-python backtest.py --strategy EMACrossoverStrategy
-```
-
-# Run Hyperparameter Tuning with `screen`
-## Single-Objective Optimization
-```sh
-screen -S single_objective  # Create a new screen session named 'single_objective'
-python3 tuning.py --strategy EMACrossoverStrategy --start_date 2025-06-01 --end_date 2026-02-06 --objective_type single --trials 1000  # Run tuning
-screen -r single_objective  # Reattach to the session
-```
-
-## Multi-Objective Optimization
-```sh
-screen -S multiple_objective  # Create a new screen session named 'multiple_objective'
-python3 tuning.py --strategy EMACrossoverStrategy --start_date 2025-06-01 --end_date 2026-02-06 --objective_type multiple --trials 5000  # Run tuning
-screen -r multiple_objective  # Reattach to the session
-```
-
-## Weighted-Objective Optimization
-```sh
-screen -S weighted_objective  # Create a new screen session named 'weighted_objective'
-python3 tuning.py --strategy EMACrossoverStrategy --start_date 2025-06-01 --end_date 2026-02-06 --objective_type weighted --trials 5000  # Run tuning
-screen -r weighted_objective  # Reattach to the session
-```
+**Windows** — install the prebuilt wheel manually before the rest of the dependencies (see Setup below).
 
 ---
 
-## Managing `screen` Sessions
-```sh
-screen -ls  # List all active screen sessions
+## Setup
+
+Create and activate a dedicated virtual environment from inside this directory.
+
+**macOS / Linux**
+```bash
+cd backtest
+python3.11 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+pip install ta-lib
+pip install -r requirements.txt
 ```
 
-## Detach from a session
-Press `Ctrl + A`, then `D`
-
-## Kill all `screen` Sessions
-```sh
-screen -ls | awk '/[0-9]+\./ {print $1}' | xargs -I {} screen -S {} -X quit
+**Windows**
+```powershell
+cd backtest
+C:\Python311\python.exe -m venv venv
+.\venv\Scripts\activate
+python -m pip install --upgrade pip
+pip install https://github.com/cgohlke/talib-build/releases/download/v0.6.8/ta_lib-0.6.8-cp311-cp311-win_amd64.whl
+pip install -r requirements.txt
 ```
 
-# Use a calculation: 1 contract for every $3,000 of equity
-dynamic_size = int(self.equity // 3000) 
-position_size_contracts = max(1, dynamic_size)
+> All commands below assume the backtest venv is active and you are inside the `backtest/` directory.
 
+---
 
-2026-02-13 23:21:06,010 - INFO - Trial 319 finished with values: [6038.8, -14.4, 72.4, -118.0, 6.575368156425812, 1.7760819640379988] and parameters: {'fast_ema': 6, 'take_profit_long': 0.8700000000000001, 'take_profit_short': 0.98, 'stop_loss_long': 1.97, 'stop_loss_short': 1.52, 'max_long_positions': 3, 'max_short_positions': 3, 'rsi_overbought': 70.0, 'rsi_oversold': 66.0, 'atr_percentile': 18.0}.
-2026-02-13 23:47:36,735 - INFO - Trial 414 finished with values: [6335.8, -16.4, 78.3, -122.0, 6.1765959246350794, 1.6672116121158578] and parameters: {'fast_ema': 6, 'take_profit_long': 0.8700000000000001, 'take_profit_short': 0.47, 'stop_loss_long': 1.97, 'stop_loss_short': 1.52, 'max_long_positions': 3, 'max_short_positions': 3, 'rsi_overbought': 67.0, 'rsi_oversold': 66.0, 'atr_percentile': 18.0}.
+## Running a Backtest
+
+```bash
+python backtest.py --strategy RSIBollingerStrategy
+```
+
+Results are written to an HTML plot file in the current directory. Execution log is written to `{strategy}-backtest-last-execution.log`.
+
+**Available strategies**
+
+| Strategy | Style | Key Indicators |
+|---|---|---|
+| `RSIBollingerStrategy` | Mean-reversion | RSI, Bollinger Bands, ATR |
+
+---
+
+## Configuration
+
+Backtest parameters are stored in `strategies/RSIBollingerStrategy.json`. Edit this file to change any parameter before running the backtest.
+
+The file is organized into four categories:
+
+**Backtest Date Range**
+| Key | Default | Description |
+|---|---|---|
+| `start_date` | `"2026-01-01"` | Inclusive simulation start date (YYYY-MM-DD) |
+| `end_date` | `"2026-04-10"` | Inclusive simulation end date (YYYY-MM-DD) |
+| `dataset` | `"nq_intraday-15min.csv"` | OHLC dataset file from `datasets/` |
+
+**Engine Configuration**
+| Key | Default | Description |
+|---|---|---|
+| `initial_cash_balance` | `400000` | Starting capital in USD |
+| `leverage` | `20.0` | Simulated leverage (1:20 — mirrors IG retail account) |
+| `commission` | `0.00012` | Round-trip commission per trade |
+| `silent_mode` | `false` | `false` = emit detailed buy/sell logs to console |
+| `objective_type` | `"single"` | Optimisation mode: `single` · `multiple` · `weighted` |
+
+**Risk Controls**
+| Key | Default | Description |
+|---|---|---|
+| `max_positions` | `5` | Maximum open grid levels |
+| `min_dist_between_entries_ticks` | `100.0` | Minimum tick gap between consecutive entries |
+| `martingale_multiplier` | `1.5` | Grid size multiplier (contracts scale as ×1, ×1.5, ×2.25 …) |
+| `take_profit_ticks` | `240.0` | Profit target in ticks from basket average price |
+| `atr_period` | `12` | ATR lookback period for dynamic stop-loss |
+| `atr_sl_multiplier` | `11.0` | ATR multiplier for stop-loss distance |
+
+**Indicator Settings**
+| Key | Default | Description |
+|---|---|---|
+| `bb_dev` | `1.9` | Bollinger Band standard deviation width |
+| `bb_period` | `20` | Bollinger Band and SMA lookback period |
+| `rsi_period` | `11` | RSI oscillator lookback period |
+| `rsi_overbought` | `76` | RSI level above which short entries are considered |
+| `rsi_oversold` | `25` | RSI level below which long entries are considered |
+| `use_trend_filter` | `false` | `false` = pure mean-reversion, ignores trend direction |
+
+> **Note**: These are independent from the live trading parameters in `../strategies/RSIBollingerStrategy.json`. Tuning results from Optuna can be applied here to improve backtest fidelity, but they do not automatically propagate to the live config.
+
+---
+
+## Tuning Configuration
+
+Tuning engine settings and search spaces are stored in `tuning_params.json`. Edit this file to change optimization behavior without modifying `tuning.py`.
+
+The file is organized into three sections:
+
+**`file`** — dataset and output paths
+| Key | Default | Description |
+|---|---|---|
+| `dataset_name` | `"nq_intraday-15min.csv"` | OHLC dataset file from `datasets/` |
+| `output_folder` | `"tuning_output"` | Directory for trial result and log files |
+| `datasets_folder` | `"datasets"` | Directory containing OHLC dataset files |
+
+**`engine`** — backtesting engine settings applied to every trial
+| Key | Default | Description |
+|---|---|---|
+| `initial_cash_balance` | `400000` | Starting capital in USD |
+| `leverage` | `20.0` | Simulated leverage (1:20) |
+| `commission` | `0.00012` | Round-trip commission per trade |
+| `contract_multiplier` | `1` | Contract size multiplier |
+| `max_drawdown_pct` | `80` | Maximum drawdown percentage before trial is stopped |
+| `silent_mode` | `true` | Suppress per-bar logs during optimization trials |
+
+**`search_spaces`** — per-strategy Optuna parameter search spaces
+
+Each strategy key maps to a dict of parameter names. Each parameter uses an Optuna-compatible descriptor:
+
+| Field | Required | Description |
+|---|---|---|
+| `type` | yes | `"int"`, `"float"`, or `"categorical"` |
+| `low` | for int/float | Lower bound (inclusive) |
+| `high` | for int/float | Upper bound (inclusive) |
+| `step` | for float | Step size for discrete float sampling (optional) |
+| `choices` | for categorical | Array of candidate values |
+
+> **JSON boolean convention**: categorical `choices` use JSON booleans (`true`/`false`), which `json.load()` maps automatically to Python's `True`/`False`.
+
+**Adding a new strategy**: add a new key under `search_spaces` with the strategy class name and define its parameter descriptors. No changes to `tuning.py` are required.
+
+---
+
+## Parameter Optimization
+
+Uses [Optuna](https://optuna.org/) to search the parameter space defined in `tuning.py`.
+
+```bash
+python tuning.py \
+  --strategy RSIBollingerStrategy \
+  --start_date 2026-01-01 \
+  --end_date 2026-04-10 \
+  --objective_type multiple \
+  --trials 100
+```
+
+**Arguments**
+
+| Argument | Required | Description |
+|---|---|---|
+| `--strategy` | no | `RSIBollingerStrategy` (default) |
+| `--start_date` | yes | Backtest start date (`YYYY-MM-DD`) |
+| `--end_date` | yes | Backtest end date (`YYYY-MM-DD`) |
+| `--objective_type` | yes | `single` · `multiple` · `weighted` (see below) |
+| `--trials` | yes | Number of Optuna trials to run |
+
+**Objective types**
+
+| Type | Description |
+|---|---|
+| `single` | Maximize final equity. Fast, suitable for grid search. |
+| `multiple` | Pareto front across 6 objectives: portfolio value (↑), max drawdown (↓), win rate (↑), avg loss (↓), Sortino ratio (↑), Sharpe ratio (↑). |
+| `weighted` | Composite score: 0.7 × equity − 0.3 × max_drawdown. |
+
+Outputs are written to `tuning_output/` — one JSON file with trial results and one log file per run, both timestamped as `tuning_{strategy}_{objective}_{YYYYMMDD_HHMM}`.
+
+> **Note**: `nq_intraday-15min.csv` is the default dataset regardless of the strategy selected. To change the dataset, update `file.dataset_name` in `tuning_params.json` before running.
+
+---
+
+## Datasets
+
+Historical OHLC data located in `datasets/`:
+
+| File | Resolution | Instrument | Used by |
+|---|---|---|---|
+| `nq_intraday-15min.csv` | 15-min | NASDAQ 100 futures | `RSIBollingerStrategy` |
+| `es_intraday-15min.csv` | 15-min | S&P 500 futures | — |
+
+---
+
+## Further Reading
+
+- [`../docs/architecture.md`](../docs/architecture.md) — backtest engine internals and optimization pipeline design
+- [`../docs/development.md`](../docs/development.md) — pre-commit setup, conventions, and detailed instructions for adding a strategy
+- [`../docs/strategies/RSIBollingerStrategy.md`](../docs/strategies/RSIBollingerStrategy.md) — strategy parameters, entry/exit logic, and protection mechanisms
