@@ -18,5 +18,10 @@
   "use_trend_filter": false,
   "take_profit_ticks": 240.0,
   "atr_period": 12,
-  "atr_sl_multiplier": 11.0
+  "atr_sl_multiplier": 11.0,
+  "ema_period": 200,
+  "position_size": 13,
+  "max_drawdown_pct": 80,
+  "security_buffer": 100000.0,
+  "log_all_candles": false
 }

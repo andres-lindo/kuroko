@@ -45,8 +45,6 @@ class RSIBollingerStrategy(Strategy):
             average entry price.
         atr_period: ATR lookback period for dynamic stop-loss calculation.
         atr_sl_multiplier: ATR multiplier applied to determine stop distance.
-        contract_multiplier: Point-value multiplier (set to 1 for NQ/ES
-            futures in the backtest environment).
         position_size: Base contract count for the first grid entry.
         max_drawdown_pct: Equity drawdown percentage that triggers the
             trading freeze.
@@ -76,6 +74,7 @@ class RSIBollingerStrategy(Strategy):
     silent_mode = False
 
     # Tunable strategy parameters
+    position_size = 13 # 13 integer units representing 0.13 contracts in live
     max_positions = 5
     min_dist_between_entries_ticks = 16.0
     martingale_multiplier = 1.5
@@ -90,8 +89,6 @@ class RSIBollingerStrategy(Strategy):
     atr_sl_multiplier = 12.0
 
     # Internal state variables — not included in Optuna search spaces.
-    contract_multiplier = 1
-    position_size = 13 # 13 integer units representing 0.13 contracts in live
     max_drawdown_pct = 80
     ema_period = 200
     security_buffer = 100000 # 100000 representing $1000 buffer in live scale
