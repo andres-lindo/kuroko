@@ -43,7 +43,9 @@ class AzureBlobHandler(logging.Handler):
         self.connection_string = connection_string
         self.container_name = container_name.lower()
         self.base_blob_name = blob_name
-        self.blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+        self.blob_service_client = BlobServiceClient.from_connection_string(
+            connection_string
+        )
 
         # Create the container on first use; ignore the error if it already exists.
         try:

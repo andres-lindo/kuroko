@@ -3,6 +3,7 @@
 Dynamically loads the configured strategy module, initialises logging
 (console and Azure Blob), connects to IG Markets, and starts the strategy loop.
 """
+
 import importlib
 import logging
 import os
@@ -14,6 +15,7 @@ from dotenv import load_dotenv
 
 from azure_log_handler import AzureBlobHandler
 from ig_client import IGClient
+
 
 # Route unhandled exceptions through the standard logger instead of stderr
 def handle_exception(exc_type, exc_value, exc_traceback):
@@ -39,8 +41,7 @@ load_dotenv("credentials.env")
 
 # Configure root logger so all modules emit to stdout with a consistent format
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
 
 # Suppress verbose INFO output from third-party libraries that are not actionable
@@ -94,9 +95,7 @@ def load_strategy(strategy_name: str) -> tuple[type, callable]:
     try:
         load_params_fn = getattr(module, "load_params")
     except AttributeError:
-        logger.critical(
-            f"Module '{module_name}' does not export 'load_params'."
-        )
+        logger.critical(f"Module '{module_name}' does not export 'load_params'.")
         sys.exit(1)
 
     return strategy_class, load_params_fn
@@ -115,13 +114,11 @@ def setup_azure_logging(partition_key: str) -> None:
     try:
         conn_str = os.getenv("table_storage_connection")
         azure_handler = AzureBlobHandler(
-            connection_string=conn_str,
-            blob_name=partition_key,
-            container_name="logs"
+            connection_string=conn_str, blob_name=partition_key, container_name="logs"
         )
-        azure_handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-        ))
+        azure_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        )
         logging.getLogger().addHandler(azure_handler)
         logging.info(f"Azure Blob logging configured for partition: {partition_key}")
         sys.excepthook = handle_exception
@@ -160,15 +157,15 @@ def main():
     ig = IGClient()
     strat = strategy_class(params=params, ig_client=ig)
 
-    logging.info('Kuroko started. Press CTRL+C to stop.')
+    logging.info("Kuroko started. Press CTRL+C to stop.")
     try:
         strat.run()
     except KeyboardInterrupt:
-        logging.info('CTRL+C detected. Exiting...')
+        logging.info("CTRL+C detected. Exiting...")
     except Exception as e:
         logging.exception("Critical application error:")
         raise
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

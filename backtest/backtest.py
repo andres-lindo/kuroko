@@ -34,21 +34,25 @@ def setup_logging(filename="backtest-last-execution.log"):
 
     logging.basicConfig(
         level=logging.INFO,
-        format='%(message)s',
+        format="%(message)s",
         handlers=[
-            logging.FileHandler(filename, mode='w'),
-            logging.StreamHandler(sys.stdout)
-        ]
+            logging.FileHandler(filename, mode="w"),
+            logging.StreamHandler(sys.stdout),
+        ],
     )
+
 
 # Suppress the fractional-trading UserWarning that backtesting.py emits when
 # leverage-based margin accounts hold non-integer contract sizes.
-warnings.filterwarnings('ignore', category=UserWarning, message='.*fractional trading.*')
+warnings.filterwarnings(
+    "ignore", category=UserWarning, message=".*fractional trading.*"
+)
 
 # --- Strategy Registry ---
 STRATEGY_REGISTRY = {
     "RSIBollingerStrategy": "strategies.RSIBollingerStrategy",
 }
+
 
 def load_raw_data(csv_file):
     """Load a CSV dataset into a DataFrame without any preprocessing.
@@ -72,6 +76,7 @@ def load_raw_data(csv_file):
     # Skip date parsing here — the strategy's prepare_data is responsible
     # for interpreting and filtering the index.
     return pd.read_csv(csv_file, low_memory=False)
+
 
 def load_strategy_class(strategy_name):
     """Resolve a strategy name string to the corresponding class object.
@@ -103,6 +108,7 @@ def load_strategy_class(strategy_name):
     module = importlib.import_module(module_path)
     return getattr(module, strategy_name)
 
+
 def load_backtest_params(strategy_name):
     """Load backtest parameters for a strategy from its JSON config file.
 
@@ -125,6 +131,7 @@ def load_backtest_params(strategy_name):
     )
     with open(config_path, "r") as f:
         return json.load(f)
+
 
 def get_strategy_params(strategy_name):
     """Return the default run parameters for a strategy from its JSON config.
@@ -149,17 +156,19 @@ def get_strategy_params(strategy_name):
     """
     return load_backtest_params(strategy_name).copy()
 
+
 def generate_plot(bt_instance, filename="backtest_result.html"):
     """Generates the interactive HTML plot without resampling data."""
     try:
         # resample=False is critical to avoid 'Length of values' errors
-        bt_instance.plot(filename=filename, open_browser=False, resample=False) 
+        bt_instance.plot(filename=filename, open_browser=False, resample=False)
         full_path = os.path.abspath(filename)
-        
+
         print(f"📈 Plot generated successfully!")
         print(f"🔗 Path: {full_path}", end="\n\n")
     except Exception as e:
         print(f"❌ Could not generate plot: {e}", end="\n\n")
+
 
 def run(data, params, strategy_class=None):
     """Execute a backtest and return results according to the active objective mode.
@@ -194,12 +203,12 @@ def run(data, params, strategy_class=None):
 
     # 1. Extract engine configuration keys from params before passing the
     #    remainder to bt.run(), which only accepts strategy-level parameters.
-    initial_cash = params.get('initial_cash_balance')
-    leverage = params.get('leverage')
-    commission = params.get('commission')
+    initial_cash = params.get("initial_cash_balance")
+    leverage = params.get("leverage")
+    commission = params.get("commission")
 
-    silent_mode = params.pop('silent_mode')
-    objective_type = params.pop('objective_type')
+    silent_mode = params.pop("silent_mode")
+    objective_type = params.pop("objective_type")
 
     # Inject silent_mode into the class attribute so the strategy's internal
     # log() method can read it without receiving it as a constructor argument.
@@ -211,10 +220,10 @@ def run(data, params, strategy_class=None):
         strategy_class,
         cash=initial_cash,
         commission=commission,
-        margin=1/leverage,
+        margin=1 / leverage,
         exclusive_orders=False,
         trade_on_close=True,
-        hedging=True
+        hedging=True,
     )
 
     # 3. Run the backtest, forwarding only strategy-level params (engine keys
@@ -222,12 +231,12 @@ def run(data, params, strategy_class=None):
     stats = bt.run(**params)
 
     trades_df = stats._trades
-    strategy_instance = stats['_strategy']
-    
-    if getattr(strategy_instance, 'max_drawdown_reached', False):
+    strategy_instance = stats["_strategy"]
+
+    if getattr(strategy_instance, "max_drawdown_reached", False):
         if silent_mode:
-            if objective_type == 'single':
-                return 0.0 
+            if objective_type == "single":
+                return 0.0
             return {
                 "portfolio_value": -100.0,
                 "win_rate": -100.0,
@@ -246,8 +255,8 @@ def run(data, params, strategy_class=None):
     #   normal (any)      → print the full report and return the stats object
 
     # Case 1: Silent + single-objective (fast Optuna trial)
-    if silent_mode and objective_type == 'single':
-        portfolio_value = stats['Equity Final [$]']
+    if silent_mode and objective_type == "single":
+        portfolio_value = stats["Equity Final [$]"]
         print(f"Equity: {portfolio_value:.2f}")
         return round(portfolio_value, 1)
 
@@ -256,12 +265,14 @@ def run(data, params, strategy_class=None):
     n_winning = len(closed_trades[closed_trades["PnL"] > 0])
     n_losing = len(closed_trades[closed_trades["PnL"] < 0])
     win_rate = (n_winning / len(closed_trades) * 100) if len(closed_trades) > 0 else 0
-    avg_loss = (closed_trades[closed_trades["PnL"] < 0]["PnL"].mean() if n_losing > 0 else 0)
+    avg_loss = (
+        closed_trades[closed_trades["PnL"] < 0]["PnL"].mean() if n_losing > 0 else 0
+    )
 
-    final_equity = stats['Equity Final [$]']
-    max_dd = stats['Max. Drawdown [%]']
-    sharpe_ratio = stats['Sharpe Ratio']
-    sortino_ratio = stats['Sortino Ratio']
+    final_equity = stats["Equity Final [$]"]
+    max_dd = stats["Max. Drawdown [%]"]
+    sharpe_ratio = stats["Sharpe Ratio"]
+    sortino_ratio = stats["Sortino Ratio"]
 
     # Case 2 & 3: Silent + multiple/weighted — return a metric dict for Optuna.
     if silent_mode and objective_type in ("multiple", "weighted"):
@@ -279,14 +290,18 @@ def run(data, params, strategy_class=None):
 
     # Case 4: Normal mode — print full human-readable report.
     print(f"\n{stats}\n")
-    print("="*60)
+    print("=" * 60)
     print("Operations Summary:")
-    print("="*60)
+    print("=" * 60)
     print(f"Total Trades: {len(trades_df)}")
     print(f"Closed Trades: {len(closed_trades)}")
     print(f"Winning: {n_winning} ({win_rate:.2f}%)")
     print(f"Losing: {n_losing}")
-    print(f"Avg Win: {closed_trades[closed_trades['PnL'] > 0]['PnL'].mean():.2f}" if n_winning > 0 else "Avg Win: 0.00")
+    print(
+        f"Avg Win: {closed_trades[closed_trades['PnL'] > 0]['PnL'].mean():.2f}"
+        if n_winning > 0
+        else "Avg Win: 0.00"
+    )
     print(f"Avg Loss: {avg_loss:.2f}")
     print(f"Max Drawdown: {max_dd:.2f}%")
     print(f"Sharpe Ratio: {sharpe_ratio}")
@@ -294,7 +309,7 @@ def run(data, params, strategy_class=None):
     print(f"Initial Capital: {params['initial_cash_balance']:.2f}")
     print(f"Final Capital: {final_equity:.2f}")
     print(f"Net Profit: {final_equity - params['initial_cash_balance']:.2f}")
-    print("="*60)
+    print("=" * 60)
 
     # Generate the interactive HTML chart only in normal (non-silent) mode.
     if not silent_mode:
@@ -302,10 +317,11 @@ def run(data, params, strategy_class=None):
 
     return stats
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--strategy', nargs='?', default='RSIBollingerStrategy')
+    parser.add_argument("--strategy", nargs="?", default="RSIBollingerStrategy")
     args = parser.parse_args()
 
     setup_logging(f"{args.strategy}-backtest-last-execution.log")
@@ -317,13 +333,13 @@ if __name__ == '__main__':
     params = get_strategy_params(args.strategy)
 
     # 3. Extract dataset path and date range before passing params to run().
-    csv_filename = params.pop('dataset')
-    start_date = params.pop('start_date')
-    end_date = params.pop('end_date')
+    csv_filename = params.pop("dataset")
+    start_date = params.pop("start_date")
+    end_date = params.pop("end_date")
 
     # Build the absolute path to the dataset file.
     script_dir = os.path.dirname(__file__)
-    csv_file = os.path.join(script_dir, 'datasets', csv_filename)
+    csv_file = os.path.join(script_dir, "datasets", csv_filename)
 
     print(f"Running backtest with strategy: {args.strategy}")
 
