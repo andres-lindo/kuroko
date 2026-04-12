@@ -207,8 +207,10 @@ marimo/_lsp/
 __marimo__/
 
 # Custom ignore patterns
+.DS_Store
 .atl/*
 credentials.env
 cache/*.parquet
 backtest/*.html
 backtest/tuning_output/*
+
