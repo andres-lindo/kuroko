@@ -16,6 +16,18 @@ from dotenv import load_dotenv
 from azure_log_handler import AzureBlobHandler
 from ig_client import IGClient
 
+BANNER = r"""
+  ██╗  ██╗██╗   ██╗██████╗  ██████╗ ██╗  ██╗ ██████╗
+  ██║ ██╔╝██║   ██║██╔══██╗██╔═══██╗██║ ██╔╝██╔═══██╗
+  █████╔╝ ██║   ██║██████╔╝██║   ██║█████╔╝ ██║   ██║
+  ██╔═██╗ ██║   ██║██╔══██╗██║   ██║██╔═██╗ ██║   ██║
+  ██║  ██╗╚██████╔╝██║  ██║╚██████╔╝██║  ██╗╚██████╔╝
+  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+              OPERATE IN THE SHADOWS
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+"""
+
 
 # Route unhandled exceptions through the standard logger instead of stderr
 def handle_exception(exc_type, exc_value, exc_traceback):
@@ -136,6 +148,7 @@ def main():
     CRITICAL log entry is written and the process exits with code 1.
     No IGClient or strategy instantiation is attempted in that case.
     """
+    print(BANNER)
     # The partition key is used as the log blob label in Azure Blob Storage
     parser = argparse.ArgumentParser(description="Kuroko live trading bot")
     parser.add_argument(

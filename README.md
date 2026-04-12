@@ -1,3 +1,15 @@
+```
+  ██╗  ██╗██╗   ██╗██████╗  ██████╗ ██╗  ██╗ ██████╗
+  ██║ ██╔╝██║   ██║██╔══██╗██╔═══██╗██║ ██╔╝██╔═══██╗
+  █████╔╝ ██║   ██║██████╔╝██║   ██║█████╔╝ ██║   ██║
+  ██╔═██╗ ██║   ██║██╔══██╗██║   ██║██╔═██╗ ██║   ██║
+  ██║  ██╗╚██████╔╝██║  ██║╚██████╔╝██║  ██╗╚██████╔╝
+  ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ╚═════╝
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+              OPERATE IN THE SHADOWS
+       ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
 # Kuroko
 
 Algorithmic trading bot for financial futures (NASDAQ 100, S&P 500) via [IG Markets](https://www.ig.com/). Includes a live trading engine, a historical backtesting framework, and a parameter optimization pipeline.
