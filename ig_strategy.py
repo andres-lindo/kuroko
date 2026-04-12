@@ -17,31 +17,31 @@ class Strategy:
         self.max_positions = 5
         self.min_dist_between_entries_ticks = 100.0
         self.martingale_multiplier = 1.5
-        self.bb_dev = 1.9
+        self.bb_dev = 1.5
         self.bb_period = 20
-        self.rsi_period = 11
-        self.rsi_overbought = 76
-        self.rsi_oversold = 25
+        self.rsi_period = 13
+        self.rsi_overbought = 74
+        self.rsi_oversold = 26
         self.use_trend_filter = False
-        self.take_profit_ticks = 240.0
-        self.atr_period = 12
-        self.atr_sl_multiplier = 11.0
+        self.take_profit_ticks = 210.0
+        self.atr_period = 10
+        self.atr_sl_multiplier = 9.0
 
         # Variables internas
-        self.position_size = 0.13
+        self.position_size = 0.15
         self.max_drawdown_pct = 75.75
         self.ema_period = 200
         self.max_drawdown_reached = False
 
         # Variables sistema
-        self.is_live_account = False          # Cambiar a True SOLO cuando se opere con dinero REAL
-        self.demo_starting_balance = 20000.0  # Balance demo de IG
-        self.initial_cash_balance = 4000.0    # Capital inicial
+        self.is_live_account = True          # Cambiar a True SOLO cuando se opere con dinero REAL
+        self.demo_starting_balance = 19999.51  # Balance demo de IG
+        self.initial_cash_balance = 3960.0    # Capital inicial
         
         self.leverage = 20
         self.epic = "IX.D.NASDAQ.IFMM.IP"
         self.lookback = 300
-        self.security_buffer = 1000.0
+        self.security_buffer = 960.0
 
     def get_candles(self):
         df = self.ig.get_candles(self.epic, '15min', self.lookback).copy()
@@ -290,7 +290,7 @@ class Strategy:
             if self.is_live_account:
                 # Datos crudos del broker para cuando pases a REAL
                 current_equity = account_info['balance'] + open_pnl
-                used_margin = account_info['margin']
+                used_margin = sum((p['size'] * p['level'] / self.leverage) for p in positions) if n_trades > 0 else 0
                 free_margin = account_info['available']
                 modo = "REAL"
             else:
