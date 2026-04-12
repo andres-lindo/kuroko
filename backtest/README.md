@@ -160,8 +160,8 @@ Uses [Optuna](https://optuna.org/) to search the parameter space defined in `tun
 ```bash
 python tuning.py \
   --strategy RSIBollingerStrategy \
-  --start_date 2024-01-01 \
-  --end_date 2024-12-31 \
+  --start_date 2026-01-01 \
+  --end_date 2026-04-10 \
   --objective_type multiple \
   --trials 100
 ```
@@ -198,7 +198,6 @@ Historical OHLC data located in `datasets/`:
 |---|---|---|---|
 | `nq_intraday-15min.csv` | 15-min | NASDAQ 100 futures | `RSIBollingerStrategy` |
 | `es_intraday-15min.csv` | 15-min | S&P 500 futures | — |
-| `es_intraday-5min.csv` | 5-min | S&P 500 futures | — |
 
 ---
 
