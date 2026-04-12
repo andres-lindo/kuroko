@@ -23,41 +23,19 @@ import random
 import numpy as np
 from backtest import load_raw_data, run, load_strategy_class
 
+
+def load_tuning_params() -> dict:
+    """Load tuning configuration from tuning_params.json."""
+    params_path = os.path.join(os.path.dirname(__file__), "tuning_params.json")
+    with open(params_path) as f:
+        return json.load(f)
+
+
 # --- Global Configurations ---
-FILE_CONFIG = {
-    'dataset_name': 'nq_intraday-15min.csv',
-    'output_folder': 'tuning_output',
-    'datasets_folder': 'datasets'
-}
-
-ENGINE_CONFIG = {
-    'initial_cash_balance': 400000,
-    'leverage': 20.0,
-    'commission': 0.00012,
-    'contract_multiplier': 1,
-    'max_drawdown_pct': 80,
-    'silent_mode': True
-}
-
-STRATEGY_SEARCH_SPACES = {
-    'RSIBollingerStrategy': {
-        'position_size':                  {'type': 'int',   'low': 10,    'high': 15},
-        'max_positions':                  {'type': 'int',   'low': 3,    'high': 5},
-        'min_dist_between_entries_ticks': {'type': 'float', 'low': 60.0,  'high': 150.0, 'step': 10.0},        
-        'martingale_multiplier':          {'type': 'float', 'low': 1.0,  'high': 1.5,  'step': 0.1},
-
-        'bb_dev':                         {'type': 'float', 'low': 1.5,  'high': 2.5,  'step': 0.1},
-        'bb_period':                      {'type': 'int',   'low': 18,   'high': 24},
-        'rsi_period':                     {'type': 'int',   'low': 10,   'high': 16},
-        'rsi_overbought':                 {'type': 'float', 'low': 65,   'high': 80,   'step': 1.0},
-        'rsi_oversold':                   {'type': 'float', 'low': 20,   'high': 40,   'step': 1.0},
-        'use_trend_filter':               {'type': 'categorical', 'choices': [True, False]},
-        
-        'take_profit_ticks':              {'type': 'float', 'low': 80.0, 'high': 250.0, 'step': 10.0},        
-        'atr_period':                     {'type': 'int', 'low': 10, 'high': 20},        
-        'atr_sl_multiplier':              {'type': 'float', 'low': 6.0,  'high': 15.0, 'step': 1.0},
-    }
-}
+_params = load_tuning_params()
+FILE_CONFIG = _params["file"]
+ENGINE_CONFIG = _params["engine"]
+STRATEGY_SEARCH_SPACES = _params["search_spaces"]
 
 # --- Setup & Args ---
 parser = argparse.ArgumentParser()

@@ -112,6 +112,47 @@ The file is organized into four categories:
 
 ---
 
+## Tuning Configuration
+
+Tuning engine settings and search spaces are stored in `tuning_params.json` (committed to the repository). Edit this file to change optimization behavior without modifying `tuning.py`.
+
+The file is organized into three sections:
+
+**`file`** — dataset and output paths
+| Key | Default | Description |
+|---|---|---|
+| `dataset_name` | `"nq_intraday-15min.csv"` | OHLC dataset file from `datasets/` |
+| `output_folder` | `"tuning_output"` | Directory for trial result and log files |
+| `datasets_folder` | `"datasets"` | Directory containing OHLC dataset files |
+
+**`engine`** — backtesting engine settings applied to every trial
+| Key | Default | Description |
+|---|---|---|
+| `initial_cash_balance` | `400000` | Starting capital in USD |
+| `leverage` | `20.0` | Simulated leverage (1:20) |
+| `commission` | `0.00012` | Round-trip commission per trade |
+| `contract_multiplier` | `1` | Contract size multiplier |
+| `max_drawdown_pct` | `80` | Maximum drawdown percentage before trial is stopped |
+| `silent_mode` | `true` | Suppress per-bar logs during optimization trials |
+
+**`search_spaces`** — per-strategy Optuna parameter search spaces
+
+Each strategy key maps to a dict of parameter names. Each parameter uses an Optuna-compatible descriptor:
+
+| Field | Required | Description |
+|---|---|---|
+| `type` | yes | `"int"`, `"float"`, or `"categorical"` |
+| `low` | for int/float | Lower bound (inclusive) |
+| `high` | for int/float | Upper bound (inclusive) |
+| `step` | for float | Step size for discrete float sampling (optional) |
+| `choices` | for categorical | Array of candidate values |
+
+> **JSON boolean convention**: categorical `choices` use JSON booleans (`true`/`false`), which `json.load()` maps automatically to Python's `True`/`False`.
+
+**Adding a new strategy**: add a new key under `search_spaces` with the strategy class name and define its parameter descriptors. No changes to `tuning.py` are required.
+
+---
+
 ## Parameter Optimization
 
 Uses [Optuna](https://optuna.org/) to search the parameter space defined in `tuning.py`.
@@ -145,7 +186,7 @@ python tuning.py \
 
 Outputs are written to `tuning_output/` — one JSON file with trial results and one log file per run, both timestamped as `tuning_{strategy}_{objective}_{YYYYMMDD_HHMM}`.
 
-> **Note**: `tuning.py` hardcodes `nq_intraday-15min.csv` as the dataset regardless of the strategy selected. To change the dataset, update `FILE_CONFIG['dataset_name']` in `tuning.py` before running.
+> **Note**: `nq_intraday-15min.csv` is the default dataset regardless of the strategy selected. To change the dataset, update `file.dataset_name` in `tuning_params.json` before running.
 
 ---
 

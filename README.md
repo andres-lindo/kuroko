@@ -98,6 +98,7 @@ kuroko/
     ├── requirements.txt         # Backtest-specific dependencies
     ├── backtest.py              # Backtest engine and runner
     ├── tuning.py                # Optuna-based parameter optimization
+    ├── tuning_params.json       # Tuning engine config and Optuna search spaces
     ├── datasets/
     │   ├── es_intraday-15min.csv   # S&P 500 futures (15-min OHLC)
     │   └── nq_intraday-15min.csv  # NASDAQ 100 futures (15-min OHLC)
