@@ -2,7 +2,6 @@
 
 Implements a mean-reversion grid strategy using RSI and Bollinger Bands
 signals, martingale position sizing, and ATR-based dynamic stop-losses.
-Module name: rsi_bollinger. Logger name: rsi_bollinger.
 """
 import os
 import re
@@ -16,7 +15,7 @@ import pandas as pd
 
 from datetime import datetime, timedelta, timezone
 
-logger = logging.getLogger("rsi_bollinger")
+logger = logging.getLogger(__name__)
 
 
 # Expected type for each parameter key.

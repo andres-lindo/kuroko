@@ -47,7 +47,7 @@ warnings.filterwarnings('ignore', category=UserWarning, message='.*fractional tr
 
 # --- Strategy Registry ---
 STRATEGY_REGISTRY = {
-    "RSIBollingerStrategy": "strategies.rsi_bollinger",
+    "RSIBollingerStrategy": "strategies.RSIBollingerStrategy",
 }
 
 def load_raw_data(csv_file):

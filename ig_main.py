@@ -6,7 +6,6 @@ Dynamically loads the configured strategy module, initialises logging
 import importlib
 import logging
 import os
-import re
 import sys
 import warnings
 
@@ -55,39 +54,16 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="trading_ig.res
 logger = logging.getLogger(__name__)
 
 
-def _class_to_module(class_name: str) -> str:
-    """Convert a PascalCase strategy class name to its snake_case module name.
-
-    Strips the 'Strategy' suffix, then applies a two-pass regex conversion
-    to correctly handle consecutive uppercase sequences (e.g. RSI -> rsi).
-
-    Args:
-        class_name: PascalCase strategy class name (e.g. 'RSIBollingerStrategy').
-
-    Returns:
-        snake_case module name (e.g. 'rsi_bollinger').
-
-    Examples:
-        >>> _class_to_module('RSIBollingerStrategy')
-        'rsi_bollinger'
-        >>> _class_to_module('SimpleStrategy')
-        'simple'
-    """
-    base = re.sub(r"Strategy$", "", class_name)
-    s1 = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", base)
-    s2 = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s1)
-    return s2.lower()
-
-
 def load_strategy(strategy_name: str) -> tuple[type, callable]:
     """Dynamically load a strategy module and return the class and load_params callable.
 
-    Resolves the module name from the strategy class name by convention
-    (PascalCase class name -> snake_case module file). Exits the process with
-    code 1 if the module is not found or does not export the expected names.
+    The module file must be named after the strategy class (e.g.
+    'RSIBollingerStrategy' is loaded from 'strategies/RSIBollingerStrategy.py').
+    Exits the process with code 1 if the module is not found or does not
+    export the expected names.
 
     Args:
-        strategy_name: PascalCase strategy class name (e.g. 'RSIBollingerStrategy').
+        strategy_name: Strategy class name (e.g. 'RSIBollingerStrategy').
 
     Returns:
         A tuple of (StrategyClass, load_params_fn).
@@ -96,16 +72,14 @@ def load_strategy(strategy_name: str) -> tuple[type, callable]:
         SystemExit: If the module cannot be imported or does not export the
             expected class or 'load_params' callable.
     """
-    module_name = _class_to_module(strategy_name)
-
     try:
-        module = importlib.import_module(f"strategies.{module_name}")
+        module = importlib.import_module(f"strategies.{strategy_name}")
     except ModuleNotFoundError as e:
-        if e.name not in (f"strategies.{module_name}", "strategies"):
+        if e.name not in (f"strategies.{strategy_name}", "strategies"):
             raise
         logger.critical(
-            f"Strategy module '{module_name}' not found for strategy '{strategy_name}'. "
-            f"Check that strategies/{module_name}.py exists."
+            f"Strategy module not found for '{strategy_name}'. "
+            f"Check that strategies/{strategy_name}.py exists."
         )
         sys.exit(1)
 
@@ -113,7 +87,7 @@ def load_strategy(strategy_name: str) -> tuple[type, callable]:
         strategy_class = getattr(module, strategy_name)
     except AttributeError:
         logger.critical(
-            f"Module '{module_name}' does not export class '{strategy_name}'."
+            f"Module 'strategies.{strategy_name}' does not export class '{strategy_name}'."
         )
         sys.exit(1)
 

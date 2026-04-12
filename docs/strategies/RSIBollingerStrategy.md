@@ -4,7 +4,7 @@ Mean-reversion grid strategy for IG Markets live trading. Trades NASDAQ 100
 (or S&P 500) futures on a 15-minute candle cadence using RSI and Bollinger
 Bands signals, martingale position sizing, and ATR-based dynamic stop-losses.
 
-Module: `strategies/rsi_bollinger.py` | Logger name: `rsi_bollinger`
+Module: `strategies/RSIBollingerStrategy.py` | Logger name: `strategies.RSIBollingerStrategy`
 
 ---
 
