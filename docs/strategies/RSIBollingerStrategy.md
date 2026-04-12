@@ -113,15 +113,16 @@ In LIVE mode, `free_margin` comes directly from the broker's `available` field.
 
 ## Account Mode
 
-`is_live_account` is derived from the `ig_acc_type` environment variable in `credentials.env`. It is NOT present in `RSIBollingerStrategy.json`.
+`is_live_account` is set at startup by `ig_main.py` based on the `ig_acc_type` environment variable. See [Architecture — Account Mode](../architecture.md#account-mode) for how the flag is derived.
 
-| `ig_acc_type` | `is_live_account` | Behaviour |
-|---------------|-------------------|-----------|
-| `LIVE` | `True` | Real-money trades via IG Markets |
-| `DEMO` | `False` | Virtual mode — simulates 1:20 leverage, no real money |
-| missing / other | `False` | Treated as demo |
+**In DEMO mode** (`is_live_account=False`):
+- Equity = `initial_cash_balance` + realized P&L (virtual simulation)
+- Free margin = `current_equity - used_margin` (computed locally)
+- `demo_starting_balance` is used only as a reference for realized P&L calculation
 
-> **Warning**: `ig_acc_type=LIVE` places real-money orders. The match is case-sensitive — `live` or `Live` will NOT activate live mode.
+**In LIVE mode** (`is_live_account=True`):
+- Equity and free margin come directly from the broker's account summary
+- `initial_cash_balance` and `demo_starting_balance` are ignored
 
 ---
 

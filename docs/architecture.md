@@ -150,6 +150,20 @@ See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for
 
 `table_storage_connection` is NOT in this file — it is read from the environment (`credentials.env`) exclusively for `AzureBlobHandler` log shipping.
 
+### Account Mode
+
+`is_live_account` is derived from the `ig_acc_type` environment variable in `credentials.env`.
+
+| `ig_acc_type` | `is_live_account` | Behaviour |
+|---------------|-------------------|-----------|
+| `LIVE` | `True` | Real-money trades via IG Markets |
+| `DEMO` | `False` | Virtual mode — simulates 1:20 leverage, no real money |
+| missing / other | `False` | Treated as demo |
+
+> **Warning**: `ig_acc_type=LIVE` places real-money orders. The match is case-sensitive — `live` or `Live` will NOT activate live mode.
+
+For how this flag affects margin and equity calculations inside the strategy, see [RSIBollingerStrategy — Account Mode](strategies/RSIBollingerStrategy.md#account-mode).
+
 ---
 
 ## Backtesting
