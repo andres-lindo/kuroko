@@ -88,14 +88,18 @@ The file is organized into four categories:
 | `commission` | `0.00012` | Round-trip commission per trade |
 | `silent_mode` | `false` | `false` = emit detailed buy/sell logs to console |
 | `objective_type` | `"single"` | Optimisation mode: `single` · `multiple` · `weighted` |
+| `log_all_candles` | `false` | `true` = log every bar even without a trade event |
 
 **Risk Controls**
 | Key | Default | Description |
 |---|---|---|
 | `max_positions` | `5` | Maximum open grid levels |
+| `position_size` | `13` | Base contract size for the first grid entry |
 | `min_dist_between_entries_ticks` | `100.0` | Minimum tick gap between consecutive entries |
 | `martingale_multiplier` | `1.5` | Grid size multiplier (contracts scale as ×1, ×1.5, ×2.25 …) |
 | `take_profit_ticks` | `240.0` | Profit target in ticks from basket average price |
+| `max_drawdown_pct` | `80` | Drawdown percentage that freezes new entries |
+| `security_buffer` | `100000.0` | Minimum free-margin buffer (USD) required before any entry |
 | `atr_period` | `12` | ATR lookback period for dynamic stop-loss |
 | `atr_sl_multiplier` | `11.0` | ATR multiplier for stop-loss distance |
 
@@ -108,6 +112,7 @@ The file is organized into four categories:
 | `rsi_overbought` | `76` | RSI level above which short entries are considered |
 | `rsi_oversold` | `25` | RSI level below which long entries are considered |
 | `use_trend_filter` | `false` | `false` = pure mean-reversion, ignores trend direction |
+| `ema_period` | `200` | EMA lookback period used by the optional trend filter |
 
 > **Note**: These are independent from the live trading parameters in `../strategies/RSIBollingerStrategy.json`. Tuning results from Optuna can be applied here to improve backtest fidelity, but they do not automatically propagate to the live config.
 
@@ -132,9 +137,11 @@ The file is organized into three sections:
 | `initial_cash_balance` | `400000` | Starting capital in USD |
 | `leverage` | `20.0` | Simulated leverage (1:20) |
 | `commission` | `0.00012` | Round-trip commission per trade |
-| `contract_multiplier` | `1` | Contract size multiplier |
 | `max_drawdown_pct` | `80` | Maximum drawdown percentage before trial is stopped |
 | `silent_mode` | `true` | Suppress per-bar logs during optimization trials |
+| `ema_period` | `200` | EMA lookback period (fixed, not tuned by Optuna) |
+| `security_buffer` | `100000.0` | Minimum free-margin buffer required before any entry |
+| `log_all_candles` | `false` | `true` = log every bar (keep `false` during tuning) |
 
 **`search_spaces`** — per-strategy Optuna parameter search spaces
 
