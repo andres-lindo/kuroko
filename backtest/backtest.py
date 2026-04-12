@@ -9,6 +9,7 @@ Optuna tuning script.
 from backtesting import Backtest
 import pandas as pd
 import os
+import json
 import argparse
 import importlib
 import warnings
@@ -102,60 +103,51 @@ def load_strategy_class(strategy_name):
     module = importlib.import_module(module_path)
     return getattr(module, strategy_name)
 
-def get_strategy_params(strategy_name):
-    """Return the default run parameters for a registered strategy.
+def load_backtest_params(strategy_name):
+    """Load backtest parameters for a strategy from its JSON config file.
 
-    Parameters are split into two groups inside each entry:
-    engine parameters (cash, leverage, commission, mode flags) and
-    strategy parameters (indicator settings, risk limits). Both groups
-    are returned together in a single flat dict so callers can pass them
-    directly to :func:`run`.
+    Resolves the path relative to this file's directory:
+    ``backtest/strategies/{strategy_name}.json``.
 
     Args:
-        strategy_name: Registered name of the strategy (e.g.
+        strategy_name: Name of the strategy class (e.g.
+            ``'RSIBollingerStrategy'``). Used to build the file name.
+
+    Returns:
+        A dict with all parameters loaded from the JSON file.
+
+    Raises:
+        FileNotFoundError: If no JSON file exists for ``strategy_name``
+            at the expected path.
+    """
+    config_path = os.path.join(
+        os.path.dirname(__file__), "strategies", f"{strategy_name}.json"
+    )
+    with open(config_path, "r") as f:
+        return json.load(f)
+
+def get_strategy_params(strategy_name):
+    """Return the default run parameters for a strategy from its JSON config.
+
+    Delegates to :func:`load_backtest_params` to read
+    ``backtest/strategies/{strategy_name}.json``. Parameters cover two
+    groups: engine settings (cash, leverage, commission, mode flags) and
+    strategy settings (indicator settings, risk limits), returned together
+    in a single flat dict so callers can pass them directly to :func:`run`.
+
+    Args:
+        strategy_name: Name of the strategy class (e.g.
             ``'RSIBollingerStrategy'``).
 
     Returns:
         A shallow copy of the parameter dict so callers can safely
-        ``pop`` keys without mutating the registry.
+        ``pop`` keys without mutating the loaded data.
 
     Raises:
-        ValueError: If ``strategy_name`` has no entry in
-            ``STRATEGY_PARAMS``.
+        FileNotFoundError: If no JSON config exists for ``strategy_name``
+            at ``backtest/strategies/{strategy_name}.json``.
     """
-    STRATEGY_PARAMS = {
-        "RSIBollingerStrategy": {
-            # --- Backtest Date Range ---
-            "start_date": "2026-01-01",  # Inclusive simulation start date.
-            "end_date": "2026-04-10",  # Inclusive simulation end date.
-            "dataset": "nq_intraday-15min.csv",  # OHLC dataset file (NQ futures, 15-min bars).
-            # --- Engine Configuration ---
-            "initial_cash_balance": 400000,  # Starting capital in USD.
-            "leverage": 20.0,  # CRITICAL: Retail leverage 1:20; requires 5% margin (~$345/contract).
-            "commission": 0.00012,  # Simulated round-trip commission per trade.
-            "silent_mode": False,  # False = emit detailed buy/sell logs to console.
-            "objective_type": "single",  # Optimisation target: single-objective (maximise equity).
-            # --- Strategy Parameters ---
-            "max_positions": 5,  # Safety cap: max 5 grid levels to prevent margin exhaustion.
-            "min_dist_between_entries_ticks": 100.0,  # Min tick gap between entries to avoid clustering.
-            "martingale_multiplier": 1.5,  # Grid size multiplier: contracts scale as x1, x1.5, x2.25 …
-            "bb_dev": 1.9,  # Bollinger Band standard deviation width (1.7 = tighter, 2.0 = wider).
-            "bb_period": 20,  # Bollinger Band and SMA lookback period.
-            "rsi_period": 11,  # RSI oscillator lookback period.
-            "rsi_overbought": 76,  # RSI level above which short entries are allowed.
-            "rsi_oversold": 25,  # RSI level below which long entries are allowed.
-            "use_trend_filter": False,  # False = pure mean-reversion (ignores trend direction).
-            "take_profit_ticks": 240.0,  # Profit target in ticks measured from the basket average price.
-            "atr_period": 12,  # ATR lookback period for dynamic stop-loss calculation.
-            "atr_sl_multiplier": 11.0,  # ATR multiplier for the stop-loss distance (wider = more room).
-        },
-        # Add more strategy configurations here
-    }
-    
-    if strategy_name not in STRATEGY_PARAMS:
-        raise ValueError(f"No parameters configured for strategy '{strategy_name}'")
-    
-    return STRATEGY_PARAMS[strategy_name].copy()
+    return load_backtest_params(strategy_name).copy()
 
 def generate_plot(bt_instance, filename="backtest_result.html"):
     """Generates the interactive HTML plot without resampling data."""

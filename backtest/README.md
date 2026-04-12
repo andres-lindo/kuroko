@@ -66,6 +66,52 @@ Results are written to an HTML plot file in the current directory. Execution log
 
 ---
 
+## Configuration
+
+Backtest parameters are stored in `strategies/RSIBollingerStrategy.json` and committed to the repository. Edit this file to change any parameter before running the backtest.
+
+The file is organized into four categories:
+
+**Backtest Date Range**
+| Key | Default | Description |
+|---|---|---|
+| `start_date` | `"2026-01-01"` | Inclusive simulation start date (YYYY-MM-DD) |
+| `end_date` | `"2026-04-10"` | Inclusive simulation end date (YYYY-MM-DD) |
+| `dataset` | `"nq_intraday-15min.csv"` | OHLC dataset file from `datasets/` |
+
+**Engine Configuration**
+| Key | Default | Description |
+|---|---|---|
+| `initial_cash_balance` | `400000` | Starting capital in USD |
+| `leverage` | `20.0` | Simulated leverage (1:20 — mirrors IG retail account) |
+| `commission` | `0.00012` | Round-trip commission per trade |
+| `silent_mode` | `false` | `false` = emit detailed buy/sell logs to console |
+| `objective_type` | `"single"` | Optimisation mode: `single` · `multiple` · `weighted` |
+
+**Risk Controls**
+| Key | Default | Description |
+|---|---|---|
+| `max_positions` | `5` | Maximum open grid levels |
+| `min_dist_between_entries_ticks` | `100.0` | Minimum tick gap between consecutive entries |
+| `martingale_multiplier` | `1.5` | Grid size multiplier (contracts scale as ×1, ×1.5, ×2.25 …) |
+| `take_profit_ticks` | `240.0` | Profit target in ticks from basket average price |
+| `atr_period` | `12` | ATR lookback period for dynamic stop-loss |
+| `atr_sl_multiplier` | `11.0` | ATR multiplier for stop-loss distance |
+
+**Indicator Settings**
+| Key | Default | Description |
+|---|---|---|
+| `bb_dev` | `1.9` | Bollinger Band standard deviation width |
+| `bb_period` | `20` | Bollinger Band and SMA lookback period |
+| `rsi_period` | `11` | RSI oscillator lookback period |
+| `rsi_overbought` | `76` | RSI level above which short entries are considered |
+| `rsi_oversold` | `25` | RSI level below which long entries are considered |
+| `use_trend_filter` | `false` | `false` = pure mean-reversion, ignores trend direction |
+
+> **Note**: These are independent from the live trading parameters in `../strategies/RSIBollingerStrategy.json`. Tuning results from Optuna can be applied here to improve backtest fidelity, but they do not automatically propagate to the live config.
+
+---
+
 ## Parameter Optimization
 
 Uses [Optuna](https://optuna.org/) to search the parameter space defined in `tuning.py`.

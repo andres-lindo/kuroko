@@ -1,0 +1,22 @@
+{
+  "start_date": "2026-01-01",
+  "end_date": "2026-04-10",
+  "dataset": "nq_intraday-15min.csv",
+  "initial_cash_balance": 400000,
+  "leverage": 20.0,
+  "commission": 0.00012,
+  "silent_mode": false,
+  "objective_type": "single",
+  "max_positions": 5,
+  "min_dist_between_entries_ticks": 100.0,
+  "martingale_multiplier": 1.5,
+  "bb_dev": 1.9,
+  "bb_period": 20,
+  "rsi_period": 11,
+  "rsi_overbought": 76,
+  "rsi_oversold": 25,
+  "use_trend_filter": false,
+  "take_profit_ticks": 240.0,
+  "atr_period": 12,
+  "atr_sl_multiplier": 11.0
+}

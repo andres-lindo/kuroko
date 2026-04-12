@@ -67,7 +67,7 @@ table_storage_connection=DefaultEndpointsProtocol=https;AccountName=...
 
 > `ig_acc_type` controls live vs demo mode (`DEMO` or `LIVE`). See [`docs/architecture.md`](docs/architecture.md#risk-controls) before switching to a live account.
 
-Strategy parameters are stored in `strategies/RSIBollingerStrategy.json` and committed to the repository. Edit that file to change any live-trading parameter before running the bot. See [RSIBollingerStrategy documentation](docs/strategies/RSIBollingerStrategy.md) for the full parameter reference.
+Strategy parameters are stored in `strategies/RSIBollingerStrategy.json` (live trading) and `backtest/strategies/RSIBollingerStrategy.json` (backtesting) — both committed to the repository. Edit the corresponding file before running. See [RSIBollingerStrategy documentation](docs/strategies/RSIBollingerStrategy.md) for the full parameter reference.
 
 ---
 
@@ -103,7 +103,8 @@ kuroko/
     │   └── nq_intraday-15min.csv  # NASDAQ 100 futures (15-min OHLC)
     └── strategies/
         ├── __init__.py
-        └── rsi_bollinger.py        # RSI + Bollinger Bands (mean-reversion)
+        ├── rsi_bollinger.py        # RSI + Bollinger Bands (mean-reversion)
+        └── RSIBollingerStrategy.json  # Backtest default parameters (date range, engine, strategy)
 ```
 
 ---
