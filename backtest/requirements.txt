@@ -1,8 +1,8 @@
-backtesting==0.3.3
-numpy==1.26.4
-optuna==4.1.0
-pandas==1.5.3
-bokeh==2.4.3
+backtesting
+numpy
+optuna
+pandas
+bokeh
 
 # TA-Lib wheels for Windows
 TA-Lib @ https://github.com/cgohlke/talib-build/releases/download/v0.6.8/ta_lib-0.6.8-cp311-cp311-win_amd64.whl
