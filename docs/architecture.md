@@ -172,7 +172,7 @@ See [`backtest/README.md`](../backtest/README.md) for setup and execution. The a
 
 ### Backtest Engine (`backtest/backtest.py`)
 
-Built on top of `backtesting.py` 0.3.3. The engine loads a CSV dataset, instantiates the strategy class, and runs a bar-by-bar simulation.
+The engine loads a CSV dataset, instantiates the strategy class, and runs a bar-by-bar simulation.
 
 ```
 load_raw_data(csv)
@@ -184,12 +184,6 @@ load_strategy_class(name)
 run(strategy_class, data, params)
     └── backtesting.Backtest(data, strategy_class, **engine_config).run()
 ```
-
-Strategy classes follow the `backtesting.py` pattern:
-- **Class attributes** = tunable parameters (Optuna reads these directly)
-- `prepare_data(df, start_date, end_date)` = classmethod for date filtering and preprocessing
-- `init()` = indicator setup (called once)
-- `next()` = per-bar logic (called on every candle)
 
 ### Optimization Pipeline (`backtest/tuning.py`)
 
