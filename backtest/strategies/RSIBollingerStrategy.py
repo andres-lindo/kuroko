@@ -200,9 +200,6 @@ class RSIBollingerStrategy(Strategy):
         if self.max_drawdown_reached:
             return
 
-        # Log the current bar's data and margin stats for diagnostics.
-        self.log("BAR LOGGED")
-
         # --- SIMULATED BROKER TP/SL DETECTOR ---
         # backtesting.py closes positions silently when a broker-level TP or
         # SL is hit. Comparing the current closed_trades count to the previous
