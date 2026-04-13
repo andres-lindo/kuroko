@@ -10,7 +10,6 @@
   "max_drawdown_pct": 80,
   "ema_period": 200,
   "silent_mode": false,
-  "log_all_candles": false,
 
   "position_size": 15,
   "max_positions": 5,

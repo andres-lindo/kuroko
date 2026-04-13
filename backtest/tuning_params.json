@@ -11,8 +11,7 @@
     "max_drawdown_pct": 80,
     "silent_mode": true,
     "ema_period": 200,
-    "security_buffer": 100000.0,
-    "log_all_candles": false
+    "security_buffer": 100000.0
   },
   "search_spaces": {
     "RSIBollingerStrategy": {

@@ -51,8 +51,6 @@ class RSIBollingerStrategy(Strategy):
         ema_period: EMA lookback period used by the optional trend filter.
         security_buffer: Minimum free-margin buffer (in USD) required before
             opening a new position, mirroring IG's margin model.
-        log_all_candles: When True, logs every bar even without a trade
-            event (useful for debugging).
     """
 
     # ---------------------------------------------------------------------------
@@ -71,7 +69,7 @@ class RSIBollingerStrategy(Strategy):
     initial_cash_balance = 300000  # 300000 representing $3000 buffer in live scale
     leverage = 20  # IG retail futures leverage is 20x.
     commission = 0.00012
-    silent_mode = False
+    silent_mode = True
 
     # Tunable strategy parameters
     position_size = 13  # 13 integer units representing 0.13 contracts in live
@@ -92,9 +90,6 @@ class RSIBollingerStrategy(Strategy):
     max_drawdown_pct = 80
     ema_period = 200
     security_buffer = 100000  # 100000 representing $1000 buffer in live scale
-
-    # Debugging flag
-    log_all_candles = False
 
     @classmethod
     def prepare_data(cls, df, start_date, end_date):
@@ -205,6 +200,9 @@ class RSIBollingerStrategy(Strategy):
         if self.max_drawdown_reached:
             return
 
+        # Log the current bar's data and margin stats for diagnostics.
+        self.log("BAR LOGGED")
+
         # --- SIMULATED BROKER TP/SL DETECTOR ---
         # backtesting.py closes positions silently when a broker-level TP or
         # SL is hit. Comparing the current closed_trades count to the previous
@@ -237,9 +235,6 @@ class RSIBollingerStrategy(Strategy):
         atr = self.atr[-1]
         trades = self.trades
         n_trades = len(trades)
-
-        if self.log_all_candles:
-            self.log("OK")
 
         # --- 0. EXITS (BASKET TP MANUAL FALLBACK) ---
         if n_trades > 0:

@@ -207,7 +207,7 @@ def run(data, params, strategy_class=None):
     leverage = params.get("leverage")
     commission = params.get("commission")
 
-    silent_mode = params.pop("silent_mode")
+    silent_mode = params.pop("silent_mode", True)
     objective_type = params.pop("objective_type")
 
     # Inject silent_mode into the class attribute so the strategy's internal
