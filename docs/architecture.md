@@ -6,7 +6,7 @@ Kuroko is split into two independent execution contexts that share no runtime st
 
 | Context | Entry point | Environment |
 |---|---|---|
-| Live trading | `ig_main.py` | Root venv |
+| Live trading | `kuroko.py` | Root venv |
 | Backtesting / Optimization | `backtest/backtest.py`, `backtest/tuning.py` | `backtest/` venv |
 
 ---
@@ -16,7 +16,7 @@ Kuroko is split into two independent execution contexts that share no runtime st
 ### Startup Sequence
 
 ```
-ig_main.py  ← load_dotenv("credentials.env") runs at module scope, before main()
+kuroko.py  ← load_dotenv("credentials.env") runs at module scope, before main()
 ├── load_strategy(args.strategy) → (RSIBollingerStrategy, load_params)
 ├── load_params("strategies/RSIBollingerStrategy.json") → types.SimpleNamespace
 │   └── keys: log_partition_key, candle_frecuency, epic, max_positions, rsi_period, bb_period, ...

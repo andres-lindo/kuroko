@@ -92,7 +92,7 @@ kuroko/
 ├── requirements.txt             # Live trading dependencies
 ├── .pre-commit-config.yaml      # pre-commit hooks
 │
-├── ig_main.py                   # Entry point — loads strategy dynamically
+├── kuroko.py                    # Entry point — loads strategy dynamically
 ├── ig_client.py                 # IG Markets API wrapper (auth, retry, caching)
 ├── azure_log_handler.py         # Custom logging handler → Azure Blob Storage
 │
@@ -131,13 +131,13 @@ kuroko/
 source venv/bin/activate          # macOS/Linux
 .\venv\Scripts\activate           # Windows
 
-python ig_main.py --strategy <StrategyName>
+python kuroko.py --strategy <StrategyName>
 ```
 
 `--strategy` is required and must name the strategy class to run. The Azure Blob log partition key is read from `log_partition_key` in the strategy JSON config.
 
 ```bash
-python ig_main.py --strategy RSIBollingerStrategy
+python kuroko.py --strategy RSIBollingerStrategy
 ```
 
 See [RSIBollingerStrategy documentation](docs/strategies/RSIBollingerStrategy.md) for parameter reference.
