@@ -587,7 +587,11 @@ class RSIBollingerStrategy:
             if self.is_live_account:
                 # LIVE mode: use raw broker figures
                 current_equity = account_info.get("balance", 0.0) + open_pnl
-                used_margin = account_info.get("margin", 0.0)
+                used_margin = (
+                    sum((p["size"] * p["level"] / self.leverage) for p in positions)
+                    if n_trades > 0
+                    else 0
+                )
                 free_margin = account_info.get("available", 0.0)
                 modo = "LIVE"
             else:
