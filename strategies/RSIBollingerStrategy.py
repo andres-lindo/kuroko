@@ -611,6 +611,18 @@ class RSIBollingerStrategy:
                 free_margin = current_equity - used_margin
                 modo = f"VIRTUAL (1:{self.leverage})"
 
+            # --- AVG ENTRY PRICE ---
+            if n_trades > 0:
+                total_size = sum(p["size"] for p in positions)
+                avg_entry = (
+                    sum(p["size"] * p["level"] for p in positions) / total_size
+                    if total_size > 0
+                    else 0
+                )
+                avg_entry_str = f"{avg_entry:.2f}"
+            else:
+                avg_entry_str = "N/A"
+
             # --- MARGIN LEVEL (%) ---
             if used_margin > 0:
                 margin_level_pct = (current_equity / used_margin) * 100
@@ -633,7 +645,8 @@ class RSIBollingerStrategy:
                 f"Used Margin: ${used_margin:.2f} | "
                 f"Margin Level: {margin_str} {health_icon} | "
                 f"Free: ${free_margin:.2f} | "
-                f"Positions: {n_trades}"
+                f"Positions: {n_trades} | "
+                f"Avg Entry Price: {avg_entry_str}"
             )
         except Exception as e:
             logger.error(f"Error generating account status report: {e}")
