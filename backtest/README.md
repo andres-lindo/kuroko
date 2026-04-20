@@ -88,7 +88,6 @@ The file is organized into four categories:
 | `commission` | `0.00012` | Round-trip commission per trade |
 | `silent_mode` | `false` | `false` = emit detailed buy/sell logs to console |
 | `objective_type` | `"single"` | Optimisation mode: `single` · `multiple` · `weighted` |
-| `log_all_candles` | `false` | `true` = log every bar even without a trade event |
 
 **Risk Controls**
 | Key | Default | Description |
@@ -141,7 +140,6 @@ The file is organized into three sections:
 | `silent_mode` | `true` | Suppress per-bar logs during optimization trials |
 | `ema_period` | `200` | EMA lookback period (fixed, not tuned by Optuna) |
 | `security_buffer` | `100000.0` | Minimum free-margin buffer required before any entry |
-| `log_all_candles` | `false` | `true` = log every bar (keep `false` during tuning) |
 
 **`search_spaces`** — per-strategy Optuna parameter search spaces
 

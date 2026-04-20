@@ -113,7 +113,7 @@ In LIVE mode, `free_margin` comes directly from the broker's `available` field.
 
 ## Account Mode
 
-`is_live_account` is set at startup by `ig_main.py` based on the `ig_acc_type` environment variable. See [Architecture — Account Mode](../architecture.md#account-mode) for how the flag is derived.
+`is_live_account` is set at startup by `kuroko.py` based on the `ig_acc_type` environment variable. See [Architecture — Account Mode](../architecture.md#account-mode) for how the flag is derived.
 
 **In DEMO mode** (`is_live_account=False`):
 - Equity = `initial_cash_balance` + realized P&L (virtual simulation)

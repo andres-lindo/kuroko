@@ -587,7 +587,11 @@ class RSIBollingerStrategy:
             if self.is_live_account:
                 # LIVE mode: use raw broker figures
                 current_equity = account_info.get("balance", 0.0) + open_pnl
-                used_margin = account_info.get("margin", 0.0)
+                used_margin = (
+                    sum((p["size"] * p["level"] / self.leverage) for p in positions)
+                    if n_trades > 0
+                    else 0
+                )
                 free_margin = account_info.get("available", 0.0)
                 modo = "LIVE"
             else:
@@ -606,6 +610,20 @@ class RSIBollingerStrategy:
                 )
                 free_margin = current_equity - used_margin
                 modo = f"VIRTUAL (1:{self.leverage})"
+
+            # --- AVG ENTRY PRICE & ESTIMATED TP PROFIT ---
+            if n_trades > 0:
+                total_size = sum(p["size"] for p in positions)
+                avg_entry = (
+                    sum(p["size"] * p["level"] for p in positions) / total_size
+                    if total_size > 0
+                    else 0
+                )
+                avg_entry_str = f"{avg_entry:.2f}"
+                est_profit_str = f"${total_size * self.take_profit_ticks:.2f}"
+            else:
+                avg_entry_str = "N/A"
+                est_profit_str = "N/A"
 
             # --- MARGIN LEVEL (%) ---
             if used_margin > 0:
@@ -629,7 +647,9 @@ class RSIBollingerStrategy:
                 f"Used Margin: ${used_margin:.2f} | "
                 f"Margin Level: {margin_str} {health_icon} | "
                 f"Free: ${free_margin:.2f} | "
-                f"Positions: {n_trades}"
+                f"Positions: {n_trades} | "
+                f"Avg Entry Price: {avg_entry_str} | "
+                f"Est. TP Profit: {est_profit_str}"
             )
         except Exception as e:
             logger.error(f"Error generating account status report: {e}")
