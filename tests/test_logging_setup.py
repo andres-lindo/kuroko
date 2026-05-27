@@ -69,7 +69,14 @@ class TestLoadAppConfig:
                 "retention_days": 14,
                 "console_logging": False,
                 "structured_format": False,
-            }
+            },
+            "trading": {
+                "epic": "IX.D.SP500.IFM.IP",
+                "leverage": 10,
+                "demo_starting_balance": 50000.0,
+                "initial_cash_balance": 5000.0,
+                "security_buffer": 500.0,
+            },
         }
         config_file = tmp_path / "config.json"
         config_file.write_text(json.dumps(config_data))
@@ -81,6 +88,9 @@ class TestLoadAppConfig:
         assert result["logging"]["retention_days"] == 14
         assert result["logging"]["console_logging"] is False
         assert result["logging"]["structured_format"] is False
+        assert result["trading"]["epic"] == "IX.D.SP500.IFM.IP"
+        assert result["trading"]["leverage"] == 10
+        assert result["trading"]["initial_cash_balance"] == 5000.0
 
     def test_missing_file_returns_defaults(self, tmp_path, caplog):
         """REQ-1 missing scenario: returns defaults and emits a warning."""
@@ -103,8 +113,8 @@ class TestLoadAppConfig:
         assert result == _DEFAULTS
         assert any("Could not parse" in record.message for record in caplog.records)
 
-    def test_missing_logging_key_returns_defaults(self, tmp_path, caplog):
-        """REQ-1 missing logging key: valid JSON without 'logging' falls back to defaults."""
+    def test_empty_config_returns_all_defaults(self, tmp_path, caplog):
+        """REQ-1 empty config: valid JSON with no sections falls back to all defaults."""
         config_file = tmp_path / "config.json"
         config_file.write_text(json.dumps({}))
 
@@ -112,7 +122,14 @@ class TestLoadAppConfig:
             result = load_app_config(str(config_file))
 
         assert result == _DEFAULTS
-        assert any("missing 'logging'" in record.message for record in caplog.records)
+        assert any(
+            "missing or invalid 'logging'" in record.message
+            for record in caplog.records
+        )
+        assert any(
+            "missing or invalid 'trading'" in record.message
+            for record in caplog.records
+        )
 
     def test_returns_independent_copy_of_defaults(self, tmp_path):
         """Mutating the returned defaults dict must not affect future calls."""
@@ -122,6 +139,223 @@ class TestLoadAppConfig:
 
         second = load_app_config(missing_path)
         assert second["logging"]["log_level"] == "INFO"
+
+
+# --------------------------------------------------------------------------- #
+# load_app_config — trading section                                            #
+# --------------------------------------------------------------------------- #
+
+
+class TestLoadAppConfigTrading:
+    """Tests for load_app_config() trading section handling."""
+
+    def test_valid_trading_section_returns_all_keys(self, tmp_path):
+        """REQ-1 scenario 1: valid trading section — all 5 keys present and typed."""
+        config_data = {
+            "logging": {
+                "log_type": ["file"],
+                "log_level": "INFO",
+                "log_dir": "logs",
+                "log_file_name": "kuroko.log",
+                "retention_days": 7,
+                "console_logging": True,
+                "structured_format": True,
+                "azure_log_partition_key": "PROD_NQ100",
+            },
+            "trading": {
+                "epic": "IX.D.NASDAQ.IFMM.IP",
+                "leverage": 20,
+                "demo_starting_balance": 20000.0,
+                "initial_cash_balance": 4000.0,
+                "security_buffer": 1000.0,
+            },
+        }
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps(config_data))
+
+        result = load_app_config(str(config_file))
+
+        assert result["logging"]["azure_log_partition_key"] == "PROD_NQ100"
+        trading = result["trading"]
+        assert trading["epic"] == "IX.D.NASDAQ.IFMM.IP"
+        assert trading["leverage"] == 20
+        assert trading["demo_starting_balance"] == 20000.0
+        assert trading["initial_cash_balance"] == 4000.0
+        assert trading["security_buffer"] == 1000.0
+
+    def test_missing_trading_section_returns_defaults_and_warns(self, tmp_path, caplog):
+        """REQ-1 scenario 2: missing 'trading' key — WARNING logged, defaults returned."""
+        config_data = {
+            "logging": {
+                "log_type": ["file"],
+                "log_level": "INFO",
+                "log_dir": "logs",
+                "log_file_name": "kuroko.log",
+                "retention_days": 7,
+                "console_logging": True,
+                "structured_format": True,
+            }
+        }
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps(config_data))
+
+        with caplog.at_level(logging.WARNING):
+            result = load_app_config(str(config_file))
+
+        assert isinstance(result["trading"], dict)
+        assert result["trading"]["epic"] == "IX.D.NASDAQ.IFMM.IP"
+        assert any(
+            "missing or invalid 'trading'" in record.message
+            for record in caplog.records
+        )
+
+    def test_trading_section_null_returns_defaults_and_warns(self, tmp_path, caplog):
+        """REQ-1 scenario 3: trading is null — WARNING logged, defaults returned."""
+        config_data = {
+            "logging": {
+                "log_type": ["file"],
+                "log_level": "INFO",
+                "log_dir": "logs",
+                "log_file_name": "kuroko.log",
+                "retention_days": 7,
+                "console_logging": True,
+                "structured_format": True,
+            },
+            "trading": None,
+        }
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps(config_data))
+
+        with caplog.at_level(logging.WARNING):
+            result = load_app_config(str(config_file))
+
+        assert isinstance(result["trading"], dict)
+        assert result["trading"]["epic"] == "IX.D.NASDAQ.IFMM.IP"
+        assert any(
+            "missing or invalid 'trading'" in record.message
+            for record in caplog.records
+        )
+
+    def test_trading_wrong_type_replaced_with_default(self, tmp_path, caplog):
+        """REQ-1 type coercion: wrong-type trading key is replaced with default and warns."""
+        config_data = {
+            "logging": {
+                "log_type": ["file"],
+                "log_level": "INFO",
+                "log_dir": "logs",
+                "log_file_name": "kuroko.log",
+                "retention_days": 7,
+                "console_logging": True,
+                "structured_format": True,
+            },
+            "trading": {
+                "epic": "IX.D.NASDAQ.IFMM.IP",
+                "leverage": "twenty",
+                "demo_starting_balance": 20000.0,
+                "initial_cash_balance": 4000.0,
+                "security_buffer": 1000.0,
+            },
+        }
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps(config_data))
+
+        with caplog.at_level(logging.WARNING):
+            result = load_app_config(str(config_file))
+
+        assert result["trading"]["leverage"] == _DEFAULTS["trading"]["leverage"]
+        assert any("trading.leverage" in record.message for record in caplog.records)
+
+    def test_trading_bool_leverage_replaced_with_default(self, tmp_path, caplog):
+        """bool is a subclass of int — True/False must not pass numeric validation."""
+        config_data = {
+            "logging": {
+                "log_type": [],
+                "log_level": "INFO",
+                "log_dir": "logs",
+                "log_file_name": "kuroko.log",
+                "retention_days": 7,
+                "console_logging": False,
+                "structured_format": True,
+            },
+            "trading": {
+                "epic": "IX.D.NASDAQ.IFMM.IP",
+                "leverage": True,
+                "demo_starting_balance": 20000.0,
+                "initial_cash_balance": 4000.0,
+                "security_buffer": 1000.0,
+            },
+        }
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps(config_data))
+
+        with caplog.at_level(logging.WARNING):
+            result = load_app_config(str(config_file))
+
+        assert result["trading"]["leverage"] == _DEFAULTS["trading"]["leverage"]
+        assert any("trading.leverage" in record.message for record in caplog.records)
+
+    def test_logging_bool_retention_days_replaced_with_default(self, tmp_path, caplog):
+        """bool masquerading as int must be rejected for bare-int fields like retention_days."""
+        config_data = {
+            "logging": {
+                "log_type": [],
+                "log_level": "INFO",
+                "log_dir": "logs",
+                "log_file_name": "kuroko.log",
+                "retention_days": True,
+                "console_logging": False,
+                "structured_format": True,
+            },
+            "trading": {
+                "epic": "IX.D.NASDAQ.IFMM.IP",
+                "leverage": 20,
+                "demo_starting_balance": 20000.0,
+                "initial_cash_balance": 4000.0,
+                "security_buffer": 1000.0,
+            },
+        }
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps(config_data))
+
+        with caplog.at_level(logging.WARNING):
+            result = load_app_config(str(config_file))
+
+        assert (
+            result["logging"]["retention_days"]
+            == _DEFAULTS["logging"]["retention_days"]
+        )
+        assert any(
+            "logging.retention_days" in record.message for record in caplog.records
+        )
+
+    def test_trading_section_non_dict_returns_defaults_and_warns(
+        self, tmp_path, caplog
+    ):
+        """REQ-1 scenario 4: trading is a non-dict scalar — WARNING logged, defaults returned."""
+        config_data = {
+            "logging": {
+                "log_type": ["file"],
+                "log_level": "INFO",
+                "log_dir": "logs",
+                "log_file_name": "kuroko.log",
+                "retention_days": 7,
+                "console_logging": True,
+                "structured_format": True,
+            },
+            "trading": 42,
+        }
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps(config_data))
+
+        with caplog.at_level(logging.WARNING):
+            result = load_app_config(str(config_file))
+
+        assert isinstance(result["trading"], dict)
+        assert result["trading"]["epic"] == "IX.D.NASDAQ.IFMM.IP"
+        assert any(
+            "missing or invalid 'trading'" in record.message
+            for record in caplog.records
+        )
 
 
 # --------------------------------------------------------------------------- #

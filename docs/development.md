@@ -99,7 +99,7 @@ pre-commit run --all-files
 - **Formatter**: black (enforced via pre-commit, line length default: 88)
 - **Language**: all code, variable names, inline comments, docstrings, and log messages must be in English
 - **Secrets**: never commit `credentials.env` or any file containing API keys or connection strings
-- **Config changes**: strategy parameters for live trading are stored in `strategies/RSIBollingerStrategy.json` and committed to the repository. Edit that file directly and redeploy the bot to apply changes. See [RSIBollingerStrategy documentation](../docs/strategies/RSIBollingerStrategy.md) for the full parameter reference.
+- **Config changes**: strategy parameters (signal and risk tuning) for live trading are stored in `strategies/RSIBollingerStrategy.json` and committed to the repository. Edit that file directly and redeploy the bot to apply changes. See [RSIBollingerStrategy documentation](../docs/strategies/RSIBollingerStrategy.md) for the full parameter reference. Infrastructure/deployment parameters (`epic`, `leverage`, `demo_starting_balance`, `initial_cash_balance`, `security_buffer`) are stored in `config.json["trading"]` — they are not in the strategy JSON.
 
 > **Note**: `strategies/RSIBollingerStrategy.json` (live) and `backtest/strategies/RSIBollingerStrategy.json` (backtest) are independent files. Tuning results from Optuna must be manually applied to the live config. See [backtest/README.md](../backtest/README.md) for details.
 
@@ -134,7 +134,7 @@ Logging is bootstrapped by `logging_setup.py`. Startup follows this sequence:
 1. `logging.basicConfig()` at module level provides console output during the bootstrap phase (config and strategy loading).
 2. `load_app_config()` reads `config.json` from the project root.
 3. `load_strategy()` / `load_params()` loads the strategy class and its parameters.
-4. `setup_logging(config["logging"], params.log_partition_key)` — called **once**, after params are loaded. This replaces the basicConfig handlers with the configured file, Azure Blob, and/or console handlers.
+4. `setup_logging(config["logging"], config["logging"]["azure_log_partition_key"])` — called **once**, after params are loaded. This replaces the basicConfig handlers with the configured file, Azure Blob, and/or console handlers.
 
 If `load_params` or `load_strategy` crashes, the error is visible on the console via `basicConfig` — this is acceptable for a startup failure.
 
@@ -152,7 +152,7 @@ If `load_params` or `load_strategy` crashes, the error is visible on the console
 
 **Fallback behaviour:** If `config.json` is missing or contains invalid JSON, `load_app_config()` returns the defaults above and logs a `WARNING`. The bot continues normally — no crash on config absence.
 
-**`log_partition_key`** is always sourced from the strategy JSON (e.g. `strategies/RSIBollingerStrategy.json`), not from `config.json`. It is passed as the second argument to `setup_logging()`.
+**`azure_log_partition_key`** is sourced from `config.json["logging"]["azure_log_partition_key"]`. It is passed as the `partition_key` argument to `setup_logging()`. It is NOT stored in the strategy JSON.
 
 **Adding a new handler type:**
 1. Add a new string value (e.g. `"file_json"`) to the valid `log_type` values.

@@ -144,7 +144,7 @@ See [RSIBollingerStrategy documentation](docs/strategies/RSIBollingerStrategy.md
 
 Stop the bot with `CTRL+C`.
 
-> **Startup failure**: if the bot exits immediately with a `CRITICAL` log entry, first check the strategy module name (e.g. `strategies/RSIBollingerStrategy.py` must exist). Then verify that `strategies/RSIBollingerStrategy.json` contains valid JSON, has all 24 required keys with the correct types, and that `candle_frecuency` matches the pattern `\d+min` (e.g. `"15min"`). The error log will list every missing key and type mismatch in one report. Startup failure is the only fatal failure — everything else is recovered automatically.
+> **Startup failure**: if the bot exits immediately with a `CRITICAL` log entry, first check the strategy module name (e.g. `strategies/RSIBollingerStrategy.py` must exist). Then verify that `strategies/RSIBollingerStrategy.json` contains valid JSON, has all 24 required keys with the correct types, and that `candle_frequency` matches the pattern `\d+min` (e.g. `"15min"`). The error log will list every missing key and type mismatch in one report. Startup failure is the only fatal failure — everything else is recovered automatically.
 
 > **Runtime failures**: the bot does not crash on IG API errors. If the IG API is unavailable (maintenance window, timeout, empty response), the bot skips the affected cycle, logs a WARNING or ERROR, and retries on the next tick (~1 minute). It recovers automatically when the API comes back. See [`docs/architecture.md`](docs/architecture.md#fault-tolerance-and-self-healing) for the full recovery model.
 

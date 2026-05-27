@@ -1,12 +1,6 @@
 {
-  "log_partition_key": "DEV_NQ100",
-  "epic": "IX.D.NASDAQ.IFMM.IP",
-  "candle_frecuency": "15min",
-  "leverage": 20,
+  "candle_frequency": "15min",
   "lookback": 300,
-  "demo_starting_balance": 20000.0,
-  "initial_cash_balance": 4000.0,
-  "security_buffer": 1000.0,
 
   "max_positions": 5,
   "position_size": 0.13,

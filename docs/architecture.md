@@ -19,7 +19,7 @@ Kuroko is split into two independent execution contexts that share no runtime st
 kuroko.py  ← load_dotenv("credentials.env") runs at module scope, before main()
 ├── load_strategy(args.strategy) → (RSIBollingerStrategy, load_params)
 ├── load_params("strategies/RSIBollingerStrategy.json") → types.SimpleNamespace
-│   └── keys: log_partition_key, candle_frecuency, epic, max_positions, rsi_period, bb_period, ...
+│   └── keys: log_partition_key, candle_frequency, epic, max_positions, rsi_period, bb_period, ...
 │
 ├── AzureBlobHandler
 │   └── Azure Blob Storage → container: logs
@@ -102,7 +102,7 @@ A failure here is fatal by design — the bot cannot trade without its configura
 
 1. **File errors** — missing file (`FileNotFoundError`), invalid JSON (`JSONDecodeError`), or unreadable file (`OSError`).
 2. **Schema errors** — `_validate_params()` checks that all 22 required keys are present and correctly typed (e.g. `int` fields reject `bool`, `float` fields accept `int`). All errors are collected and reported at once before exiting.
-3. **Format error** — `candle_frecuency` must match the regex `^\d+min$` (e.g. `"15min"`).
+3. **Format error** — `candle_frequency` must match the regex `^\d+min$` (e.g. `"15min"`).
 
 No retry is attempted; the process manager (systemd, supervisor, etc.) handles restart scheduling.
 
@@ -143,7 +143,7 @@ strategies/RSIBollingerStrategy.json
 └── json.load() → dict
     └── types.SimpleNamespace(**data) → params
         └── RSIBollingerStrategy(params=params, ig_client=ig)
-            └── self.params.candle_frecuency / .epic / .max_positions / ...
+            └── self.params.candle_frequency / .epic / .max_positions / ...
 ```
 
 See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for the full parameter reference.

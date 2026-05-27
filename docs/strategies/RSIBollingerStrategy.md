@@ -113,7 +113,7 @@ In LIVE mode, `free_margin` comes directly from the broker's `available` field.
 
 ## Account Mode
 
-`is_live_account` is set at startup by `kuroko.py` based on the `ig_acc_type` environment variable. See [Architecture — Account Mode](../architecture.md#account-mode) for how the flag is derived.
+`is_live_account` is determined inside `RSIBollingerStrategy.__init__` by reading `os.getenv("ig_acc_type")`. It is `True` only when the value is exactly `"LIVE"` (case-sensitive); any other value — including `"DEMO"` or missing — results in `False`. See [Architecture — Account Mode](../architecture.md#account-mode) for full details.
 
 **In DEMO mode** (`is_live_account=False`):
 - Equity = `initial_cash_balance` + realized P&L (virtual simulation)
@@ -128,19 +128,15 @@ In LIVE mode, `free_margin` comes directly from the broker's `available` field.
 
 ## Parameters Reference
 
-All parameters are stored in `strategies/RSIBollingerStrategy.json` and loaded
-at startup via `load_params()` into a `types.SimpleNamespace`.
+### Signal / Risk Parameters
+
+Stored in `strategies/RSIBollingerStrategy.json` and loaded at startup via
+`load_params()` into a `types.SimpleNamespace`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `log_partition_key` | string | `"DEV_NQ100"` | Azure Blob Storage log blob label (`{key}_{YYYY-MM-DD}.log`) |
-| `epic` | string | `"IX.D.NASDAQ.IFMM.IP"` | IG Markets instrument identifier |
-| `candle_frecuency` | string | `"15min"` | Candle resolution; must match `\d+min` |
-| `leverage` | int | `20` | Leverage ratio used for virtual margin calculation in DEMO mode |
+| `candle_frequency` | string | `"15min"` | Candle resolution; must match `[1-9]\d*min` (positive integer followed by 'min') |
 | `lookback` | int | `300` | Number of candles to fetch per cycle |
-| `demo_starting_balance` | float | `20000.0` | IG demo account reference balance used only for realized P&L calculation |
-| `initial_cash_balance` | float | `4000.0` | Simulated capital base for virtual margin and drawdown floor |
-| `security_buffer` | float | `1000.0` | Minimum free margin buffer required before any entry (USD) |
 | `max_positions` | int | `5` | Maximum number of simultaneous open positions in the grid |
 | `position_size` | float | `0.13` | Base position size in contracts |
 | `min_dist_between_entries_ticks` | float | `100.0` | Minimum price distance between consecutive grid entries (ticks) |
@@ -156,3 +152,16 @@ at startup via `load_params()` into a `types.SimpleNamespace`.
 | `atr_period` | int | `12` | ATR lookback period for dynamic stop-loss calculation |
 | `atr_sl_multiplier` | float | `11.0` | ATR multiplier applied to compute the stop-loss distance |
 | `ema_period` | int | `200` | EMA period used by the optional trend filter |
+
+### Infrastructure / Deployment Parameters
+
+Trading parameters are stored in `config.json["trading"]` and loaded via `load_app_config()`. These are passed to the strategy constructor as a `types.SimpleNamespace` (`trading_config`). They are not strategy logic parameters and must not appear in `strategies/RSIBollingerStrategy.json`.
+
+| Key | Type | Default | Source | Description |
+|-----|------|---------|--------|-------------|
+| `azure_log_partition_key` | string | `"DEV_NQ100"` | `config.json["logging"]` | Azure Blob Storage log blob label; passed to `setup_logging()` as `partition_key` |
+| `epic` | string | `"IX.D.NASDAQ.IFMM.IP"` | `config.json["trading"]` | IG Markets instrument identifier |
+| `leverage` | int | `20` | `config.json["trading"]` | Leverage ratio used for virtual margin calculation in DEMO mode |
+| `demo_starting_balance` | float | `20000.0` | `config.json["trading"]` | IG demo account reference balance used only for realized P&L calculation |
+| `initial_cash_balance` | float | `4000.0` | `config.json["trading"]` | Simulated capital base for virtual margin and drawdown floor |
+| `security_buffer` | float | `1000.0` | `config.json["trading"]` | Minimum free margin buffer required before any entry (USD) |

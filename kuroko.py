@@ -1,20 +1,22 @@
 """Entry point for the Kuroko live trading bot.
 
 Dynamically loads the configured strategy module, initialises logging via
-logging_setup (file, Azure Blob, and/or console per config.json), connects to
-IG Markets, and starts the strategy loop.
+logging_setup (file, Azure Blob, and/or console per config.json), wires
+infrastructure params from config.json["trading"] into the strategy, connects
+to IG Markets, and starts the strategy loop.
 """
 
 import importlib
 import logging
 import os
 import sys
+import types
 import warnings
 
 import argparse
 from dotenv import load_dotenv
 
-from logging_setup import load_app_config, setup_logging
+from logging_setup import _DEFAULTS, load_app_config, setup_logging
 from ig_client import IGClient
 
 BANNER = r"""
@@ -101,8 +103,8 @@ def main():
     """Parse CLI arguments, bootstrap the bot, and start the strategy loop.
 
     Dynamically loads the configured strategy and its parameters, attaches
-    Azure Blob log shipping (using ``log_partition_key`` from the strategy
-    JSON), and then runs the strategy until interrupted.
+    Azure Blob log shipping (using ``azure_log_partition_key`` from
+    config.json["logging"]), and then runs the strategy until interrupted.
 
     If the strategy module cannot be loaded or parameter loading fails, a
     CRITICAL log entry is written and the process exits with code 1.
@@ -132,13 +134,20 @@ def main():
     params = load_params(strategy_path)
 
     # Configure all handlers once, after params are loaded so the Azure Blob
-    # handler uses the correct partition_key from the strategy JSON.
+    # handler uses the correct partition_key from config.json["logging"].
     # Console output during the bootstrap phase above is handled by basicConfig.
-    setup_logging(config["logging"], params.log_partition_key)
+    partition_key = config["logging"].get(
+        "azure_log_partition_key",
+        _DEFAULTS["logging"]["azure_log_partition_key"],
+    )
+    setup_logging(config["logging"], partition_key)
+
+    # Build trading_config from config["trading"]
+    trading_config = types.SimpleNamespace(**config["trading"])
 
     # Initialise broker client and strategy, then enter the main loop
     ig = IGClient()
-    strat = strategy_class(params=params, ig_client=ig)
+    strat = strategy_class(params=params, ig_client=ig, trading_config=trading_config)
 
     logger.info("Kuroko started. Press CTRL+C to stop.")
     try:

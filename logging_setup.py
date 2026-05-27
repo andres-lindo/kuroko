@@ -30,11 +30,80 @@ _DEFAULTS: dict = {
         "retention_days": 7,
         "console_logging": True,
         "structured_format": True,
-    }
+        "azure_log_partition_key": "DEV_NQ100",
+    },
+    "trading": {
+        "epic": "IX.D.NASDAQ.IFMM.IP",
+        "leverage": 20,
+        "demo_starting_balance": 20000.0,
+        "initial_cash_balance": 4000.0,
+        "security_buffer": 1000.0,
+    },
 }
 
 _FORMAT_STRUCTURED = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 _FORMAT_LEGACY = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+
+# Expected types for each key in the trading section
+_TRADING_TYPES: dict = {
+    "epic": str,
+    "leverage": (int, float),
+    "demo_starting_balance": (int, float),
+    "initial_cash_balance": (int, float),
+    "security_buffer": (int, float),
+}
+
+# Expected types for each key in the logging section
+_LOGGING_TYPES: dict = {
+    "log_type": list,
+    "log_level": str,
+    "log_dir": str,
+    "log_file_name": str,
+    "retention_days": int,
+    "console_logging": bool,
+    "structured_format": bool,
+    "azure_log_partition_key": str,
+}
+
+
+def _validate_section_types(
+    data: dict, types_dict: dict, defaults: dict, section_name: str
+) -> None:
+    """Check each known key in a config section against its expected type.
+
+    Logs a WARNING for each key whose value does not match the expected type and
+    replaces it with the default value. Missing keys are also warned about and
+    filled from defaults. Unknown extra keys are left untouched.
+
+    Args:
+        data: The config section dict, mutated in place if corrections are made.
+        types_dict: Mapping of key → expected type (or tuple of types).
+        defaults: The defaults dict for this section, used for replacements.
+        section_name: Section label used in warning messages (e.g. 'trading').
+    """
+    for key, expected in types_dict.items():
+        if key not in data:
+            logger.warning(
+                f"config.json {section_name}.{key} is missing — using default value"
+            )
+            data[key] = copy.deepcopy(defaults[key])
+            continue
+        value = data[key]
+        # bool is a subclass of int in Python; reject it when the expected type is numeric
+        is_numeric_expected = expected in (int, (int, float))
+        is_bool_masquerading = isinstance(value, bool) and is_numeric_expected
+        if is_bool_masquerading or not isinstance(value, expected):
+            if isinstance(expected, type):
+                expected_name = expected.__name__
+            else:
+                expected_name = "/".join(t.__name__ for t in expected)
+            logger.warning(
+                f"config.json {section_name}.{key} has unexpected type "
+                f"'{type(value).__name__}' — expected '{expected_name}'; "
+                f"using default value"
+            )
+            data[key] = copy.deepcopy(defaults[key])
 
 
 # --------------------------------------------------------------------------- #
@@ -56,21 +125,30 @@ def load_app_config(config_path: str) -> dict:
     """
     if not os.path.exists(config_path):
         logger.warning(
-            f"config.json not found at '{config_path}'. Using default logging config."
+            f"config.json not found at '{config_path}'. Using default config."
         )
         return copy.deepcopy(_DEFAULTS)
 
     try:
         with open(config_path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
-        if not isinstance(data.get("logging"), dict):
-            logger.warning("config.json missing 'logging' section — using defaults")
-            return copy.deepcopy(_DEFAULTS)
+        for section in ("logging", "trading"):
+            if not isinstance(data.get(section), dict):
+                logger.warning(
+                    f"config.json missing or invalid '{section}' section — using defaults"
+                )
+                data[section] = copy.deepcopy(_DEFAULTS[section])
+        _validate_section_types(
+            data["logging"], _LOGGING_TYPES, _DEFAULTS["logging"], "logging"
+        )
+        _validate_section_types(
+            data["trading"], _TRADING_TYPES, _DEFAULTS["trading"], "trading"
+        )
         return data
     except (json.JSONDecodeError, OSError) as exc:
         logger.warning(
             f"Could not parse config.json at '{config_path}': {exc}. "
-            "Using default logging config."
+            "Using default config."
         )
         return copy.deepcopy(_DEFAULTS)
 
@@ -147,7 +225,7 @@ def setup_logging(log_config: dict, partition_key: str) -> None:
     Args:
         log_config: The "logging" sub-dict from config.json (or defaults).
         partition_key: Partition/blob name passed to AzureBlobHandler. Must
-            come from the strategy JSON — not from config.json.
+            come from config.json["logging"]["azure_log_partition_key"].
     """
     log_type: list = log_config.get("log_type", _DEFAULTS["logging"]["log_type"])
     log_level_str: str = log_config.get("log_level", _DEFAULTS["logging"]["log_level"])
