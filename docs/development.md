@@ -127,6 +127,38 @@ logger.info(f"Cache loaded from disk for {epic} {res}")
 logger.info("Cache loaded from disk for %s %s", epic, res)
 ```
 
+#### Logging Configuration
+
+Logging is bootstrapped by `logging_setup.py`. Startup follows this sequence:
+
+1. `logging.basicConfig()` at module level provides console output during the bootstrap phase (config and strategy loading).
+2. `load_app_config()` reads `config.json` from the project root.
+3. `load_strategy()` / `load_params()` loads the strategy class and its parameters.
+4. `setup_logging(config["logging"], params.log_partition_key)` — called **once**, after params are loaded. This replaces the basicConfig handlers with the configured file, Azure Blob, and/or console handlers.
+
+If `load_params` or `load_strategy` crashes, the error is visible on the console via `basicConfig` — this is acceptable for a startup failure.
+
+**`config.json` — `logging` section keys:**
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `log_type` | array | `["file"]` | Active handler types. Valid values: `"file"`, `"azure_table"`. Any combination is valid; `[]` disables all non-console handlers. |
+| `log_level` | string | `"INFO"` | Root logger level (`"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`). |
+| `log_dir` | string | `"logs"` | Directory for rotated log files. Created automatically if it does not exist. |
+| `log_file_name` | string | `"kuroko.log"` | Base filename inside `log_dir`. Rotated files get a date suffix (e.g. `kuroko.log.2026-05-27`). |
+| `retention_days` | integer | `7` | Log files older than this many days are deleted at startup. |
+| `console_logging` | boolean | `true` | Attach a `StreamHandler(stdout)` when `true`. |
+| `structured_format` | boolean | `true` | When `true`, uses pipe-delimited format: `%(asctime)s | %(levelname)s | %(name)s | %(message)s`. When `false`, uses `%(asctime)s [%(levelname)s] %(name)s: %(message)s`. |
+
+**Fallback behaviour:** If `config.json` is missing or contains invalid JSON, `load_app_config()` returns the defaults above and logs a `WARNING`. The bot continues normally — no crash on config absence.
+
+**`log_partition_key`** is always sourced from the strategy JSON (e.g. `strategies/RSIBollingerStrategy.json`), not from `config.json`. It is passed as the second argument to `setup_logging()`.
+
+**Adding a new handler type:**
+1. Add a new string value (e.g. `"file_json"`) to the valid `log_type` values.
+2. In `logging_setup.py`, add an `if "file_json" in log_type:` branch inside `setup_logging()`.
+3. Apply `formatter` to the new handler before attaching it to `root` — all handlers share the same formatter instance for consistent output.
+
 ### Error Handling
 
 Handle exceptions individually in each function. Do not let exceptions propagate silently or catch broad `Exception` at the top level without logging:

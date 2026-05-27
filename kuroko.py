@@ -1,7 +1,8 @@
 """Entry point for the Kuroko live trading bot.
 
-Dynamically loads the configured strategy module, initialises logging
-(console and Azure Blob), connects to IG Markets, and starts the strategy loop.
+Dynamically loads the configured strategy module, initialises logging via
+logging_setup (file, Azure Blob, and/or console per config.json), connects to
+IG Markets, and starts the strategy loop.
 """
 
 import importlib
@@ -13,7 +14,7 @@ import warnings
 import argparse
 from dotenv import load_dotenv
 
-from azure_log_handler import AzureBlobHandler
+from logging_setup import load_app_config, setup_logging
 from ig_client import IGClient
 
 BANNER = r"""
@@ -28,30 +29,11 @@ BANNER = r"""
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-
-# Route unhandled exceptions through the standard logger instead of stderr
-def handle_exception(exc_type, exc_value, exc_traceback):
-    """Log unhandled exceptions before the interpreter exits.
-
-    Allows KeyboardInterrupt to pass through to the default handler so
-    CTRL+C still terminates the process cleanly.
-
-    Args:
-        exc_type: Exception class of the unhandled exception.
-        exc_value: Exception instance.
-        exc_traceback: Traceback object.
-    """
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-
-    logging.error("Unhandled exception:", exc_info=(exc_type, exc_value, exc_traceback))
-
-
 # Load secrets from credentials.env before any module reads environment variables
 load_dotenv("credentials.env")
 
-# Configure root logger so all modules emit to stdout with a consistent format
+# Configure a minimal root logger so early-startup warnings (e.g. from
+# load_app_config) are visible before setup_logging() replaces the handlers.
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
@@ -115,31 +97,6 @@ def load_strategy(strategy_name: str) -> tuple[type, callable]:
     return strategy_class, load_params_fn
 
 
-def setup_azure_logging(partition_key: str) -> None:
-    """Attach the AzureBlobHandler to the root logger for cloud log shipping.
-
-    Also registers the unhandled-exception hook so crashes are captured in the
-    blob before the process exits. Fails gracefully — a warning is logged and
-    the bot continues without cloud shipping if the handler cannot be created.
-
-    Args:
-        partition_key: Label used to identify this deployment's log blob.
-    """
-    try:
-        conn_str = os.getenv("table_storage_connection")
-        azure_handler = AzureBlobHandler(
-            connection_string=conn_str, blob_name=partition_key, container_name="logs"
-        )
-        azure_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
-        logging.getLogger().addHandler(azure_handler)
-        logging.info(f"Azure Blob logging configured for partition: {partition_key}")
-        sys.excepthook = handle_exception
-    except Exception as e:
-        logging.warning(f"Could not configure Azure Blob logging: {e}")
-
-
 def main():
     """Parse CLI arguments, bootstrap the bot, and start the strategy loop.
 
@@ -160,21 +117,36 @@ def main():
     )
     args = parser.parse_args()
 
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(project_root, "config.json")
+    config = load_app_config(config_path)
+
+    # Resolve log_dir to an absolute path anchored at the project root so the
+    # bot creates logs relative to its own directory regardless of CWD.
+    log_dir = config["logging"].get("log_dir", "logs")
+    if not os.path.isabs(log_dir):
+        config["logging"]["log_dir"] = os.path.join(project_root, log_dir)
+
     strategy_class, load_params = load_strategy(args.strategy)
-    params = load_params(f"strategies/{args.strategy}.json")
-    setup_azure_logging(params.log_partition_key)
+    strategy_path = os.path.join(project_root, "strategies", f"{args.strategy}.json")
+    params = load_params(strategy_path)
+
+    # Configure all handlers once, after params are loaded so the Azure Blob
+    # handler uses the correct partition_key from the strategy JSON.
+    # Console output during the bootstrap phase above is handled by basicConfig.
+    setup_logging(config["logging"], params.log_partition_key)
 
     # Initialise broker client and strategy, then enter the main loop
     ig = IGClient()
     strat = strategy_class(params=params, ig_client=ig)
 
-    logging.info("Kuroko started. Press CTRL+C to stop.")
+    logger.info("Kuroko started. Press CTRL+C to stop.")
     try:
         strat.run()
     except KeyboardInterrupt:
-        logging.info("CTRL+C detected. Exiting...")
+        logger.info("CTRL+C detected. Exiting...")
     except Exception:
-        logging.exception("Critical application error:")
+        logger.exception("Critical application error:")
         raise
 
 

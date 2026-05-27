@@ -6,3 +6,4 @@ pyarrow
 azure-data-tables
 azure-storage-blob
 pre-commit
+pytest

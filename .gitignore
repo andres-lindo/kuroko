@@ -213,4 +213,5 @@ credentials.env
 cache/*.parquet
 backtest/*.html
 backtest/tuning_output/*
+logs/
 
