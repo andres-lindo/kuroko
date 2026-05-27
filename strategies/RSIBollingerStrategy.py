@@ -593,7 +593,11 @@ class RSIBollingerStrategy:
                 # the broker so they reflect the same account state, including any
                 # positions or hedges not opened by this bot.
                 current_equity = account_info.get("balance", 0.0) + open_pnl
-                used_margin = account_info.get("deposit", 0.0)
+                used_margin = (
+                    sum((p["size"] * p["level"] / self.leverage) for p in positions)
+                    if n_trades > 0
+                    else 0
+                )
                 free_margin = account_info.get("available", 0.0)
                 modo = "LIVE"
             else:
