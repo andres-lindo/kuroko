@@ -11,7 +11,7 @@
   },
   "trading": {
     "epic": "IX.D.NASDAQ.IFMM.IP",
-    "leverage": 20,
+    "leverage": 200,
     "demo_starting_balance": 20000.0,
     "initial_cash_balance": 4000.0,
     "security_buffer": 1000.0
