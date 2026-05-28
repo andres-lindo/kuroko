@@ -121,7 +121,9 @@ def _wire_strategy(
         candle_freq = getattr(params, "candle_frequency", "5min")
         resolution = candle_frequency_to_resolution(candle_freq)
         streaming_client = IGStreamingClient(
-            ig.ig_service, trading_config.epic, resolution=resolution
+            ig.ig_service,
+            getattr(params, "epic", trading_config.epic),
+            resolution=resolution,
         )
         strat = strategy_class(
             params=params,

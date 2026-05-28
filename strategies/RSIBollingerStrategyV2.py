@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 # Expected type for each V2 parameter key.
 # float fields accept int values (e.g. 240 is valid for take_profit_ticks).
 _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
+    "epic": str,
     "api_mode": str,
     "operation_mode": str,
     "candle_frequency": str,
@@ -161,19 +162,19 @@ class RSIBollingerStrategyV2:
 
         Args:
             params: SimpleNamespace loaded from RSIBollingerStrategyV2.json.
-                Required keys: bb_period, bb_std, rsi_period, rsi_oversold,
+                Required keys: epic, bb_period, bb_std, rsi_period, rsi_oversold,
                 rsi_overbought, max_long_positions, max_short_positions,
                 contract_size, min_dist_between_entries_ticks, take_profit_ticks.
             ig_client: Authenticated IGClient instance for REST position management.
             streaming_client: IGStreamingClient instance for candle delivery.
             trading_config: SimpleNamespace with infrastructure params sourced from
-                config.json["trading"]. Expected keys: epic.
+                config.json["trading"].
         """
         self.params = params
         self.ig = ig_client
         self.streaming_client = streaming_client
         self.trading_config = trading_config
-        self.epic = trading_config.epic
+        self.epic = params.epic
 
         # operation_mode: 'candle' or 'tick'. Invalid value falls back to 'candle'.
         _raw_mode = getattr(params, "operation_mode", "candle")

@@ -83,6 +83,7 @@ def make_params_v2():
             SimpleNamespace populated with all 12 V2 signal/risk keys.
         """
         defaults = {
+            "epic": "IX.D.NASDAQ.IFMM.IP",
             "api_mode": "streaming",
             "candle_frequency": "5min",
             "bb_period": 20,

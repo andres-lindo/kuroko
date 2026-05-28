@@ -93,6 +93,7 @@ class TestLoadParams:
     def test_valid_v2_json_loads_without_exit(self, tmp_path):
         """a well-formed V2 JSON file loads successfully."""
         data = {
+            "epic": "IX.D.NASDAQ.IFMM.IP",
             "api_mode": "streaming",
             "operation_mode": "candle",
             "candle_frequency": "5min",
@@ -112,6 +113,7 @@ class TestLoadParams:
 
         params = load_params(str(path))
 
+        assert params.epic == "IX.D.NASDAQ.IFMM.IP"
         assert params.api_mode == "streaming"
         assert params.candle_frequency == "5min"
         assert params.bb_period == 20
@@ -1946,6 +1948,7 @@ class TestValidateParamsBranches:
     def test_float_value_accepted_for_float_key(self, tmp_path):
         """An int value for a float key (e.g. take_profit_ticks=240) is accepted."""
         data = {
+            "epic": "IX.D.NASDAQ.IFMM.IP",
             "api_mode": "streaming",
             "operation_mode": "candle",
             "candle_frequency": "5min",
@@ -2050,6 +2053,7 @@ class TestValidateParamsBranches:
         ) or importlib.import_module("strategies.RSIBollingerStrategyV2")
 
         base_data = {
+            "epic": "IX.D.NASDAQ.IFMM.IP",
             "api_mode": "streaming",
             "operation_mode": "candle",
             "candle_frequency": "5min",
@@ -2082,6 +2086,7 @@ class TestValidateParamsBranches:
         ) or importlib.import_module("strategies.RSIBollingerStrategyV2")
 
         base_data = {
+            "epic": "IX.D.NASDAQ.IFMM.IP",
             "api_mode": "streaming",
             "operation_mode": "candle",
             "candle_frequency": "5min",

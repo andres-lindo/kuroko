@@ -10,7 +10,6 @@
     "azure_log_partition_key": "DEV_NQ100"
   },
   "trading": {
-    "epic": "IX.D.NASDAQ.IFMM.IP",
     "leverage": 200,
     "demo_starting_balance": 20000.0,
     "initial_cash_balance": 4000.0,
