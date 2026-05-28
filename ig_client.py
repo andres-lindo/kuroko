@@ -382,7 +382,7 @@ class IGClient:
             API response dict from trading_ig containing dealReference
             and confirmation status.
         """
-        return self._safe_api_call(
+        response = self._safe_api_call(
             self._svc.create_open_position,
             currency_code=currency,
             direction=side,
@@ -401,6 +401,8 @@ class IGClient:
             trailing_stop=None,
             trailing_stop_increment=None,
         )
+        log.debug(f"open_position confirms response: {response}")
+        return response
 
     def update_position(self, dealid: str, stop: float = None, limit: float = None):
         """Update the stop-loss and/or take-profit level on an open position.

@@ -938,10 +938,16 @@ class TestExtractDealIdUnknown:
 
         assert len(strat._short_positions) == 0
 
-    def test_position_added_when_deal_id_is_valid(self, make_strategy_v2):
-        """Sanity check: position IS added when deal_id is successfully extracted."""
+    def test_position_added_when_deal_accepted_and_deal_id_present(
+        self, make_strategy_v2
+    ):
+        """Sanity check: position IS added when dealStatus=ACCEPTED and dealId is present."""
         strat, mock_ig, _ = make_strategy_v2()
-        mock_ig.open_position.return_value = {"dealReference": "VALID123"}
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "VALID_DEAL_ID_123",
+            "dealReference": "REF123",
+        }
         indicators = _make_indicators(
             bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
         )
@@ -949,7 +955,89 @@ class TestExtractDealIdUnknown:
         strat._manage_longs(indicators)
 
         assert len(strat._long_positions) == 1
-        assert strat._long_positions[0]["deal_id"] == "VALID123"
+        assert strat._long_positions[0]["deal_id"] == "VALID_DEAL_ID_123"
+
+    def test_position_not_added_when_deal_rejected(self, make_strategy_v2):
+        """CRITICAL BUG FIX: position must NOT be added when dealStatus is REJECTED.
+
+        The IG confirms endpoint returns 200 even for rejected deals. The response
+        always contains a dealReference (used to query confirms), but dealStatus
+        tells us whether the deal was actually executed. If REJECTED, no position
+        exists at the broker — adding it to the grid creates a phantom position.
+        """
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.open_position.return_value = {
+            "dealStatus": "REJECTED",
+            "dealId": "",
+            "dealReference": "83YS8TTNEGTYKR",
+            "reason": "error.service.marketdata.position.notional.details.null.error",
+        }
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
+        )
+
+        strat._manage_longs(indicators)
+
+        assert len(strat._long_positions) == 0
+
+    def test_short_position_not_added_when_deal_rejected(self, make_strategy_v2):
+        """CRITICAL BUG FIX: short position must NOT be added when dealStatus is REJECTED."""
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.open_position.return_value = {
+            "dealStatus": "REJECTED",
+            "dealId": "",
+            "dealReference": "WYWNCD8KAMUTYKR",
+            "reason": "error.service.marketdata.position.notional.details.null.error",
+        }
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=110.0
+        )
+
+        strat._manage_shorts(indicators)
+
+        assert len(strat._short_positions) == 0
+
+    def test_position_not_added_when_deal_status_missing(self, make_strategy_v2):
+        """Position must NOT be added when dealStatus is absent (malformed confirms response)."""
+        strat, mock_ig, _ = make_strategy_v2()
+        # dealId is present but dealStatus is absent — treated as unaccepted
+        mock_ig.open_position.return_value = {
+            "dealId": "SOME_ID",
+            "dealReference": "REF999",
+        }
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
+        )
+
+        strat._manage_longs(indicators)
+
+        assert len(strat._long_positions) == 0
+
+    def test_position_uses_deal_id_not_deal_reference(self, make_strategy_v2):
+        """The grid must store dealId (broker position ID), not dealReference.
+
+        dealReference is an ephemeral key used to query the confirms endpoint.
+        dealId is the stable broker position identifier that close_position and
+        reconciliation use. Storing dealReference causes 404s when closing.
+        """
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "POSITION_ID_XYZ",
+            "dealReference": "CONFIRMS_REF_ABC",
+        }
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
+        )
+
+        strat._manage_longs(indicators)
+
+        assert len(strat._long_positions) == 1
+        stored_id = strat._long_positions[0]["deal_id"]
+        assert stored_id == "POSITION_ID_XYZ", (
+            f"Expected dealId='POSITION_ID_XYZ' but got {stored_id!r}. "
+            "Strategy must store dealId (broker position ID), not dealReference."
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -2360,19 +2448,23 @@ class TestExtractDealIdEdgeCases:
         # Non-dict response → deal_id = 'unknown' → position NOT added
         assert len(strat._long_positions) == 0
 
-    def test_extract_deal_id_returns_unknown_when_deal_reference_is_empty_string(
+    def test_extract_deal_id_returns_unknown_when_deal_id_is_empty_string(
         self, make_strategy_v2
     ):
-        """When dealReference is '' (falsy), _extract_deal_id returns 'unknown'."""
+        """When dealId is '' (falsy) even on ACCEPTED, _extract_deal_id returns 'unknown'."""
         strat, mock_ig, _ = make_strategy_v2()
-        mock_ig.open_position.return_value = {"dealReference": ""}
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "",
+            "dealReference": "REF123",
+        }
         indicators = _make_indicators(
             bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
         )
 
         strat._manage_longs(indicators)
 
-        # Empty string is falsy → "unknown" → position NOT added
+        # Empty dealId → "unknown" → position NOT added
         assert len(strat._long_positions) == 0
 
     def test_extract_deal_id_returns_unknown_when_get_raises(self, make_strategy_v2):

@@ -856,17 +856,35 @@ def _distance_ok(close: float, last_entry: float, min_ticks: float) -> bool:
 
 
 def _extract_deal_id(response) -> str:
-    """Extract deal_id from an IG open_position response.
+    """Extract deal_id from an IG open_position confirms response.
+
+    The IG confirms endpoint returns a JSON body that always contains a
+    ``dealReference`` (the key used to query confirms) and a ``dealStatus``
+    that indicates whether the deal was actually executed. Only a response
+    with ``dealStatus == "ACCEPTED"`` represents a live broker position.
+
+    The stable broker position identifier is ``dealId`` — this is what
+    close_position and reconciliation use. ``dealReference`` is ephemeral
+    and must NOT be stored as the grid position ID.
 
     Args:
-        response: Return value of IGClient.open_position (dict or MagicMock).
+        response: Return value of IGClient.open_position — the confirms dict
+            returned by trading_ig's fetch_deal_by_deal_reference(), or any
+            object with a .get() method (e.g. MagicMock in tests).
 
     Returns:
-        Deal ID string, or 'unknown' if extraction fails.
+        The ``dealId`` string when ``dealStatus == "ACCEPTED"`` and ``dealId``
+        is non-empty. Returns ``'unknown'`` in all other cases:
+        - ``dealStatus`` is absent or not ``"ACCEPTED"`` (rejected deal)
+        - ``dealId`` is absent or empty
+        - response has no ``.get()`` method
+        - any unexpected exception
     """
     try:
-        if hasattr(response, "get"):
-            return response.get("dealReference", "unknown") or "unknown"
-        return "unknown"
+        if not hasattr(response, "get"):
+            return "unknown"
+        if response.get("dealStatus") != "ACCEPTED":
+            return "unknown"
+        return response.get("dealId", "unknown") or "unknown"
     except Exception:
         return "unknown"
