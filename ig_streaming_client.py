@@ -173,23 +173,28 @@ class _CandleSubscriptionListener:
         except (ValueError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
 
-        bid_close = float(update.getValue("BID_CLOSE") or "0")
-        ofr_close = float(update.getValue("OFR_CLOSE") or "0")
         try:
-            volume = int(update.getValue("LTV") or "0")
-        except (ValueError, TypeError):
-            volume = 0
-        candle = {
-            "open": float(update.getValue("BID_OPEN") or "0"),
-            "high": float(update.getValue("BID_HIGH") or "0"),
-            "low": float(update.getValue("BID_LOW") or "0"),
-            "close": bid_close,
-            "bid_close": bid_close,
-            "ofr_close": ofr_close,
-            "spread": ofr_close - bid_close,
-            "volume": volume,
-            "timestamp": timestamp,
-        }
+            bid_close = float(update.getValue("BID_CLOSE") or "0")
+            ofr_close = float(update.getValue("OFR_CLOSE") or "0")
+            try:
+                volume = int(update.getValue("LTV") or "0")
+            except (ValueError, TypeError):
+                volume = 0
+            candle = {
+                "type": "candle",
+                "open": float(update.getValue("BID_OPEN") or "0"),
+                "high": float(update.getValue("BID_HIGH") or "0"),
+                "low": float(update.getValue("BID_LOW") or "0"),
+                "close": bid_close,
+                "bid_close": bid_close,
+                "ofr_close": ofr_close,
+                "spread": ofr_close - bid_close,
+                "volume": volume,
+                "timestamp": timestamp,
+            }
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Candle field parse error on {self._item_name}: {e}")
+            return
         self._q.put(candle)
 
     def onSubscription(self) -> None:
@@ -270,6 +275,74 @@ class _TickListener:
         logger.info(f"Tick subscription removed from {self._item_name}")
 
 
+class _DirectTickListener:
+    """Lightstreamer SubscriptionListener for raw tick items in tick mode.
+
+    Unlike _TickListener (which feeds a TickAggregator for the candle-fallback
+    path), this listener enqueues raw tick dicts directly onto the shared queue
+    so the worker thread can dispatch them to the on_tick callback.
+
+    All strategy state mutations happen on the single worker thread — this
+    listener's onItemUpdate MUST only call queue.put() and nothing else.
+
+    Attributes:
+        _item_name: The Lightstreamer item name this listener handles.
+        _q: The shared queue onto which tick dicts are placed.
+    """
+
+    def __init__(self, item_name: str, tick_queue: queue.Queue):
+        """Initialise the listener.
+
+        Args:
+            item_name: Lightstreamer item identifier (e.g. 'CHART:epic:TICK').
+            tick_queue: Shared queue for both candle and tick items.
+        """
+        self._item_name = item_name
+        self._q = tick_queue
+
+    # NOTE: The Lightstreamer Python client library uses camelCase callback names.
+    # onItemUpdate MUST be camelCase — the library dispatches to this exact method name.
+
+    def onItemUpdate(self, update) -> None:
+        """Enqueue a raw tick dict onto the shared queue.
+
+        Called by the Lightstreamer library dispatcher (camelCase required).
+        The only side effect is a queue.put() call — no strategy attributes
+        are read or written (thread-safety requirement, REQ-12).
+
+        Args:
+            update: Lightstreamer ItemUpdate object. Use update.getValue("FIELD")
+                to retrieve field values; returns str or None.
+        """
+        try:
+            bid = float(update.getValue("BID") or "0")
+            ofr = float(update.getValue("OFR") or "0")
+            utm = int(update.getValue("UTM") or "0")
+        except (ValueError, TypeError) as e:
+            logger.debug(f"Tick parse error on {self._item_name}: {e}")
+            return
+        self._q.put({"type": "tick", "bid": bid, "ofr": ofr, "utm": utm})
+
+    def onSubscription(self) -> None:
+        """Called when the tick subscription is confirmed by the server."""
+        logger.info(f"Direct tick subscription active on {self._item_name}")
+
+    def onSubscriptionError(self, code: int, message: str) -> None:
+        """Called when the server reports a subscription error.
+
+        Args:
+            code: Error code from server.
+            message: Human-readable error description.
+        """
+        logger.error(
+            f"Direct tick subscription error on {self._item_name}: {code} {message}"
+        )
+
+    def onUnsubscription(self) -> None:
+        """Called when the tick subscription is removed."""
+        logger.info(f"Direct tick subscription removed from {self._item_name}")
+
+
 def _make_native_subscription(
     epic: str, resolution: str, listener: _CandleSubscriptionListener
 ):
@@ -306,7 +379,7 @@ def _make_native_subscription(
     return sub
 
 
-def _make_tick_subscription(epic: str, listener: _TickListener):
+def _make_tick_subscription(epic: str, listener: _TickListener | _DirectTickListener):
     """Build a Lightstreamer Subscription for tick items (fallback).
 
     Creates a DISTINCT-mode Subscription for CHART:{epic}:TICK and attaches
@@ -514,8 +587,13 @@ class IGStreamingClient:
         self._worker: Optional[threading.Thread] = None
         self._stop_event: threading.Event = threading.Event()
         self._active_subscription = None
+        self._using_tick_fallback: bool = False
 
-    def start(self, on_candle: Callable[[dict], None]) -> None:
+    def start(
+        self,
+        on_candle: Callable[[dict], None],
+        on_tick: Optional[Callable[[dict], None]] = None,
+    ) -> None:
         """Subscribe to candle data and begin delivering events to on_candle.
 
         Creates an IGStreamService from the provided IGService, establishes
@@ -523,6 +601,12 @@ class IGStreamingClient:
         starts a worker thread that dispatches completed candles to on_candle.
 
         Falls back to tick aggregation if the native subscription fails.
+
+        When on_tick is provided (tick mode), a second Lightstreamer subscription
+        to CHART:{epic}:TICK is created using _DirectTickListener. Raw ticks are
+        enqueued onto the same shared queue and dispatched to on_tick from the
+        single worker thread — guaranteeing no concurrency between on_candle and
+        on_tick.
 
         Notes:
             open/high/low/close are derived from BID prices (not mid-market).
@@ -532,8 +616,11 @@ class IGStreamingClient:
 
         Args:
             on_candle: Callable invoked with each completed candle dict.
-                       The dict has keys: open, high, low, close, bid_close,
+                       The dict has keys: type, open, high, low, close, bid_close,
                        ofr_close, spread, volume, timestamp.
+            on_tick: Optional callable invoked with each raw tick dict.
+                     The dict has keys: type, bid, ofr, utm. When None (default),
+                     no tick subscription is created and candle mode is unchanged.
 
         Raises:
             RuntimeError: If start() is called while the client is already running.
@@ -559,7 +646,7 @@ class IGStreamingClient:
         # receive candles immediately when the subscription confirms.
         self._worker = threading.Thread(
             target=self._worker_loop,
-            args=(on_candle,),
+            args=(on_candle, on_tick),
             daemon=True,
             name="ig-streaming-worker",
         )
@@ -567,6 +654,14 @@ class IGStreamingClient:
 
         try:
             self._subscribe_native(on_candle)
+            if on_tick is not None and not self._using_tick_fallback:
+                self._subscribe_tick_direct()
+            elif on_tick is not None and self._using_tick_fallback:
+                logger.warning(
+                    "Tick mode requested but native subscription fell back to tick aggregation. "
+                    "Direct tick subscription skipped — tick-mode trade signals are disabled. "
+                    "Strategy will receive synthetic candles only."
+                )
         except Exception:
             # Subscription failed — shut down the worker thread and stream
             # service so the orphaned thread does not run indefinitely.
@@ -600,9 +695,24 @@ class IGStreamingClient:
             )
             self._subscribe_tick_fallback()
 
+    def _subscribe_tick_direct(self) -> None:
+        """Subscribe to CHART:{epic}:TICK for raw tick delivery in tick mode.
+
+        Creates a _DirectTickListener that enqueues raw tick dicts onto the
+        shared queue with type='tick'. The worker thread dispatches these to
+        the on_tick callback. This subscription is created in addition to the
+        candle subscription — not instead of it.
+        """
+        item_name = f"CHART:{self._epic}:TICK"
+        listener = _DirectTickListener(item_name, self._candle_queue)
+        sub = _make_tick_subscription(self._epic, listener)
+        self._stream_svc.subscribe(sub)
+        logger.info(f"Direct tick subscription created: {item_name}")
+
     def _subscribe_tick_fallback(self) -> None:
         """Subscribe to CHART:{epic}:TICK and aggregate ticks into candles."""
         item_name = f"CHART:{self._epic}:TICK"
+        self._using_tick_fallback = True
         aggregator = TickAggregator(
             resolution_minutes=_resolution_to_minutes(self._resolution),
             on_candle=lambda candle: self._candle_queue.put(candle),
@@ -614,32 +724,54 @@ class IGStreamingClient:
         self._active_subscription = sub
         logger.info(f"Tick fallback subscription active: {item_name}")
 
-    def _worker_loop(self, on_candle: Callable[[dict], None]) -> None:
-        """Dequeue completed candles and invoke on_candle.
+    def _worker_loop(
+        self,
+        on_candle: Callable[[dict], None],
+        on_tick: Optional[Callable[[dict], None]] = None,
+    ) -> None:
+        """Dequeue items and dispatch to on_candle or on_tick by item type.
 
         Runs on a dedicated worker thread. Blocks on queue.get() with a
         short timeout so the stop event is checked regularly. After the stop
         event is set, any remaining items in the queue are drained and
-        delivered to on_candle before the loop exits — this ensures in-flight
-        candles are not silently dropped at shutdown.
+        delivered before the loop exits — this ensures in-flight items are
+        not silently dropped at shutdown.
+
+        Dispatch rules:
+        - ``item.get("type", "candle") == "candle"`` → ``on_candle(item)``
+        - ``item.get("type", "candle") == "tick"`` and on_tick is not None
+          → ``on_tick(item)``
+        - Items without a ``"type"`` key default to ``"candle"`` for
+          backward compatibility with any producer that predates this change.
 
         Args:
             on_candle: Callback to invoke for each completed candle.
+            on_tick: Optional callback to invoke for each raw tick. When None,
+                tick items are silently discarded (candle mode).
         """
         logger.debug("Streaming worker thread started.")
+
+        def _dispatch(item: dict) -> None:
+            item_type = item.get("type", "candle")
+            if item_type == "tick":
+                if on_tick is not None:
+                    on_tick(item)
+            else:
+                on_candle(item)
+
         while not self._stop_event.is_set():
             try:
-                candle = self._candle_queue.get(timeout=0.05)
+                item = self._candle_queue.get(timeout=0.05)
                 try:
-                    on_candle(candle)
+                    _dispatch(item)
                 except Exception as e:
-                    logger.error(f"Error in on_candle callback: {e}", exc_info=True)
+                    logger.error(f"Error in callback: {e}", exc_info=True)
                 finally:
                     self._candle_queue.task_done()
             except queue.Empty:
                 continue
 
-        # Drain remaining items so in-flight candles are not lost on shutdown.
+        # Drain remaining items so in-flight items are not lost on shutdown.
         # Cap at _DRAIN_BUDGET items to prevent indefinite blocking under
         # thundering-herd conditions; any remaining items are discarded.
         _DRAIN_BUDGET = 50
@@ -647,14 +779,12 @@ class IGStreamingClient:
         dropped = 0
         while drained < _DRAIN_BUDGET:
             try:
-                candle = self._candle_queue.get(timeout=0.01)
+                item = self._candle_queue.get(timeout=0.01)
                 drained += 1
                 try:
-                    on_candle(candle)
+                    _dispatch(item)
                 except Exception as e:
-                    logger.error(
-                        f"Error in on_candle callback during drain: {e}", exc_info=True
-                    )
+                    logger.error(f"Error in callback during drain: {e}", exc_info=True)
                 finally:
                     self._candle_queue.task_done()
             except queue.Empty:
@@ -672,7 +802,7 @@ class IGStreamingClient:
         if dropped:
             logger.warning(
                 f"Drain budget ({_DRAIN_BUDGET}) exceeded on shutdown; "
-                f"dropped {dropped} candle(s) from queue."
+                f"dropped {dropped} item(s) from queue."
             )
 
         logger.debug("Streaming worker thread stopped.")
@@ -706,4 +836,5 @@ class IGStreamingClient:
             self._stream_svc = None
 
         self._active_subscription = None
+        self._using_tick_fallback = False
         logger.info("IGStreamingClient stopped.")

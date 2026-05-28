@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 # float fields accept int values (e.g. 240 is valid for take_profit_ticks).
 _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
     "api_mode": str,
+    "operation_mode": str,
     "candle_frequency": str,
     "bb_period": int,
     "bb_std": float,
@@ -173,8 +174,19 @@ class RSIBollingerStrategyV2:
         self.streaming_client = streaming_client
         self.trading_config = trading_config
         self.epic = trading_config.epic
+
+        # operation_mode: 'candle' or 'tick'. Invalid value falls back to 'candle'.
+        _raw_mode = getattr(params, "operation_mode", "candle")
+        if _raw_mode not in ("candle", "tick"):
+            logger.warning(
+                f"Unknown operation_mode '{_raw_mode}' — defaulting to 'candle'"
+            )
+            _raw_mode = "candle"
+        self._operation_mode: str = _raw_mode
+
         logger.debug(
             f"RSIBollingerStrategyV2 initialised: epic={self.epic} "
+            f"operation_mode={self._operation_mode} "
             f"bb_period={params.bb_period} bb_std={params.bb_std} "
             f"rsi_period={params.rsi_period} rsi_oversold={params.rsi_oversold} "
             f"rsi_overbought={params.rsi_overbought} "
@@ -203,6 +215,16 @@ class RSIBollingerStrategyV2:
 
         # Stop event — set by stop() to signal run() to exit
         self._stop_event: threading.Event = threading.Event()
+
+        # Tick mode: cached indicators (set by _on_candle, read by _on_tick).
+        # None until the first candle is processed — serves as the warmup gate.
+        self._cached_indicators: dict | None = None
+
+        # Tick mode: in-flight flags prevent duplicate REST calls on back-to-back ticks.
+        # Each flag is set to True immediately before a REST call and reset in a
+        # finally block — so it is always False after _on_tick returns.
+        self._tick_long_in_flight: bool = False
+        self._tick_short_in_flight: bool = False
 
         # Timestamp of the last REST candle loaded during warm-up.
         # Used by _on_candle to discard overlapping streaming candles.
@@ -764,8 +786,175 @@ class RSIBollingerStrategyV2:
             f"longs={len(self._long_positions)} shorts={len(self._short_positions)}"
         )
 
+        # In tick mode, cache the indicators so _on_tick can evaluate signals
+        # from live bid/ofr prices, then return early — tick handler owns entries/exits.
+        if self._operation_mode == "tick":
+            self._cached_indicators = indicators
+            return
+
         self._manage_longs(indicators)
         self._manage_shorts(indicators)
+
+    # ---------------------------------------------------------------------- #
+    # Tick handler                                                             #
+    # ---------------------------------------------------------------------- #
+
+    def _tick_try_open(self, side: str, bid: float) -> None:
+        """Attempt to open a position via REST in tick mode.
+
+        Sets the in-flight flag before the REST call and resets it in a
+        finally block — guaranteeing the flag is always False after this
+        method returns, even when the REST call raises.
+
+        Args:
+            side: Trade direction — 'BUY' (long) or 'SELL' (short).
+            bid: Current bid price used as the entry reference price.
+        """
+        if side == "BUY":
+            self._tick_long_in_flight = True
+            positions = self._long_positions
+        else:
+            self._tick_short_in_flight = True
+            positions = self._short_positions
+
+        try:
+            response = self.ig.open_position(
+                epic=self.epic,
+                size=self.params.contract_size,
+                side=side,
+                limit=self.params.take_profit_ticks,
+            )
+            deal_id = _extract_deal_id(response)
+            if deal_id != "unknown":
+                positions.append(
+                    {
+                        "deal_id": deal_id,
+                        "entry_price": bid,
+                        "size": self.params.contract_size,
+                    }
+                )
+                logger.info(f"Tick: opened {side} {deal_id} @ bid={bid:.2f}")
+        except Exception as e:
+            logger.error(f"Tick: failed to open {side}: {e}")
+        finally:
+            if side == "BUY":
+                self._tick_long_in_flight = False
+            else:
+                self._tick_short_in_flight = False
+
+    def _tick_close_positions(
+        self,
+        positions: list,
+        close_side: str,
+        bid: float,
+        spread: float,
+        direction: str,
+    ) -> list:
+        """Close profitable positions and return those that should remain open.
+
+        Args:
+            positions: Current position list (longs or shorts).
+            close_side: REST close direction — 'SELL' for longs, 'BUY' for shorts.
+            bid: Current bid price.
+            spread: Live spread (ofr - bid) from the tick.
+            direction: 'long' or 'short' — used for profit calculation and logging.
+
+        Returns:
+            List of positions that were not closed (kept open).
+        """
+        profit_fn = _long_profit if direction == "long" else _short_profit
+        to_close = []
+        to_keep = []
+        for pos in positions:
+            profit = profit_fn(bid, pos["entry_price"], spread, pos["size"])
+            if profit > 0:
+                to_close.append(pos)
+            else:
+                to_keep.append(pos)
+        for pos in to_close:
+            try:
+                self.ig.close_position(pos["deal_id"], close_side, pos["size"])
+                logger.info(
+                    f"Tick: closed {direction.upper()} {pos['deal_id']} @ bid={bid:.2f}"
+                )
+            except Exception as e:
+                logger.error(f"Tick: failed to close {direction} {pos['deal_id']}: {e}")
+                pos["needs_reconciliation"] = True
+                to_keep.append(pos)
+        return to_keep
+
+    def _on_tick(self, tick: dict) -> None:
+        """Evaluate entry and exit signals from a live tick in tick mode.
+
+        Called from the worker thread via the dispatcher. Reads cached indicators
+        (set by the last _on_candle call) and compares live bid/ofr prices to the
+        Bollinger Band levels. Delegates REST calls to _tick_try_open() and exit
+        logic to _tick_close_positions() so this method stays under 50 lines.
+
+        Warmup gate: silently returns when _cached_indicators is None (no candle
+        has been processed yet).
+
+        Args:
+            tick: Dict with keys 'bid' (float), 'ofr' (float), 'utm' (int).
+        """
+        indicators = self._cached_indicators
+        if indicators is None:
+            return  # warmup gate — no candle processed yet
+
+        if self._needs_reconciliation():
+            self._reconcile_positions()
+
+        bid = tick["bid"]
+        spread = tick["ofr"] - bid  # live spread from the tick itself
+        bb_upper = indicators["bb_upper"]
+        bb_lower = indicators["bb_lower"]
+        rsi = indicators["rsi"]
+
+        # --- Long exit ---
+        if bid > bb_upper and self._long_positions:
+            self._long_positions = self._tick_close_positions(
+                self._long_positions, "SELL", bid, spread, "long"
+            )
+
+        # --- Short exit ---
+        if bid < bb_lower and self._short_positions:
+            self._short_positions = self._tick_close_positions(
+                self._short_positions, "BUY", bid, spread, "short"
+            )
+
+        # --- Long entry ---
+        if (
+            bid < bb_lower
+            and rsi < self.params.rsi_oversold
+            and not self._tick_long_in_flight
+            and len(self._long_positions) < self.params.max_long_positions
+        ):
+            _long_dist_ok = True
+            if self._long_positions:
+                last_entry = self._long_positions[-1]["entry_price"]
+                if not _distance_ok(
+                    bid, last_entry, self.params.min_dist_between_entries_ticks
+                ):
+                    _long_dist_ok = False  # distance guard — skip entry
+            if _long_dist_ok:
+                self._tick_try_open("BUY", bid)
+
+        # --- Short entry ---
+        if (
+            bid > bb_upper
+            and rsi > self.params.rsi_overbought
+            and not self._tick_short_in_flight
+            and len(self._short_positions) < self.params.max_short_positions
+        ):
+            _short_dist_ok = True
+            if self._short_positions:
+                last_entry = self._short_positions[-1]["entry_price"]
+                if not _distance_ok(
+                    bid, last_entry, self.params.min_dist_between_entries_ticks
+                ):
+                    _short_dist_ok = False  # distance guard — skip entry
+            if _short_dist_ok:
+                self._tick_try_open("SELL", bid)
 
     # ---------------------------------------------------------------------- #
     # Main loop                                                                #
@@ -786,7 +975,8 @@ class RSIBollingerStrategyV2:
         logger.debug(
             f"Warm-up complete — starting streaming client (window_size={len(self._candle_window)})."
         )
-        self.streaming_client.start(self._on_candle)
+        on_tick = self._on_tick if self._operation_mode == "tick" else None
+        self.streaming_client.start(self._on_candle, on_tick=on_tick)
         logger.debug("Streaming client started — blocking on stop event.")
         self._stop_event.wait()
         logger.info("RSIBollingerStrategyV2 stopped.")

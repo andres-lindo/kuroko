@@ -1,6 +1,7 @@
 {
   "api_mode": "streaming",
   "candle_frequency": "1min",
+  "operation_mode": "candle",
 
   "bb_period": 20,
   "bb_std": 1.5,
@@ -10,8 +11,8 @@
 
   "max_long_positions": 5,
   "max_short_positions": 5,
-  
-  "contract_size": 0.1,
+
+  "contract_size": 0.2,
   "min_dist_between_entries_ticks": 30,
-  "take_profit_ticks": 30
+  "take_profit_ticks": 20
 }

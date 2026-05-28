@@ -24,6 +24,65 @@ differences from V1:
    trend continuations; per-position spread-aware profit is the guard for
    mean-reversion exits.
 
+V2 also supports an optional **tick mode** (`operation_mode: "tick"`) where
+entry and exit signals are evaluated on every live tick using indicators cached
+from the most recently closed candle.
+
+---
+
+## Operation Modes
+
+`operation_mode` controls whether signals are evaluated on candle close or on
+every live tick.
+
+### Candle mode (`operation_mode: "candle"`)
+
+Default behavior. `_on_candle` computes indicators from each closed candle and
+immediately evaluates entry and exit signals via `_manage_longs()` and
+`_manage_shorts()`. This is identical to the original V2 behavior.
+
+### Tick mode (`operation_mode: "tick"`)
+
+Indicators are computed and cached (`_cached_indicators`) on every candle close.
+Entry and exit signals are then evaluated on each live tick by `_on_tick()`, using
+the cached indicators together with the live `bid` and `ofr` prices from the tick.
+
+**Warmup gate**: `_on_tick` silently discards ticks until at least one candle has
+been processed. No WARNING is logged during this warmup period.
+
+**In-flight guard**: `_tick_long_in_flight` and `_tick_short_in_flight` flags
+prevent duplicate REST calls if multiple ticks qualify before the first REST
+response returns. Each flag is set immediately before the REST call and reset in
+a `finally` block — so it is always `False` after `_on_tick` returns, even if the
+REST call raises an exception.
+
+**Spread**: In tick mode, exit profit is calculated using the live `ofr - bid`
+spread from the tick itself (sub-second accuracy), not the candle-close spread
+stored in `_current_spread`.
+
+**Switching modes**: Set `"operation_mode": "tick"` in the strategy JSON and
+redeploy. To revert, set it back to `"candle"` (or remove the key — missing key
+defaults to `"candle"`).
+
+**Invalid value handling**: If `operation_mode` is set to an unrecognised value
+(e.g., `"turbo"`), the strategy logs a WARNING and falls back to `"candle"` mode.
+No crash, no schema break.
+
+### Data flow in tick mode
+
+```
+Lightstreamer
+  ├── CHART:{epic}:{res} → _CandleSubscriptionListener → queue (type=candle)
+  │                                                              ↓
+  │                                                     _on_candle → cache indicators
+  │
+  └── CHART:{epic}:TICK  → _DirectTickListener         → queue (type=tick)
+                                                               ↓
+                                                       _on_tick → warmup gate
+                                                               → in-flight guard
+                                                               → entry/exit signals
+```
+
 ---
 
 ## Startup Lifecycle and Warm-Up
@@ -34,8 +93,9 @@ differences from V1:
    from the REST API via `IGClient.get_candles()` and appends each row's `Close`
    price directly to `_candle_window`. This pre-fills the window so that indicators
    are valid on the very first live streaming candle.
-2. **`streaming_client.start(_on_candle)`** — opens the Lightstreamer connection
-   and begins delivering live candles.
+2. **`streaming_client.start(_on_candle, on_tick=...)`** — opens the Lightstreamer
+   connection and begins delivering live candles. In tick mode, also opens a second
+   subscription to `CHART:{epic}:TICK` via `_DirectTickListener`.
 3. **`_stop_event.wait()`** — blocks until `stop()` is called.
 
 ### Warm-up details
@@ -194,26 +254,29 @@ There is no drawdown freeze, no ATR rule, and no margin check in V2.
 The strategy runs on two threads:
 
 ```
-┌────────────────────────────────┐      ┌──────────────────────────────────┐
-│  Lightstreamer (LS) thread     │      │  IGStreamingClient worker thread  │
-│                                │      │                                  │
-│  LS adapter fires onItemUpdate ──────► queue.put(candle)                 │
-│  on _CandleSubscriptionListener│      │  ↓                               │
-│                                │      │  queue.get() → on_candle(candle) │
-└────────────────────────────────┘      │  _on_candle → _manage_longs()   │
-                                        │            → _manage_shorts()   │
-                                        │  ig_client.open/close_position()│
-                                        └──────────────────────────────────┘
+┌────────────────────────────────┐      ┌──────────────────────────────────────────┐
+│  Lightstreamer (LS) thread     │      │  IGStreamingClient worker thread          │
+│                                │      │                                          │
+│  _CandleSubscriptionListener   ──────► queue.put({type:"candle",...})            │
+│  _DirectTickListener (tick mode)──────► queue.put({type:"tick",...})             │
+│                                │      │  ↓                                       │
+│                                │      │  queue.get() → dispatch by type          │
+└────────────────────────────────┘      │  type=candle → _on_candle()              │
+                                        │    → cache indicators (tick mode)        │
+                                        │    → _manage_longs/_manage_shorts (candle)│
+                                        │  type=tick  → _on_tick()                 │
+                                        │    → warmup gate / in-flight guard       │
+                                        │    → entry/exit via ig_client            │
+                                        └──────────────────────────────────────────┘
 ```
 
-Candle data flows: **LS thread** → `_CandleSubscriptionListener.onItemUpdate()`
-enqueues to `IGStreamingClient._candle_queue` → **worker thread** dequeues and
-calls `_on_candle()` directly (registered as the callback via `streaming_client.start(_on_candle)`).
+All data flows through the **single shared queue**. The worker thread dispatches
+by `item.get("type", "candle")` — items without a `"type"` key default to candle
+for backward compatibility. There is no concurrent REST call risk because `_on_candle`
+and `_on_tick` run sequentially on the same worker thread.
 
-There is no intermediate re-queue inside the strategy. `run()` blocks on
-`_stop_event.wait()` while the streaming client's worker thread handles all candle
-delivery and trading logic. All IG REST calls (`open_position`, `close_position`)
-happen on the worker thread — no concurrent REST calls.
+`run()` blocks on `_stop_event.wait()` while the streaming client's worker thread
+handles all delivery and trading logic.
 
 ---
 
@@ -225,17 +288,18 @@ loaded at startup into a `types.SimpleNamespace` via `load_params()`.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `api_mode` | string | `"streaming"` | Must be `"streaming"` — tells `kuroko.py` to instantiate `IGStreamingClient` |
-| `candle_frequency` | string | `"5min"` | Candle resolution in `"Nmin"` format (e.g. `"1min"`, `"5min"`, `"15min"`, `"60min"`). Mapped to IG Lightstreamer resolution strings (`"1MINUTE"`, `"5MINUTE"`, `"15MINUTE"`, `"1HOUR"`). Applied to both native candle subscription and tick-aggregation fallback. |
+| `operation_mode` | string | `"candle"` | Signal evaluation mode. `"candle"`: signals fire on each closed candle (default). `"tick"`: indicators cached on candle close; signals fire on each live tick. Any other value logs a WARNING and falls back to `"candle"`. Missing key defaults to `"candle"`. |
+| `candle_frequency` | string | `"1min"` | Candle resolution in `"Nmin"` format (e.g. `"1min"`, `"5min"`, `"15min"`, `"60min"`). Mapped to IG Lightstreamer resolution strings (`"1MINUTE"`, `"5MINUTE"`, `"15MINUTE"`, `"1HOUR"`). Applied to both native candle subscription and tick-aggregation fallback. |
 | `bb_period` | int | `20` | Bollinger Bands lookback period |
-| `bb_std` | float | `2.0` | Bollinger Bands standard deviation multiplier |
+| `bb_std` | float | `1.5` | Bollinger Bands standard deviation multiplier |
 | `rsi_period` | int | `14` | RSI lookback period |
-| `rsi_oversold` | int | `30` | RSI level below which long entries are considered |
-| `rsi_overbought` | int | `70` | RSI level above which short entries are considered |
+| `rsi_oversold` | int | `40` | RSI level below which long entries are considered |
+| `rsi_overbought` | int | `60` | RSI level above which short entries are considered |
 | `max_long_positions` | int | `5` | Maximum number of simultaneously open long positions |
 | `max_short_positions` | int | `5` | Maximum number of simultaneously open short positions |
 | `contract_size` | float | `0.1` | Position size in contracts — uniform for every entry |
-| `min_dist_between_entries_ticks` | float | `20.0` | Minimum price distance between consecutive entries in the same grid (ticks) |
-| `take_profit_ticks` | float | `240.0` | Broker take-profit distance from entry price (ticks) |
+| `min_dist_between_entries_ticks` | float | `30` | Minimum price distance between consecutive entries in the same grid (ticks) |
+| `take_profit_ticks` | float | `30` | Broker take-profit distance from entry price (ticks) |
 
 Infrastructure parameters (`epic`, `leverage`, etc.) come from
 `config.json["trading"]` and are NOT stored in the strategy JSON.
@@ -253,17 +317,18 @@ Infrastructure parameters (`epic`, `leverage`, etc.) come from
 ```json
 {
   "api_mode": "streaming",
-  "candle_frequency": "5min",
+  "candle_frequency": "1min",
+  "operation_mode": "candle",
   "bb_period": 20,
-  "bb_std": 2.0,
+  "bb_std": 1.5,
   "rsi_period": 14,
-  "rsi_oversold": 30,
-  "rsi_overbought": 70,
+  "rsi_oversold": 40,
+  "rsi_overbought": 60,
   "max_long_positions": 5,
   "max_short_positions": 5,
   "contract_size": 0.1,
-  "min_dist_between_entries_ticks": 20,
-  "take_profit_ticks": 240.0
+  "min_dist_between_entries_ticks": 30,
+  "take_profit_ticks": 30
 }
 ```
 
@@ -293,7 +358,7 @@ its `finally` block, which disconnects the Lightstreamer session cleanly.
 | Feature | RSIBollingerStrategy (V1) | RSIBollingerStrategyV2 |
 |---------|---------------------------|------------------------|
 | Data source | REST polling (15-min candles, per-cycle API call) | Lightstreamer streaming (5-min candles by default, push) |
-| Candle resolution | Configurable via `candle_frequency` (default 15 min) | Configurable via `candle_frequency` (default 5 min) |
+| Candle resolution | Configurable via `candle_frequency` (default 15 min) | Configurable via `candle_frequency` (default 1min) |
 | Directions | Long only (short entry is defined but rarely triggered in V1) | Bidirectional — independent long and short grids |
 | Position sizing | Martingale: each grid level multiplies base size by `martingale_multiplier` | Flat: every entry uses `contract_size` |
 | Stop-loss | ATR-based dynamic stop (`atr_sl_multiplier * ATR`) | None |

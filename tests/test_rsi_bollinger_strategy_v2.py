@@ -94,6 +94,7 @@ class TestLoadParams:
         """a well-formed V2 JSON file loads successfully."""
         data = {
             "api_mode": "streaming",
+            "operation_mode": "candle",
             "candle_frequency": "5min",
             "bb_period": 20,
             "bb_std": 2.0,
@@ -710,7 +711,7 @@ class TestSingleQueuePattern:
         strat, _, mock_streaming = make_strategy_v2()
         captured = {}
 
-        def fake_start(callback):
+        def fake_start(callback, on_tick=None):
             captured["callback"] = callback
             # Immediately stop so run() returns
             strat.stop()
@@ -1822,6 +1823,7 @@ class TestWireStrategyPassesResolution:
 
 _V2_REQUIRED_KEYS = {
     "api_mode",
+    "operation_mode",
     "bb_period",
     "bb_std",
     "rsi_period",
@@ -1945,6 +1947,7 @@ class TestValidateParamsBranches:
         """An int value for a float key (e.g. take_profit_ticks=240) is accepted."""
         data = {
             "api_mode": "streaming",
+            "operation_mode": "candle",
             "candle_frequency": "5min",
             "bb_period": 20,
             "bb_std": 2.0,
@@ -2048,6 +2051,7 @@ class TestValidateParamsBranches:
 
         base_data = {
             "api_mode": "streaming",
+            "operation_mode": "candle",
             "candle_frequency": "5min",
             "bb_period": 20,
             "bb_std": 2.0,
@@ -2079,6 +2083,7 @@ class TestValidateParamsBranches:
 
         base_data = {
             "api_mode": "streaming",
+            "operation_mode": "candle",
             "candle_frequency": "5min",
             "bb_period": 20,
             "bb_std": 2.0,
@@ -2514,3 +2519,402 @@ class TestRequirementsPin:
                 ].isdigit(), f"Version must start with a digit, got: {version_part!r}"
                 return
         pytest.fail("lightstreamer-client-lib pin not found in requirements.txt")
+
+
+# =========================================================================== #
+# Tick mode — operation_mode parameter [REQ-1]                                 #
+# =========================================================================== #
+
+
+class TestOperationModeParam:
+    """operation_mode param validation and fallback behaviour (REQ-1)."""
+
+    def test_valid_tick_mode_sets_operation_mode(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """When operation_mode='tick', _operation_mode is set to 'tick' and no warning is logged."""
+        params = make_params_v2(operation_mode="tick")
+        strat, _, _ = make_strategy_v2(params=params)
+
+        assert strat._operation_mode == "tick"
+
+    def test_invalid_value_falls_back_to_candle_with_warning(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """An unrecognised operation_mode value defaults to 'candle' and logs a warning."""
+        import logging
+
+        params = make_params_v2(operation_mode="turbo")
+        with caplog.at_level(logging.WARNING):
+            strat, _, _ = make_strategy_v2(params=params)
+
+        assert strat._operation_mode == "candle"
+        assert any("turbo" in record.message for record in caplog.records)
+
+    def test_missing_key_defaults_to_candle(self, make_strategy_v2, make_params_v2):
+        """When operation_mode is absent from params, _operation_mode defaults to 'candle'."""
+        params = make_params_v2()
+        # Remove operation_mode attribute to simulate missing key
+        del params.operation_mode
+        strat, _, _ = make_strategy_v2(params=params)
+
+        assert strat._operation_mode == "candle"
+
+
+# =========================================================================== #
+# Tick mode — indicator cache [REQ-3]                                          #
+# =========================================================================== #
+
+
+class TestIndicatorCache:
+    """Indicator cache updated on candle close in tick mode; _compute_indicators is pure [REQ-3]."""
+
+    def test_on_candle_updates_cached_indicators_in_tick_mode(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """In tick mode, _on_candle updates _cached_indicators after computing them."""
+        params = make_params_v2(operation_mode="tick")
+        strat, _, _ = make_strategy_v2(params=params)
+        # Pre-fill candle window so indicators are computable
+        for _ in range(25):
+            strat._candle_window.append(100.0)
+        candle = _make_candle(close=100.0)
+
+        strat._on_candle(candle)
+
+        assert strat._cached_indicators is not None
+        assert "bb_upper" in strat._cached_indicators
+        assert "bb_lower" in strat._cached_indicators
+        assert "rsi" in strat._cached_indicators
+
+    def test_compute_indicators_is_pure(self, make_strategy_v2, make_params_v2):
+        """_compute_indicators must not mutate _cached_indicators (pure function)."""
+        params = make_params_v2(operation_mode="tick")
+        strat, _, _ = make_strategy_v2(params=params)
+        # Start with _cached_indicators = None
+        assert strat._cached_indicators is None
+        # Pre-fill window
+        for _ in range(25):
+            strat._candle_window.append(100.0)
+        candle = {"close": 100.0}
+
+        # Call _compute_indicators directly — must not modify _cached_indicators
+        result = strat._compute_indicators(candle)
+
+        # _cached_indicators must remain None (only _on_candle should set it)
+        assert strat._cached_indicators is None
+        # But the result itself is valid
+        assert result is not None
+
+
+# =========================================================================== #
+# Tick mode — candle mode regression [REQ-2]                                   #
+# =========================================================================== #
+
+
+class TestCandleModeRegression:
+    """Candle mode calls _manage_longs/_manage_shorts and doesn't require cache attrs [REQ-2]."""
+
+    def test_candle_mode_calls_manage_longs_and_manage_shorts(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """In candle mode, _on_candle calls _manage_longs and _manage_shorts (no early return)."""
+        params = make_params_v2(operation_mode="candle")
+        strat, _, _ = make_strategy_v2(params=params)
+        for _ in range(25):
+            strat._candle_window.append(100.0)
+        candle = _make_candle(close=100.0)
+
+        with (
+            patch.object(strat, "_manage_longs") as mock_longs,
+            patch.object(strat, "_manage_shorts") as mock_shorts,
+        ):
+            strat._on_candle(candle)
+
+        mock_longs.assert_called_once()
+        mock_shorts.assert_called_once()
+
+
+# =========================================================================== #
+# Tick mode — warmup gate [REQ-8]                                               #
+# =========================================================================== #
+
+
+class TestWarmupGate:
+    """Ticks silently dropped when _cached_indicators is None [REQ-8]."""
+
+    def test_tick_dropped_silently_when_no_cache(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """_on_tick returns without REST calls when _cached_indicators is None."""
+        import logging
+
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        assert strat._cached_indicators is None
+
+        with caplog.at_level(logging.WARNING):
+            strat._on_tick({"bid": 90.0, "ofr": 91.0, "utm": 0})
+
+        mock_ig.open_position.assert_not_called()
+        mock_ig.close_position.assert_not_called()
+        # No WARNING or ERROR level logs
+        assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+    def test_tick_processed_when_cache_populated(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """_on_tick proceeds to signal evaluation when _cached_indicators is not None."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # Populate cache with neutral indicators (no entry signals)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=50.0, rsi=50.0, close=100.0
+        )
+        # Neutral tick — bid inside bands, no signal
+        tick = {"bid": 100.0, "ofr": 100.5, "utm": 0}
+
+        strat._on_tick(tick)
+
+        # No position action expected (neutral conditions)
+        mock_ig.open_position.assert_not_called()
+        mock_ig.close_position.assert_not_called()
+
+
+# =========================================================================== #
+# Tick mode — in-flight guard [REQ-9]                                           #
+# =========================================================================== #
+
+
+class TestInFlightGuard:
+    """In-flight flags prevent duplicate ticks; reset in finally even on exception [REQ-9]."""
+
+    def test_duplicate_tick_dropped_when_long_in_flight(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """When _tick_long_in_flight is True, a qualifying long tick is silently dropped."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=20.0, close=100.0
+        )
+        strat._tick_long_in_flight = True
+        # Qualifying tick: bid < bb_lower, rsi < rsi_oversold (30)
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_in_flight_flag_reset_on_rest_exception(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """_tick_long_in_flight is False after REST raises — finally block fires."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=20.0, close=100.0
+        )
+        mock_ig.open_position.side_effect = RuntimeError("REST error")
+        # Qualifying long tick
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        assert strat._tick_long_in_flight is False
+
+
+# =========================================================================== #
+# Tick mode — entry long [REQ-4]                                                #
+# =========================================================================== #
+
+
+class TestTickEntryLong:
+    """Long position opened on BB-lower cross + RSI oversold in tick mode [REQ-4]."""
+
+    def test_long_opened_when_all_conditions_met(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Long opened when bid < bb_lower and rsi < rsi_oversold and not in-flight."""
+        params = make_params_v2(
+            operation_mode="tick",
+            rsi_oversold=30,
+            max_long_positions=3,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "TICK_LONG_1",
+        }
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=20.0, close=100.0
+        )
+        # Qualifying tick: bid < bb_lower=100
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.open_position.assert_called_once()
+        call_kwargs = mock_ig.open_position.call_args.kwargs
+        assert call_kwargs["side"] == "BUY"
+
+    def test_long_suppressed_at_max_positions(self, make_strategy_v2, make_params_v2):
+        """No long opened when max_long_positions already reached."""
+        params = make_params_v2(
+            operation_mode="tick",
+            rsi_oversold=30,
+            max_long_positions=1,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=20.0, close=100.0
+        )
+        strat._long_positions = [
+            {"deal_id": "EXISTING", "entry_price": 85.0, "size": 0.5}
+        ]
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.open_position.assert_not_called()
+
+
+# =========================================================================== #
+# Tick mode — entry short [REQ-5]                                               #
+# =========================================================================== #
+
+
+class TestTickEntryShort:
+    """Short position opened on BB-upper cross + RSI overbought in tick mode [REQ-5]."""
+
+    def test_short_opened_when_all_conditions_met(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Short opened when bid > bb_upper and rsi > rsi_overbought and not in-flight."""
+        params = make_params_v2(
+            operation_mode="tick",
+            rsi_overbought=70,
+            max_short_positions=3,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "TICK_SHORT_1",
+        }
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=80.0, close=100.0
+        )
+        # Qualifying tick: bid > bb_upper=100
+        tick = {"bid": 110.0, "ofr": 111.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.open_position.assert_called_once()
+        call_kwargs = mock_ig.open_position.call_args.kwargs
+        assert call_kwargs["side"] == "SELL"
+
+    def test_short_suppressed_at_max_positions(self, make_strategy_v2, make_params_v2):
+        """No short opened when max_short_positions already reached."""
+        params = make_params_v2(
+            operation_mode="tick",
+            rsi_overbought=70,
+            max_short_positions=1,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=80.0, close=100.0
+        )
+        strat._short_positions = [
+            {"deal_id": "EXISTING_S", "entry_price": 115.0, "size": 0.5}
+        ]
+        tick = {"bid": 110.0, "ofr": 111.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.open_position.assert_not_called()
+
+
+# =========================================================================== #
+# Tick mode — exit long [REQ-6]                                                 #
+# =========================================================================== #
+
+
+class TestTickExitLong:
+    """Long positions closed when bid > bb_upper and profit > 0 in tick mode [REQ-6]."""
+
+    def test_longs_closed_when_bid_above_bb_upper_and_profit_positive(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """All longs closed when bid > bb_upper and live spread profit > 0."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
+        )
+        # Long entered at 90; bid=110 > bb_upper=100; spread=1.0 → profit=(110-90-1)*0.5=9.5>0
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 90.0, "size": 0.5}]
+        tick = {"bid": 110.0, "ofr": 111.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.close_position.assert_called_once_with("L1", "SELL", 0.5)
+
+    def test_long_exit_suppressed_when_profit_not_positive(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Long not closed when bid > bb_upper but profit <= 0 (spread too high)."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
+        )
+        # Long at 110; bid=105 > bb_upper=100; spread=10 → profit=(105-110-10)*0.5 < 0
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 110.0, "size": 0.5}]
+        tick = {"bid": 105.0, "ofr": 115.0, "utm": 0}  # ofr-bid spread=10
+
+        strat._on_tick(tick)
+
+        mock_ig.close_position.assert_not_called()
+
+
+# =========================================================================== #
+# Tick mode — exit short [REQ-7]                                                #
+# =========================================================================== #
+
+
+class TestTickExitShort:
+    """Short positions closed when bid < bb_lower and profit > 0 in tick mode [REQ-7]."""
+
+    def test_shorts_closed_when_bid_below_bb_lower_and_profit_positive(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """All shorts closed when bid < bb_lower and live spread profit > 0."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
+        )
+        # Short entered at 110; bid=90 < bb_lower=100; spread=1.0 → profit=(110-90-1)*0.5=9.5>0
+        strat._short_positions = [{"deal_id": "S1", "entry_price": 110.0, "size": 0.5}]
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.close_position.assert_called_once_with("S1", "BUY", 0.5)
+
+    def test_short_exit_suppressed_when_profit_not_positive(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Short not closed when bid < bb_lower but profit <= 0."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
+        )
+        # Short at 90; bid=95 < bb_lower=100; spread=10 → profit=(90-95-10)*0.5 < 0
+        strat._short_positions = [{"deal_id": "S1", "entry_price": 90.0, "size": 0.5}]
+        tick = {"bid": 95.0, "ofr": 105.0, "utm": 0}  # ofr-bid=10
+
+        strat._on_tick(tick)
+
+        mock_ig.close_position.assert_not_called()

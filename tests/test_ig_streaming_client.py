@@ -16,6 +16,7 @@ from ig_streaming_client import (
     IGStreamingClient,
     TickAggregator,
     _CandleSubscriptionListener,
+    _DirectTickListener,
     _TickListener,
 )
 
@@ -618,6 +619,39 @@ class TestNativeFallbackToTick:
         # once for TICK (fallback)
         assert mock_ig_stream_service.subscribe.call_count == 2
 
+    def test_on_tick_with_tick_fallback_logs_warning_and_skips_direct_tick(
+        self, mock_ig_stream_service, mock_ig_service, caplog
+    ):
+        """When on_tick is provided but native fell back to tick aggregation,
+        a WARNING is logged and no third subscription (direct tick) is created."""
+        import logging
+
+        def raise_on_native_subscribe(sub):
+            if "5MINUTE" in sub._item_name:
+                raise RuntimeError("Subscription not available")
+            # Tick fallback subscription succeeds silently
+
+        mock_ig_stream_service.subscribe.side_effect = raise_on_native_subscribe
+
+        with caplog.at_level(logging.WARNING, logger="ig_streaming_client"):
+            with patch(
+                "ig_streaming_client.IGStreamService",
+                return_value=mock_ig_stream_service,
+            ):
+                client = IGStreamingClient(mock_ig_service, EPIC)
+                client.start(on_candle=MagicMock(), on_tick=MagicMock())
+                client.stop()
+
+        # Exactly two subscribe calls: native (raised) + tick fallback.
+        # The direct tick subscription must NOT be added as a third call.
+        assert mock_ig_stream_service.subscribe.call_count == 2
+
+        # A WARNING mentioning "tick" must have been emitted.
+        warning_text = " ".join(
+            r.message for r in caplog.records if r.levelno >= logging.WARNING
+        )
+        assert "tick" in warning_text.lower()
+
 
 # ---------------------------------------------------------------------------
 # Lifecycle: shutdown, idempotency, queue draining, LS callback naming
@@ -1096,3 +1130,117 @@ class TestWorkerDrainBudgetExceeded:
                 client._candle_queue.put({"candle_index": i})
 
             client.stop()  # must not raise even when drain budget is exceeded
+
+
+# =========================================================================== #
+# Tick mode — worker dispatch [REQ-11]                                          #
+# =========================================================================== #
+
+
+class TestWorkerDispatch:
+    """Worker loop routes by item 'type' key with backward-compat default [REQ-11]."""
+
+    def test_item_without_type_key_routes_to_on_candle(self):
+        """Item without 'type' key is treated as a candle — routes to on_candle."""
+        on_candle = MagicMock()
+        on_tick = MagicMock()
+
+        from ig_streaming_client import IGStreamingClient
+
+        client = IGStreamingClient(MagicMock(), EPIC)
+
+        # Pre-load an item without 'type' key
+        client._candle_queue.put({"bid": 1.0})
+        client._stop_event.set()  # so worker exits immediately after processing
+
+        # Run _worker_loop directly on this thread
+        client._worker_loop(on_candle, on_tick)
+
+        on_candle.assert_called_once()
+        on_tick.assert_not_called()
+
+    def test_item_with_type_tick_routes_to_on_tick(self):
+        """Item with type='tick' routes to on_tick callback."""
+        on_candle = MagicMock()
+        on_tick = MagicMock()
+
+        from ig_streaming_client import IGStreamingClient
+
+        client = IGStreamingClient(MagicMock(), EPIC)
+
+        tick_item = {"type": "tick", "bid": 1.0, "ofr": 1.1, "utm": 123}
+        client._candle_queue.put(tick_item)
+        client._stop_event.set()
+
+        client._worker_loop(on_candle, on_tick)
+
+        on_tick.assert_called_once_with(tick_item)
+        on_candle.assert_not_called()
+
+
+# =========================================================================== #
+# Tick mode — _DirectTickListener thread safety [REQ-12]                       #
+# =========================================================================== #
+
+
+class TestThreadSafety:
+    """_DirectTickListener.onItemUpdate only calls queue.put; no strategy state access [REQ-12]."""
+
+    def test_on_item_update_only_calls_queue_put(self):
+        """_DirectTickListener.onItemUpdate enqueues the tick dict and nothing else."""
+        from ig_streaming_client import _DirectTickListener
+
+        q = MagicMock()
+        listener = _DirectTickListener("CHART:TEST:TICK", q)
+
+        update = _FakeItemUpdate(
+            {
+                "BID": "100.5",
+                "OFR": "101.0",
+                "UTM": "1716825600000",
+            }
+        )
+
+        listener.onItemUpdate(update)
+
+        q.put.assert_called_once()
+        enqueued = q.put.call_args[0][0]
+        assert enqueued["type"] == "tick"
+        assert enqueued["bid"] == pytest.approx(100.5)
+        assert enqueued["ofr"] == pytest.approx(101.0)
+        assert enqueued["utm"] == 1716825600000
+
+
+# =========================================================================== #
+# Tick mode — dual subscription [REQ-10]                                        #
+# =========================================================================== #
+
+
+class TestDualSubscription:
+    """Two subscriptions created when on_tick provided; one when on_tick=None [REQ-10]."""
+
+    def test_two_subscriptions_created_when_on_tick_provided(
+        self, mock_ig_stream_service, mock_ig_service
+    ):
+        """When on_tick is not None, two Lightstreamer subscriptions are active."""
+        with patch(
+            "ig_streaming_client.IGStreamService", return_value=mock_ig_stream_service
+        ):
+            client = IGStreamingClient(mock_ig_service, EPIC)
+            client.start(on_candle=MagicMock(), on_tick=MagicMock())
+            client.stop()
+
+        assert mock_ig_stream_service.subscribe.call_count == 2
+
+    def test_one_subscription_created_when_on_tick_is_none(
+        self, mock_ig_stream_service, mock_ig_service
+    ):
+        """When on_tick=None, only the candle subscription is created."""
+        with patch(
+            "ig_streaming_client.IGStreamService", return_value=mock_ig_stream_service
+        ):
+            client = IGStreamingClient(mock_ig_service, EPIC)
+            client.start(on_candle=MagicMock(), on_tick=None)
+            client.stop()
+
+        assert mock_ig_stream_service.subscribe.call_count == 1

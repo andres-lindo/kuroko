@@ -95,6 +95,7 @@ def make_params_v2():
             "contract_size": 0.5,
             "min_dist_between_entries_ticks": 10,
             "take_profit_ticks": 50.0,
+            "operation_mode": "candle",
         }
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)
