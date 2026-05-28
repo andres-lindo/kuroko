@@ -2918,3 +2918,114 @@ class TestTickExitShort:
         strat._on_tick(tick)
 
         mock_ig.close_position.assert_not_called()
+
+
+# =========================================================================== #
+# Tick mode — close in-flight guards [REQ-10]                                  #
+# =========================================================================== #
+
+
+class TestTickCloseInFlightGuard:
+    """Close in-flight flags prevent duplicate REST close calls on back-to-back ticks [REQ-10]."""
+
+    def test_long_close_skipped_when_long_close_in_flight(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """When _tick_long_close_in_flight is True, long close is NOT attempted."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
+        )
+        # Long with positive profit when bid > bb_upper
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 90.0, "size": 0.5}]
+        strat._tick_long_close_in_flight = True
+        tick = {"bid": 110.0, "ofr": 111.0, "utm": 0}  # bid > bb_upper=100
+
+        strat._on_tick(tick)
+
+        mock_ig.close_position.assert_not_called()
+
+    def test_short_close_skipped_when_short_close_in_flight(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """When _tick_short_close_in_flight is True, short close is NOT attempted."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
+        )
+        # Short with positive profit when bid < bb_lower
+        strat._short_positions = [{"deal_id": "S1", "entry_price": 110.0, "size": 0.5}]
+        strat._tick_short_close_in_flight = True
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}  # bid < bb_lower=100
+
+        strat._on_tick(tick)
+
+        mock_ig.close_position.assert_not_called()
+
+    def test_long_close_in_flight_flag_reset_after_success(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """_tick_long_close_in_flight is False after a successful close REST call."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
+        )
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 90.0, "size": 0.5}]
+        tick = {"bid": 110.0, "ofr": 111.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        assert strat._tick_long_close_in_flight is False
+
+    def test_short_close_in_flight_flag_reset_after_success(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """_tick_short_close_in_flight is False after a successful close REST call."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
+        )
+        strat._short_positions = [{"deal_id": "S1", "entry_price": 110.0, "size": 0.5}]
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        assert strat._tick_short_close_in_flight is False
+
+    def test_long_close_in_flight_flag_reset_on_exception(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """_tick_long_close_in_flight is False even when close_position raises — finally fires."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
+        )
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 90.0, "size": 0.5}]
+        mock_ig.close_position.side_effect = RuntimeError("close REST error")
+        tick = {"bid": 110.0, "ofr": 111.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        assert strat._tick_long_close_in_flight is False
+
+    def test_short_close_in_flight_flag_reset_on_exception(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """_tick_short_close_in_flight is False even when close_position raises — finally fires."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
+        )
+        strat._short_positions = [{"deal_id": "S1", "entry_price": 110.0, "size": 0.5}]
+        mock_ig.close_position.side_effect = RuntimeError("close REST error")
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        assert strat._tick_short_close_in_flight is False

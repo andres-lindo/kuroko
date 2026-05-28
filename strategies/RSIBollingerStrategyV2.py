@@ -225,6 +225,8 @@ class RSIBollingerStrategyV2:
         # finally block — so it is always False after _on_tick returns.
         self._tick_long_in_flight: bool = False
         self._tick_short_in_flight: bool = False
+        self._tick_long_close_in_flight: bool = False
+        self._tick_short_close_in_flight: bool = False
 
         # Timestamp of the last REST candle loaded during warm-up.
         # Used by _on_candle to discard overlapping streaming candles.
@@ -911,16 +913,32 @@ class RSIBollingerStrategyV2:
         rsi = indicators["rsi"]
 
         # --- Long exit ---
-        if bid > bb_upper and self._long_positions:
-            self._long_positions = self._tick_close_positions(
-                self._long_positions, "SELL", bid, spread, "long"
-            )
+        if (
+            not self._tick_long_close_in_flight
+            and bid > bb_upper
+            and self._long_positions
+        ):
+            self._tick_long_close_in_flight = True
+            try:
+                self._long_positions = self._tick_close_positions(
+                    self._long_positions, "SELL", bid, spread, "long"
+                )
+            finally:
+                self._tick_long_close_in_flight = False
 
         # --- Short exit ---
-        if bid < bb_lower and self._short_positions:
-            self._short_positions = self._tick_close_positions(
-                self._short_positions, "BUY", bid, spread, "short"
-            )
+        if (
+            not self._tick_short_close_in_flight
+            and bid < bb_lower
+            and self._short_positions
+        ):
+            self._tick_short_close_in_flight = True
+            try:
+                self._short_positions = self._tick_close_positions(
+                    self._short_positions, "BUY", bid, spread, "short"
+                )
+            finally:
+                self._tick_short_close_in_flight = False
 
         # --- Long entry ---
         if (
