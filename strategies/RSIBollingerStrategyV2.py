@@ -801,16 +801,23 @@ class RSIBollingerStrategyV2:
     # Tick handler                                                             #
     # ---------------------------------------------------------------------- #
 
-    def _tick_try_open(self, side: str, bid: float) -> None:
+    def _tick_try_open(self, side: str, bid: float, spread: float) -> None:
         """Attempt to open a position via REST in tick mode.
 
         Sets the in-flight flag before the REST call and resets it in a
         finally block — guaranteeing the flag is always False after this
         method returns, even when the REST call raises.
 
+        For LONG (BUY) positions, ``spread`` is stored as ``entry_spread`` in
+        the position dict so that profit checks at exit time use the spread that
+        was active at open (i.e. the actual ask cost), not the potentially
+        narrower spread at the exit tick.
+
         Args:
             side: Trade direction — 'BUY' (long) or 'SELL' (short).
             bid: Current bid price used as the entry reference price.
+            spread: Live spread (ofr - bid) at the open tick. Stored for LONG
+                profit checks to avoid premature exits when spread narrows.
         """
         if side == "BUY":
             self._tick_long_in_flight = True
@@ -828,13 +835,16 @@ class RSIBollingerStrategyV2:
             )
             deal_id = _extract_deal_id(response)
             if deal_id != "unknown":
-                positions.append(
-                    {
-                        "deal_id": deal_id,
-                        "entry_price": bid,
-                        "size": self.params.contract_size,
-                    }
-                )
+                pos = {
+                    "deal_id": deal_id,
+                    "entry_price": bid,
+                    "size": self.params.contract_size,
+                }
+                if side == "BUY":
+                    # Store spread at open so LONG profit check uses the actual
+                    # ask cost (bid + spread_at_open), not the exit tick spread.
+                    pos["entry_spread"] = spread
+                positions.append(pos)
                 logger.info(f"Tick: opened {side} {deal_id} @ bid={bid:.2f}")
         except Exception as e:
             logger.error(f"Tick: failed to open {side}: {e}")
@@ -854,11 +864,22 @@ class RSIBollingerStrategyV2:
     ) -> list:
         """Close profitable positions and return those that should remain open.
 
+        For LONG positions, profit is calculated using the spread stored at
+        entry time (``pos["entry_spread"]``) rather than the current exit-tick
+        spread. This prevents premature closes when the spread narrows between
+        open and close — a common pattern in mean-reversion where entries fire
+        during volatile (wide-spread) spikes and exits fire during calmer
+        (tight-spread) recovery periods.
+
+        For SHORT positions, the exit-tick spread is correct because we pay
+        the ask price when buying back to close a short.
+
         Args:
             positions: Current position list (longs or shorts).
             close_side: REST close direction — 'SELL' for longs, 'BUY' for shorts.
             bid: Current bid price.
-            spread: Live spread (ofr - bid) from the tick.
+            spread: Live spread (ofr - bid) from the tick. Used for SHORT profit
+                checks; LONGs use their stored ``entry_spread`` instead.
             direction: 'long' or 'short' — used for profit calculation and logging.
 
         Returns:
@@ -868,7 +889,13 @@ class RSIBollingerStrategyV2:
         to_close = []
         to_keep = []
         for pos in positions:
-            profit = profit_fn(bid, pos["entry_price"], spread, pos["size"])
+            if direction == "long":
+                # Use the spread captured at entry so the profit check reflects
+                # the actual ask cost paid at open, not the current exit spread.
+                effective_spread = pos.get("entry_spread", spread)
+            else:
+                effective_spread = spread
+            profit = profit_fn(bid, pos["entry_price"], effective_spread, pos["size"])
             if profit > 0:
                 to_close.append(pos)
             else:
@@ -904,6 +931,7 @@ class RSIBollingerStrategyV2:
             return  # warmup gate — no candle processed yet
 
         if self._needs_reconciliation():
+            logger.debug("tick: reconciliation triggered")
             self._reconcile_positions()
 
         bid = tick["bid"]
@@ -912,12 +940,31 @@ class RSIBollingerStrategyV2:
         bb_lower = indicators["bb_lower"]
         rsi = indicators["rsi"]
 
+        logger.debug(
+            "tick bid=%.5f ask=%.5f spread=%.5f | bb_lower=%.5f bb_upper=%.5f rsi=%.2f"
+            " | longs=%d shorts=%d",
+            bid,
+            tick["ofr"],
+            spread,
+            bb_lower,
+            bb_upper,
+            rsi,
+            len(self._long_positions),
+            len(self._short_positions),
+        )
+
         # --- Long exit ---
         if (
             not self._tick_long_close_in_flight
             and bid > bb_upper
             and self._long_positions
         ):
+            logger.debug(
+                "tick long_exit: triggered bid=%.5f > bb_upper=%.5f positions=%d",
+                bid,
+                bb_upper,
+                len(self._long_positions),
+            )
             self._tick_long_close_in_flight = True
             try:
                 self._long_positions = self._tick_close_positions(
@@ -925,6 +972,10 @@ class RSIBollingerStrategyV2:
                 )
             finally:
                 self._tick_long_close_in_flight = False
+        elif (
+            self._tick_long_close_in_flight and bid > bb_upper and self._long_positions
+        ):
+            logger.debug("tick long_exit: skipped (in_flight) bid=%.5f", bid)
 
         # --- Short exit ---
         if (
@@ -932,6 +983,12 @@ class RSIBollingerStrategyV2:
             and bid < bb_lower
             and self._short_positions
         ):
+            logger.debug(
+                "tick short_exit: triggered bid=%.5f < bb_lower=%.5f positions=%d",
+                bid,
+                bb_lower,
+                len(self._short_positions),
+            )
             self._tick_short_close_in_flight = True
             try:
                 self._short_positions = self._tick_close_positions(
@@ -939,6 +996,12 @@ class RSIBollingerStrategyV2:
                 )
             finally:
                 self._tick_short_close_in_flight = False
+        elif (
+            self._tick_short_close_in_flight
+            and bid < bb_lower
+            and self._short_positions
+        ):
+            logger.debug("tick short_exit: skipped (in_flight) bid=%.5f", bid)
 
         # --- Long entry ---
         if (
@@ -953,9 +1016,20 @@ class RSIBollingerStrategyV2:
                 if not _distance_ok(
                     bid, last_entry, self.params.min_dist_between_entries_ticks
                 ):
-                    _long_dist_ok = False  # distance guard — skip entry
+                    _long_dist_ok = False
+                    logger.debug(
+                        "tick long_entry: skipped (distance guard) bid=%.5f last_entry=%.5f",
+                        bid,
+                        last_entry,
+                    )
             if _long_dist_ok:
-                self._tick_try_open("BUY", bid)
+                logger.debug(
+                    "tick long_entry: triggered bid=%.5f < bb_lower=%.5f rsi=%.2f",
+                    bid,
+                    bb_lower,
+                    rsi,
+                )
+                self._tick_try_open("BUY", bid, spread)
 
         # --- Short entry ---
         if (
@@ -970,9 +1044,20 @@ class RSIBollingerStrategyV2:
                 if not _distance_ok(
                     bid, last_entry, self.params.min_dist_between_entries_ticks
                 ):
-                    _short_dist_ok = False  # distance guard — skip entry
+                    _short_dist_ok = False
+                    logger.debug(
+                        "tick short_entry: skipped (distance guard) bid=%.5f last_entry=%.5f",
+                        bid,
+                        last_entry,
+                    )
             if _short_dist_ok:
-                self._tick_try_open("SELL", bid)
+                logger.debug(
+                    "tick short_entry: triggered bid=%.5f > bb_upper=%.5f rsi=%.2f",
+                    bid,
+                    bb_upper,
+                    rsi,
+                )
+                self._tick_try_open("SELL", bid, spread)
 
     # ---------------------------------------------------------------------- #
     # Main loop                                                                #
