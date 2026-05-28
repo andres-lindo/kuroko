@@ -10,6 +10,8 @@ All broker interactions are mocked — no live credentials required.
 import types
 import queue
 import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -25,6 +27,7 @@ def _make_params(**overrides) -> types.SimpleNamespace:
     """Return a minimal valid V2 SimpleNamespace params object."""
     defaults = {
         "api_mode": "streaming",
+        "candle_frequency": "5min",
         "bb_period": 20,
         "bb_std": 2.0,
         "rsi_period": 14,
@@ -1111,3 +1114,330 @@ class TestCandleKeyValidation:
         # Candle must be silently dropped — no position management must occur
         mock_ig.open_position.assert_not_called()
         mock_ig.close_position.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# REST candle warm-up                                                           #
+# --------------------------------------------------------------------------- #
+
+
+def _make_warmup_dataframe(n_rows: int, base_price: float = 100.0) -> pd.DataFrame:
+    """Return a minimal REST DataFrame with n_rows of OHLC data.
+
+    Columns match IGClient.get_candles() output: Open, High, Low, Close.
+    Index is a DatetimeIndex (UTC) with 5-min spacing.
+    """
+    idx = pd.date_range(
+        start=datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc),
+        periods=n_rows,
+        freq="5min",
+    )
+    data = {
+        "Open": [base_price] * n_rows,
+        "High": [base_price + 5] * n_rows,
+        "Low": [base_price - 5] * n_rows,
+        "Close": [base_price + i * 0.1 for i in range(n_rows)],
+    }
+    return pd.DataFrame(data, index=idx)
+
+
+class TestWarmupFillsWindow:
+    """_warmup() fetches REST candles and fills _candle_window directly from Close prices."""
+
+    def test_warmup_fills_candle_window_to_num_candles(self):
+        """After _warmup, len(_candle_window) == num_candles fetched."""
+        strat, mock_ig, _ = _make_strategy()
+        num_candles = max(strat.params.bb_period, strat.params.rsi_period) + 1  # 21
+        df = _make_warmup_dataframe(num_candles)
+        mock_ig.get_candles.return_value = df
+
+        strat._warmup()
+
+        assert len(strat._candle_window) == num_candles
+
+    def test_warmup_window_contains_close_prices(self):
+        """_warmup appends Close prices (floats) directly — not candle dicts."""
+        strat, mock_ig, _ = _make_strategy()
+        num_candles = max(strat.params.bb_period, strat.params.rsi_period) + 1
+        df = _make_warmup_dataframe(num_candles, base_price=200.0)
+        mock_ig.get_candles.return_value = df
+
+        strat._warmup()
+
+        # All values in the window must be floats (Close prices), not dicts
+        for val in strat._candle_window:
+            assert isinstance(val, float)
+        # First value matches first Close
+        assert list(strat._candle_window)[0] == pytest.approx(df["Close"].iloc[0])
+
+    def test_warmup_sets_last_warmup_ts_to_last_row(self):
+        """_last_warmup_ts equals the datetime of the last REST row."""
+        strat, mock_ig, _ = _make_strategy()
+        num_candles = max(strat.params.bb_period, strat.params.rsi_period) + 1
+        df = _make_warmup_dataframe(num_candles)
+        mock_ig.get_candles.return_value = df
+
+        strat._warmup()
+
+        expected_ts = df.index[-1].to_pydatetime()
+        assert strat._last_warmup_ts == expected_ts
+
+
+class TestWarmupGracefulDegradation:
+    """_warmup() handles REST failure without crashing the strategy."""
+
+    def test_warmup_none_response_does_not_raise(self):
+        """Task 2.5 RED: when get_candles returns None, _warmup must not raise."""
+        strat, mock_ig, _ = _make_strategy()
+        mock_ig.get_candles.return_value = None
+
+        try:
+            strat._warmup()
+        except Exception as exc:
+            pytest.fail(f"_warmup raised on None response: {exc}")
+
+    def test_warmup_none_response_leaves_candle_window_empty(self):
+        """Task 2.5: when get_candles returns None, _candle_window stays empty."""
+        strat, mock_ig, _ = _make_strategy()
+        mock_ig.get_candles.return_value = None
+
+        strat._warmup()
+
+        assert len(strat._candle_window) == 0
+
+    def test_warmup_none_response_leaves_last_warmup_ts_as_none(self):
+        """Task 2.5: when get_candles returns None, _last_warmup_ts remains None."""
+        strat, mock_ig, _ = _make_strategy()
+        mock_ig.get_candles.return_value = None
+
+        strat._warmup()
+
+        assert strat._last_warmup_ts is None
+
+    def test_warmup_exception_during_get_candles_is_caught(self):
+        """Task 2.5: an exception raised by get_candles is caught; no exception propagates."""
+        strat, mock_ig, _ = _make_strategy()
+        mock_ig.get_candles.side_effect = RuntimeError("REST timeout")
+
+        try:
+            strat._warmup()
+        except Exception as exc:
+            pytest.fail(f"_warmup propagated exception: {exc}")
+
+        assert len(strat._candle_window) == 0
+        assert strat._last_warmup_ts is None
+
+    def test_warmup_empty_dataframe_does_not_raise(self):
+        """When get_candles returns an empty DataFrame (0 rows), _warmup must not raise."""
+        strat, mock_ig, _ = _make_strategy()
+        mock_ig.get_candles.return_value = pd.DataFrame()
+
+        try:
+            strat._warmup()
+        except Exception as exc:
+            pytest.fail(f"_warmup raised on empty DataFrame: {exc}")
+
+    def test_warmup_empty_dataframe_leaves_candle_window_empty(self):
+        """When get_candles returns an empty DataFrame, _candle_window must remain empty."""
+        strat, mock_ig, _ = _make_strategy()
+        mock_ig.get_candles.return_value = pd.DataFrame()
+
+        strat._warmup()
+
+        assert len(strat._candle_window) == 0
+
+    def test_warmup_empty_dataframe_leaves_last_warmup_ts_as_none(self):
+        """When get_candles returns an empty DataFrame, _last_warmup_ts must remain None."""
+        strat, mock_ig, _ = _make_strategy()
+        mock_ig.get_candles.return_value = pd.DataFrame()
+
+        strat._warmup()
+
+        assert strat._last_warmup_ts is None
+
+
+class TestDedupGuard:
+    """_on_candle dedup guard skips candles that overlap REST warm-up data."""
+
+    def test_dedup_skips_candle_with_timestamp_equal_to_last_warmup_ts(self):
+        """Task 3.1 RED: candle with timestamp == _last_warmup_ts must NOT be appended."""
+        strat, _, _ = _make_strategy()
+        t0 = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+        strat._last_warmup_ts = t0
+        # Pre-fill window so indicators would be computed if the candle were processed
+        initial_len = 5
+        for _ in range(initial_len):
+            strat._candle_window.append(100.0)
+
+        overlap_candle = _make_candle(close=100.0)
+        overlap_candle["timestamp"] = t0
+
+        strat._on_candle(overlap_candle)
+
+        assert len(strat._candle_window) == initial_len
+
+    def test_dedup_skips_candle_with_timestamp_before_last_warmup_ts(self):
+        """Task 3.1: candle with timestamp < _last_warmup_ts is also discarded."""
+        strat, _, _ = _make_strategy()
+        t0 = datetime(2026, 1, 1, 9, 5, tzinfo=timezone.utc)
+        strat._last_warmup_ts = t0
+        initial_len = 5
+        for _ in range(initial_len):
+            strat._candle_window.append(100.0)
+
+        older_candle = _make_candle(close=100.0)
+        older_candle["timestamp"] = t0 - timedelta(minutes=5)
+
+        strat._on_candle(older_candle)
+
+        assert len(strat._candle_window) == initial_len
+
+    def test_dedup_allows_newer_candle(self):
+        """Task 3.2 RED: candle with timestamp > _last_warmup_ts IS appended."""
+        strat, _, _ = _make_strategy()
+        t0 = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+        strat._last_warmup_ts = t0
+        initial_len = 5
+        for _ in range(initial_len):
+            strat._candle_window.append(100.0)
+
+        newer_candle = _make_candle(close=100.0)
+        newer_candle["timestamp"] = t0 + timedelta(minutes=5)
+
+        strat._on_candle(newer_candle)
+
+        assert len(strat._candle_window) == initial_len + 1
+
+    def test_dedup_not_active_when_last_warmup_ts_is_none(self):
+        """Cold-start: when _last_warmup_ts is None, all candles are processed normally."""
+        strat, _, _ = _make_strategy()
+        assert strat._last_warmup_ts is None
+        initial_len = 5
+        for _ in range(initial_len):
+            strat._candle_window.append(100.0)
+
+        candle = _make_candle(close=100.0)
+        candle["timestamp"] = datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc)
+
+        strat._on_candle(candle)
+
+        assert len(strat._candle_window) == initial_len + 1
+
+    def test_dedup_handles_aware_warmup_ts_vs_naive_candle_ts_duplicate(self):
+        """Dedup guard works when _last_warmup_ts is UTC-aware and candle ts is naive (same wall-clock)."""
+        strat, _, _ = _make_strategy()
+        # Warmup sets an aware UTC timestamp
+        strat._last_warmup_ts = datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc)
+        initial_len = 5
+        for _ in range(initial_len):
+            strat._candle_window.append(100.0)
+
+        # Streaming candle arrives with a naive timestamp at the same wall-clock value
+        overlap_candle = _make_candle(close=100.0)
+        overlap_candle["timestamp"] = datetime(
+            2026, 1, 1, 0, 5
+        )  # naive, same UTC moment
+
+        strat._on_candle(overlap_candle)
+
+        # Must be deduplicated — window size unchanged
+        assert len(strat._candle_window) == initial_len
+
+    def test_dedup_handles_aware_warmup_ts_vs_naive_newer_candle_ts(self):
+        """Dedup guard correctly passes candles when _last_warmup_ts is aware and candle ts is naive but newer."""
+        strat, _, _ = _make_strategy()
+        strat._last_warmup_ts = datetime(2026, 1, 1, 0, 5, tzinfo=timezone.utc)
+        initial_len = 5
+        for _ in range(initial_len):
+            strat._candle_window.append(100.0)
+
+        # Streaming candle arrives with a naive timestamp that is NEWER
+        newer_candle = _make_candle(close=100.0)
+        newer_candle["timestamp"] = datetime(2026, 1, 1, 0, 10)  # naive, 5 min later
+
+        strat._on_candle(newer_candle)
+
+        # Must be processed — window grows by 1
+        assert len(strat._candle_window) == initial_len + 1
+
+
+class TestIndicatorsValidAfterWarmup:
+    """After a full warm-up, the first streaming candle produces valid indicators."""
+
+    def test_indicators_valid_immediately_after_warmup(self):
+        """Task 3.4 RED: after warmup with min_required candles, _compute_indicators returns non-None."""
+        strat, mock_ig, _ = _make_strategy()
+        num_candles = max(strat.params.bb_period, strat.params.rsi_period) + 1
+        df = _make_warmup_dataframe(num_candles, base_price=100.0)
+        mock_ig.get_candles.return_value = df
+
+        strat._warmup()
+
+        # The next fresh candle (after warmup) should produce valid indicators
+        # because the window is already at min_required
+        # _compute_indicators appends to window first, so we need min_required already there
+        # After warmup, window has num_candles entries. One more candle will result in
+        # window size of min_required + 1 (due to deque maxlen) which is still >= min_required
+        fresh_ts = df.index[-1].to_pydatetime() + timedelta(minutes=5)
+        fresh_candle = _make_candle(close=101.0)
+        fresh_candle["timestamp"] = fresh_ts
+
+        result = strat._compute_indicators(fresh_candle)
+
+        assert result is not None
+        assert "bb_upper" in result
+        assert "rsi" in result
+
+
+# --------------------------------------------------------------------------- #
+# Warmup → streaming handoff via _on_candle                                   #
+# --------------------------------------------------------------------------- #
+
+
+class TestOnCandleAfterWarmup:
+    """_on_candle must route to trade logic after warmup completes."""
+
+    def test_on_candle_calls_manage_longs_after_warmup(self):
+        """After _warmup(), a new streaming candle via _on_candle must call _manage_longs/_manage_shorts.
+
+        Verifies the full warmup → streaming handoff: window is pre-filled by
+        _warmup() directly from Close prices, then _on_candle() with a post-warmup
+        timestamp must produce valid indicators and invoke trade management methods.
+        """
+        strat, mock_ig, _ = _make_strategy()
+        num_candles = max(strat.params.bb_period, strat.params.rsi_period) + 1
+        df = _make_warmup_dataframe(num_candles, base_price=100.0)
+        mock_ig.get_candles.return_value = df
+
+        strat._warmup()
+
+        # Build a streaming candle timestamped after the last warmup candle
+        fresh_ts = df.index[-1].to_pydatetime() + timedelta(minutes=5)
+        streaming_candle = _make_candle(close=101.0)
+        streaming_candle["timestamp"] = fresh_ts
+
+        with (
+            patch.object(strat, "_manage_longs") as mock_longs,
+            patch.object(strat, "_manage_shorts") as mock_shorts,
+        ):
+            strat._on_candle(streaming_candle)
+
+        # Both trade management methods must be called — indicators are valid
+        mock_longs.assert_called_once()
+        mock_shorts.assert_called_once()
+
+    def test_warmup_does_not_call_on_candle(self):
+        """_warmup() fills _candle_window directly — it must NOT call _on_candle at all.
+
+        Since _warmup() no longer routes through _on_candle(), trade logic
+        cannot fire on warm-up data regardless of window fill level.
+        """
+        strat, mock_ig, _ = _make_strategy()
+        num_candles = max(strat.params.bb_period, strat.params.rsi_period) + 1
+        df = _make_warmup_dataframe(num_candles, base_price=100.0)
+        mock_ig.get_candles.return_value = df
+
+        with patch.object(strat, "_on_candle") as mock_on_candle:
+            strat._warmup()
+
+        mock_on_candle.assert_not_called()

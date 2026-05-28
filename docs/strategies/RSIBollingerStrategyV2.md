@@ -26,6 +26,49 @@ differences from V1:
 
 ---
 
+## Startup Lifecycle and Warm-Up
+
+`run()` executes the following sequence on startup:
+
+1. **`_warmup()`** — fetches `max(bb_period, rsi_period) + 1` historical candles
+   from the REST API via `IGClient.get_candles()` and appends each row's `Close`
+   price directly to `_candle_window`. This pre-fills the window so that indicators
+   are valid on the very first live streaming candle.
+2. **`streaming_client.start(_on_candle)`** — opens the Lightstreamer connection
+   and begins delivering live candles.
+3. **`_stop_event.wait()`** — blocks until `stop()` is called.
+
+### Warm-up details
+
+`_warmup()` calls `IGClient.get_candles(epic, candle_frequency, num_candles)`,
+where `num_candles = max(bb_period, rsi_period) + 1`. The returned DataFrame has
+capitalized OHLC columns (`Open`, `High`, `Low`, `Close`) and a `DatetimeIndex`.
+
+Each row's `Close` price is appended directly to `_candle_window` as a float.
+No conversion to a candle dict is performed and `_on_candle()` is not called
+during warm-up, so trading logic cannot fire on REST data regardless of window
+fill level.
+
+### `_last_warmup_ts` — deduplication guard
+
+After warm-up, `_last_warmup_ts` holds the `datetime` of the last REST candle
+processed. `_on_candle()` silently discards any incoming streaming candle whose
+`timestamp <= _last_warmup_ts`, preventing double-counting at a candle boundary.
+Both timestamps are normalized to naive UTC before comparison so that aware and
+naive datetimes (from REST and streaming sources respectively) compare correctly.
+
+`_last_warmup_ts` defaults to `None`. When `None`, the guard is a no-op and all
+streaming candles are processed normally (cold-start behavior).
+
+### Graceful degradation
+
+If `get_candles()` returns `None` or raises an exception, `_warmup()` logs a
+WARNING and returns without filling the window. The strategy proceeds to streaming
+with an empty candle window — identical to the previous cold-start behavior. There
+is no abort, no retry (the underlying `get_candles` already retries internally).
+
+---
+
 ## Data Source
 
 Candles come from `IGStreamingClient`, which subscribes to

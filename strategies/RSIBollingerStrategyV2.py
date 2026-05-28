@@ -12,6 +12,8 @@ import sys
 import types
 import threading
 import logging
+from datetime import datetime, timezone
+
 import talib as ta
 import numpy as np
 
@@ -188,6 +190,11 @@ class RSIBollingerStrategyV2:
         # Stop event — set by stop() to signal run() to exit
         self._stop_event: threading.Event = threading.Event()
 
+        # Timestamp of the last REST candle loaded during warm-up.
+        # Used by _on_candle to discard overlapping streaming candles.
+        # None when no warm-up has run (cold-start behavior — no dedup filtering).
+        self._last_warmup_ts: datetime | None = None
+
     # ---------------------------------------------------------------------- #
     # Indicator computation                                                    #
     # ---------------------------------------------------------------------- #
@@ -261,6 +268,64 @@ class RSIBollingerStrategyV2:
         if spread is not None:
             self._current_spread = float(spread)
             logger.debug(f"Spread updated from candle: {self._current_spread:.4f}")
+
+    # ---------------------------------------------------------------------- #
+    # REST warm-up                                                             #
+    # ---------------------------------------------------------------------- #
+
+    def _warmup(self) -> None:
+        """Pre-fill the candle window from REST historical data before streaming starts.
+
+        Fetches max(bb_period, rsi_period) + 1 candles via IGClient.get_candles()
+        and appends each row's Close price directly to _candle_window. Sets
+        _last_warmup_ts to the last REST candle's timestamp so that _on_candle
+        can discard overlapping streaming candles.
+
+        On failure (None response or any exception), logs a WARNING and returns early.
+        The strategy then starts in cold-start mode with an empty candle window.
+        """
+        num_candles = max(self.params.bb_period, self.params.rsi_period) + 1
+        logger.info(
+            f"Warm-up starting: fetching {num_candles} historical candles "
+            f"({self.params.candle_frequency}) for {self.epic}."
+        )
+        try:
+            df = self.ig.get_candles(
+                self.epic, self.params.candle_frequency, num_candles
+            )
+
+            if df is None:
+                logger.warning(
+                    "Warm-up skipped — get_candles returned None. "
+                    "Falling back to cold-start."
+                )
+                return
+
+            if df.empty:
+                logger.warning("Warm-up skipped — get_candles returned 0 rows.")
+                return
+
+            loaded = 0
+            for _, row in df.iterrows():
+                self._candle_window.append(float(row["Close"]))
+                loaded += 1
+
+            self._last_warmup_ts = df.index[-1].to_pydatetime()
+
+            if loaded < num_candles:
+                logger.warning(
+                    f"Warm-up partial: {loaded}/{num_candles} candles loaded."
+                )
+            else:
+                logger.info(
+                    f"Warm-up complete: {loaded} candles loaded into candle window."
+                )
+
+        except Exception as e:
+            logger.warning(
+                f"Warm-up skipped — exception during warm-up: {e}. "
+                f"Falling back to cold-start."
+            )
 
     # ---------------------------------------------------------------------- #
     # Long grid management                                                     #
@@ -527,6 +592,20 @@ class RSIBollingerStrategyV2:
             )
             return
 
+        if self._last_warmup_ts is not None and candle.get("timestamp") is not None:
+            candle_ts = candle["timestamp"]
+            warmup_ts = self._last_warmup_ts
+            # Normalize both to naive UTC for safe comparison — both sources use UTC
+            if candle_ts.tzinfo is not None:
+                candle_ts = candle_ts.astimezone(timezone.utc).replace(tzinfo=None)
+            if warmup_ts.tzinfo is not None:
+                warmup_ts = warmup_ts.astimezone(timezone.utc).replace(tzinfo=None)
+            if candle_ts <= warmup_ts:
+                logger.debug(
+                    f"Skipping duplicate candle (warmup overlap): ts={candle['timestamp']}"
+                )
+                return
+
         if self._needs_reconciliation():
             self._reconcile_positions()
 
@@ -558,6 +637,7 @@ class RSIBollingerStrategyV2:
         """
         logger.info("RSIBollingerStrategyV2 starting.")
         self._stop_event.clear()
+        self._warmup()
         self.streaming_client.start(self._on_candle)
         self._stop_event.wait()
         logger.info("RSIBollingerStrategyV2 stopped.")
