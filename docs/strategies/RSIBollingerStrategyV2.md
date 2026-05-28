@@ -54,8 +54,13 @@ fill level.
 After warm-up, `_last_warmup_ts` holds the `datetime` of the last REST candle
 processed. `_on_candle()` silently discards any incoming streaming candle whose
 `timestamp <= _last_warmup_ts`, preventing double-counting at a candle boundary.
-Both timestamps are normalized to naive UTC before comparison so that aware and
-naive datetimes (from REST and streaming sources respectively) compare correctly.
+
+`_last_warmup_ts` is stored as a **UTC-aware** `datetime`. The IG REST API
+returns `snapshotTime` in London local time (naive). `_warmup()` localizes the
+last candle's naive timestamp to `Europe/London` and converts it to UTC before
+storing, so the value is timezone-correct regardless of the machine's local
+timezone. At comparison time in `_on_candle()`, both the candle timestamp and
+`_last_warmup_ts` are normalized to naive UTC before the `<=` check.
 
 `_last_warmup_ts` defaults to `None`. When `None`, the guard is a no-op and all
 streaming candles are processed normally (cold-start behavior).

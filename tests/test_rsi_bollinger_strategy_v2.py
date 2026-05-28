@@ -18,6 +18,7 @@ import types
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -1118,10 +1119,12 @@ def _make_warmup_dataframe(n_rows: int, base_price: float = 100.0) -> pd.DataFra
     """Return a minimal REST DataFrame with n_rows of OHLC data.
 
     Columns match IGClient.get_candles() output: Open, High, Low, Close.
-    Index is a DatetimeIndex (UTC) with 5-min spacing.
+    Index is a naive DatetimeIndex representing London local time, matching
+    the real IG REST API snapshotTime format (Europe/London, no tzinfo).
+    Jan 1 is used (UTC == London in winter) to keep expected UTC values simple.
     """
     idx = pd.date_range(
-        start=datetime(2026, 1, 1, 9, 0, tzinfo=timezone.utc),
+        start=datetime(2026, 1, 1, 9, 0),  # naive London local (winter → == UTC)
         periods=n_rows,
         freq="5min",
     )
@@ -1163,8 +1166,13 @@ class TestWarmupFillsWindow:
         # First value matches first Close
         assert list(strat._candle_window)[0] == pytest.approx(df["Close"].iloc[0])
 
-    def test_warmup_sets_last_warmup_ts_to_last_row(self, make_strategy_v2):
-        """_last_warmup_ts equals the datetime of the last REST row."""
+    def test_warmup_sets_last_warmup_ts_to_utc_aware_datetime(self, make_strategy_v2):
+        """_last_warmup_ts is a UTC-aware datetime derived from the last REST row.
+
+        IG REST returns naive London-local timestamps. _warmup() localises the
+        last row to Europe/London and converts to UTC. On Jan 1 (winter) London
+        == UTC, so the numeric value matches the naive index timestamp.
+        """
         strat, mock_ig, _ = make_strategy_v2()
         num_candles = max(strat.params.bb_period, strat.params.rsi_period) + 1
         df = _make_warmup_dataframe(num_candles)
@@ -1172,8 +1180,53 @@ class TestWarmupFillsWindow:
 
         strat._warmup()
 
-        expected_ts = df.index[-1].to_pydatetime()
-        assert strat._last_warmup_ts == expected_ts
+        # Must be UTC-aware (not naive)
+        assert strat._last_warmup_ts is not None
+        assert strat._last_warmup_ts.tzinfo is not None
+        assert strat._last_warmup_ts.tzinfo == timezone.utc
+        # Jan 1 winter: London == UTC, so numeric value matches the naive index ts
+        last_naive = df.index[-1].to_pydatetime().replace(tzinfo=None)
+        expected_utc = last_naive.replace(tzinfo=ZoneInfo("Europe/London")).astimezone(
+            timezone.utc
+        )
+        assert strat._last_warmup_ts == expected_utc
+
+    def test_warmup_bst_timestamp_converted_to_utc(self, make_strategy_v2):
+        """_last_warmup_ts is UTC-aware and 1 hour behind the naive London BST value.
+
+        Regression test for Bug 2: the old code stored df.index[-1].to_pydatetime()
+        directly as _last_warmup_ts — a naive datetime representing London local time.
+        During BST (UTC+1) this naive value is 1 hour ahead of its true UTC equivalent,
+        causing the dedup guard to filter valid streaming candles that arrive at the
+        correct UTC time.
+
+        The fix localises the naive London timestamp to Europe/London and converts
+        to UTC so _last_warmup_ts always represents the correct UTC moment.
+        """
+        strat, mock_ig, _ = make_strategy_v2()
+        # Build a DataFrame with naive BST timestamps (July, UTC+1)
+        # Last row: 2026-07-01 18:20 London local == 2026-07-01 17:20 UTC
+        _LONDON = ZoneInfo("Europe/London")
+        bst_naive = datetime(2026, 7, 1, 18, 20)  # naive London BST
+        idx = pd.DatetimeIndex([bst_naive - timedelta(minutes=5), bst_naive])
+        df = pd.DataFrame(
+            {
+                "Open": [100, 101],
+                "High": [105, 106],
+                "Low": [95, 96],
+                "Close": [102.0, 103.0],
+            },
+            index=idx,
+        )
+        mock_ig.get_candles.return_value = df
+
+        strat._warmup()
+
+        assert strat._last_warmup_ts is not None
+        assert strat._last_warmup_ts.tzinfo is not None
+        # Expected: 18:20 London BST → 17:20 UTC
+        expected_utc = datetime(2026, 7, 1, 17, 20, tzinfo=timezone.utc)
+        assert strat._last_warmup_ts == expected_utc
 
 
 class TestWarmupGracefulDegradation:
@@ -1353,6 +1406,61 @@ class TestDedupGuard:
 
         # Must be processed — window grows by 1
         assert len(strat._candle_window) == initial_len + 1
+
+    def test_dedup_bst_streaming_candle_not_filtered_by_utc_warmup_ts(
+        self, make_strategy_v2
+    ):
+        """Regression for Bug 3: a valid streaming candle at 17:25 UTC must NOT be
+        filtered when _last_warmup_ts is correctly set to 17:20 UTC (BST).
+
+        The old bug: _last_warmup_ts was naive London BST (18:20), warmup_ts.tzinfo
+        was None so dedup stripped tz from candle_ts (17:25 UTC → naive 17:25), then
+        compared 17:25 <= 18:20 → True → valid candle was incorrectly discarded.
+
+        After the fix: _last_warmup_ts is 17:20 UTC-aware. Dedup converts both to
+        naive UTC: 17:25 > 17:20 → candle is correctly passed through.
+        """
+        strat, _, _ = make_strategy_v2()
+        # Warmup ts correctly set to 17:20 UTC (after BST fix)
+        warmup_utc = datetime(2026, 7, 1, 17, 20, tzinfo=timezone.utc)
+        strat._last_warmup_ts = warmup_utc
+        initial_len = 5
+        for _ in range(initial_len):
+            strat._candle_window.append(100.0)
+
+        # Streaming candle arrives at 17:25 UTC (correct — 5 min after last warmup)
+        streaming_candle = _make_candle(close=100.0)
+        streaming_candle["timestamp"] = datetime(
+            2026, 7, 1, 17, 25, tzinfo=timezone.utc
+        )
+
+        strat._on_candle(streaming_candle)
+
+        # Candle must NOT be deduplicated — window grows
+        assert len(strat._candle_window) == initial_len + 1
+
+    def test_dedup_bst_streaming_candle_filtered_when_duplicate(self, make_strategy_v2):
+        """After the BST fix, a streaming candle at the same UTC moment as warmup
+        is still correctly deduplicated (candle_ts == warmup_ts).
+        """
+        strat, _, _ = make_strategy_v2()
+        # Warmup ts at 17:20 UTC (after BST fix)
+        warmup_utc = datetime(2026, 7, 1, 17, 20, tzinfo=timezone.utc)
+        strat._last_warmup_ts = warmup_utc
+        initial_len = 5
+        for _ in range(initial_len):
+            strat._candle_window.append(100.0)
+
+        # Streaming candle at exactly the same UTC moment — should be filtered
+        duplicate_candle = _make_candle(close=100.0)
+        duplicate_candle["timestamp"] = datetime(
+            2026, 7, 1, 17, 20, tzinfo=timezone.utc
+        )
+
+        strat._on_candle(duplicate_candle)
+
+        # Must be deduplicated — window unchanged
+        assert len(strat._candle_window) == initial_len
 
 
 class TestIndicatorsValidAfterWarmup:

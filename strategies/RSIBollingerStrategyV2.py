@@ -13,6 +13,7 @@ import types
 import threading
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import talib as ta
 import numpy as np
@@ -342,9 +343,16 @@ class RSIBollingerStrategyV2:
                 self._candle_window.append(float(row["Close"]))
                 loaded += 1
 
-            self._last_warmup_ts = df.index[-1].to_pydatetime()
+            # IG REST snapshotTime is London local time (naive). Localise to
+            # Europe/London then convert to UTC so dedup comparisons in
+            # _on_candle work correctly against the UTC-aware streaming UTM.
+            _LONDON = ZoneInfo("Europe/London")
+            last_ts_naive = df.index[-1].to_pydatetime().replace(tzinfo=None)
+            self._last_warmup_ts = last_ts_naive.replace(tzinfo=_LONDON).astimezone(
+                timezone.utc
+            )
             logger.debug(
-                f"Warm-up: last REST candle ts={self._last_warmup_ts} "
+                f"Warm-up: last REST candle ts={self._last_warmup_ts} (UTC) "
                 f"window_size={len(self._candle_window)}"
             )
 

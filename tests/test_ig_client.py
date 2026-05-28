@@ -7,7 +7,8 @@ All network calls and time.sleep are mocked.
 """
 
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from unittest.mock import MagicMock, call, patch
 
 import pandas as pd
@@ -180,7 +181,19 @@ class TestSafeApiCall:
 
 
 class TestRemoveIncompleteCandle:
-    """Tests for IGClient._remove_incomplete_candle."""
+    """Tests for IGClient._remove_incomplete_candle.
+
+    IG REST API returns snapshotTime in London local time (naive, no tzinfo).
+    All test DataFrames must use naive London-local timestamps to match the
+    real API contract. _remove_incomplete_candle localises them to
+    Europe/London and converts to UTC for comparison with datetime.now(UTC).
+    """
+
+    _LONDON = ZoneInfo("Europe/London")
+
+    def _london_now(self) -> datetime:
+        """Return the current time as a naive London-local datetime (no tzinfo)."""
+        return datetime.now(self._LONDON).replace(second=0, microsecond=0, tzinfo=None)
 
     def test_empty_dataframe_returned_unchanged(self, tmp_path):
         client, _ = _make_client(tmp_path)
@@ -192,10 +205,10 @@ class TestRemoveIncompleteCandle:
 
     def test_last_candle_matching_now_is_dropped(self, tmp_path):
         client, _ = _make_client(tmp_path)
-        now = datetime.now().replace(second=0, microsecond=0)
-        # Place last candle exactly at the current minute
-        past = now - timedelta(minutes=15)
-        index = pd.DatetimeIndex([past, now])
+        # Use naive London-local "now" — matches what IG REST returns
+        now_london = self._london_now()
+        past = now_london - timedelta(minutes=15)
+        index = pd.DatetimeIndex([past, now_london])
         df = pd.DataFrame(
             {
                 "Open": [100, 101],
@@ -213,8 +226,8 @@ class TestRemoveIncompleteCandle:
 
     def test_last_candle_matching_previous_period_is_kept(self, tmp_path):
         client, _ = _make_client(tmp_path)
-        now = datetime.now().replace(second=0, microsecond=0)
-        expected_closed = now - timedelta(minutes=15)
+        now_london = self._london_now()
+        expected_closed = now_london - timedelta(minutes=15)
         earlier = expected_closed - timedelta(minutes=15)
         index = pd.DatetimeIndex([earlier, expected_closed])
         df = pd.DataFrame(
@@ -233,9 +246,9 @@ class TestRemoveIncompleteCandle:
 
     def test_unexpected_timestamp_is_returned_unchanged(self, tmp_path):
         client, _ = _make_client(tmp_path)
-        now = datetime.now().replace(second=0, microsecond=0)
+        now_london = self._london_now()
         # Timestamp 7 minutes ago — not 'now' and not 'now-15min'
-        odd_time = now - timedelta(minutes=7)
+        odd_time = now_london - timedelta(minutes=7)
         earlier = odd_time - timedelta(minutes=15)
         index = pd.DatetimeIndex([earlier, odd_time])
         df = pd.DataFrame(
@@ -251,6 +264,51 @@ class TestRemoveIncompleteCandle:
         result = client._remove_incomplete_candle(df, "15min")
 
         assert len(result) == 2
+
+    def test_bst_candle_at_current_london_time_is_dropped(self, tmp_path):
+        """Incomplete candle is detected correctly when London is UTC+1 (BST).
+
+        Regression test for Bug 1: the old code used datetime.now() (machine
+        local, e.g. UTC 17:20) to compare against a naive London timestamp
+        (18:20 BST). They would never match on a UTC machine, so the
+        incomplete candle was kept incorrectly.
+
+        The fix localises the naive REST timestamp to Europe/London and converts
+        both sides to UTC before comparing — this works correctly regardless
+        of the machine timezone or DST offset.
+        """
+        client, _ = _make_client(tmp_path)
+        # Simulate a BST scenario: London is UTC+1
+        # Fixed BST moment: 2026-07-01 18:20 London == 2026-07-01 17:20 UTC
+        _LONDON = ZoneInfo("Europe/London")
+        bst_aware = datetime(2026, 7, 1, 18, 20, tzinfo=_LONDON)
+        # Naive London-local timestamp as IG REST would return
+        now_london_naive = bst_aware.replace(tzinfo=None)
+        past_london_naive = now_london_naive - timedelta(minutes=5)
+        index = pd.DatetimeIndex([past_london_naive, now_london_naive])
+        df = pd.DataFrame(
+            {
+                "Open": [100, 101],
+                "High": [110, 111],
+                "Low": [90, 91],
+                "Close": [105, 106],
+            },
+            index=index,
+        )
+        # Freeze datetime.now(timezone.utc) to the UTC equivalent of BST "now"
+        frozen_utc = bst_aware.astimezone(timezone.utc)
+
+        class _FakeDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen_utc if tz is not None else frozen_utc.replace(tzinfo=None)
+
+        with patch("ig_client.datetime", _FakeDatetime):
+            result = client._remove_incomplete_candle(df, "5min")
+
+        # The incomplete candle (18:20 London == 17:20 UTC) must be dropped
+        assert len(result) == 1
+        assert result.index[-1] == past_london_naive
 
 
 # --------------------------------------------------------------------------- #

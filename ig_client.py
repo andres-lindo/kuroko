@@ -11,7 +11,8 @@ import logging
 import pandas as pd
 from pathlib import Path
 from time import sleep
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from requests.exceptions import ConnectionError, RequestException
 
 from trading_ig import IGService
@@ -159,9 +160,18 @@ class IGClient:
         if df.empty:
             return df
 
-        # Normalise execution time to the current minute boundary
-        exec_time = datetime.now().replace(second=0, microsecond=0)
-        last_candle_time = pd.to_datetime(df.index[-1]).replace(second=0, microsecond=0)
+        # IG REST API returns snapshotTime in London local time (Europe/London).
+        # Localise the last candle's naive timestamp to London, convert to UTC,
+        # then compare against the current UTC time — so the comparison is correct
+        # regardless of the machine's local timezone.
+        _LONDON = ZoneInfo("Europe/London")
+        last_candle_naive = pd.to_datetime(df.index[-1]).replace(
+            second=0, microsecond=0
+        )
+        last_candle_time = last_candle_naive.replace(tzinfo=_LONDON).astimezone(
+            timezone.utc
+        )
+        exec_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
         # Derive timeframe width from resolution string
         timeframe_minutes = (
