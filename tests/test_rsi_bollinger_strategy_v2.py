@@ -1567,12 +1567,12 @@ class TestV2JsonCandleFrequency:
             data.get("candle_frequency"), str
         ), f"candle_frequency must be a string, got {type(data.get('candle_frequency'))!r}"
 
-    def test_v2_json_candle_frequency_default_is_5min(self):
-        """candle_frequency default value must be '5min'."""
+    def test_v2_json_candle_frequency_default_is_1min(self):
+        """candle_frequency default value must be '1min'."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
         assert (
-            data.get("candle_frequency") == "5min"
-        ), f"Expected candle_frequency='5min', got {data.get('candle_frequency')!r}"
+            data.get("candle_frequency") == "1min"
+        ), f"Expected candle_frequency='1min', got {data.get('candle_frequency')!r}"
 
 
 class TestV2ParamsSchema:
@@ -1780,25 +1780,25 @@ class TestV2JsonConfig:
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
         assert data["bb_period"] == 20
 
-    def test_v2_json_bb_std_is_2(self):
-        """bb_std must be 2.0 per spec."""
+    def test_v2_json_bb_std_is_1_5(self):
+        """bb_std must be 1.5 per config."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["bb_std"] == 2.0
+        assert data["bb_std"] == 1.5
 
     def test_v2_json_rsi_period_is_14(self):
         """rsi_period must be 14 per spec."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
         assert data["rsi_period"] == 14
 
-    def test_v2_json_rsi_oversold_is_30(self):
-        """rsi_oversold must be 30 per spec."""
+    def test_v2_json_rsi_oversold_is_40(self):
+        """rsi_oversold must be 40 per config."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["rsi_oversold"] == 30
+        assert data["rsi_oversold"] == 40.0
 
-    def test_v2_json_rsi_overbought_is_70(self):
-        """rsi_overbought must be 70 per spec."""
+    def test_v2_json_rsi_overbought_is_60(self):
+        """rsi_overbought must be 60 per config."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["rsi_overbought"] == 70
+        assert data["rsi_overbought"] == 60.0
 
 
 # --------------------------------------------------------------------------- #
