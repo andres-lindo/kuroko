@@ -1,5 +1,5 @@
-backtesting
-numpy
-optuna
-pandas
-bokeh
+backtesting==0.6.5
+numpy==2.4.4
+optuna==4.8.0
+pandas==3.0.2
+bokeh==3.9.0
