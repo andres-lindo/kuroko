@@ -2876,6 +2876,101 @@ class TestTickExitLong:
 
         mock_ig.close_position.assert_not_called()
 
+    def test_long_exit_suppressed_when_entry_spread_wider_than_exit_spread(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Long not closed when exit-tick spread understates the entry cost.
+
+        Regression test: entry was opened when spread was wide (3.0).
+        Exit tick has a tight spread (0.5). Using exit spread in the profit
+        check produces a false positive — strategy thinks it's profitable when
+        actual broker P&L is negative.
+
+        With the fix, the entry_spread stored at open time is used for the
+        LONG profit check instead of the exit tick's spread.
+        """
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
+        )
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "L1",
+        }
+        # Simulate: LONG opened during wide-spread tick (entry spread = 3.0)
+        # entry_price=90, entry_spread=3.0 → actual fill at ask=93
+        # Exit tick: bid=91 > bb_upper=100? NO — but let's set up so the
+        # exit condition fires with a tight spread.
+        # bb_upper=100, bid=101 > bb_upper → exit fires.
+        # spread_exit=0.5 → old profit=(101-90-0.5)*0.5=5.25 > 0 → WRONG close
+        # spread_entry=3.0 → new profit=(101-90-3.0)*0.5=4.0 > 0 → still closes (happy path)
+        # Need entry close to bb_upper so only tight spread makes it look profitable.
+        # entry_price=99, entry_spread=3.0, bid_exit=101, spread_exit=0.5:
+        # old: (101-99-0.5)*0.5=0.75>0 → close (BUG)
+        # actual: (101-(99+3))*0.5=(101-102)*0.5=-0.5 → LOSS
+        # new: (101-99-3.0)*0.5=-0.5<0 → NOT closed (CORRECT)
+        strat._long_positions = [
+            {"deal_id": "L1", "entry_price": 99.0, "entry_spread": 3.0, "size": 0.5}
+        ]
+        # Exit tick: bid=101 > bb_upper=100, spread=0.5 (tight)
+        tick = {"bid": 101.0, "ofr": 101.5, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.close_position.assert_not_called()
+
+    def test_long_exit_fires_when_move_covers_entry_spread(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Long closed when price moved enough to cover the entry spread cost.
+
+        When price has moved sufficiently that profit is positive even after
+        accounting for the wide entry spread, the position should close.
+        """
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
+        )
+        # entry_price=90, entry_spread=3.0 → actual fill at ask=93
+        # bid_exit=110 > bb_upper=100, spread_exit=0.5
+        # profit=(110-90-3.0)*0.5=17*0.5=8.5>0 → CORRECT close
+        strat._long_positions = [
+            {"deal_id": "L1", "entry_price": 90.0, "entry_spread": 3.0, "size": 0.5}
+        ]
+        tick = {"bid": 110.0, "ofr": 110.5, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.close_position.assert_called_once_with("L1", "SELL", 0.5)
+
+    def test_entry_spread_stored_in_long_position_on_tick_open(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """LONG position dict contains entry_spread matching the tick spread at open."""
+        params = make_params_v2(
+            operation_mode="tick",
+            rsi_oversold=30,
+            max_long_positions=3,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "L1",
+        }
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=20.0, close=100.0
+        )
+        # Wide-spread tick at entry: bid=90 < bb_lower=100, spread=3.0
+        tick = {"bid": 90.0, "ofr": 93.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        assert len(strat._long_positions) == 1
+        pos = strat._long_positions[0]
+        assert pos["entry_spread"] == 3.0
+
 
 # =========================================================================== #
 # Tick mode — exit short [REQ-7]                                                #
