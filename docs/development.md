@@ -134,7 +134,7 @@ Logging is bootstrapped by `logging_setup.py`. Startup follows this sequence:
 1. `logging.basicConfig()` at module level provides console output during the bootstrap phase (config and strategy loading).
 2. `load_app_config()` reads `config.json` from the project root.
 3. `load_strategy()` / `load_params()` loads the strategy class and its parameters.
-4. `setup_logging(config["logging"], config["logging"]["azure_log_partition_key"])` — called **once**, after params are loaded. This replaces the basicConfig handlers with the configured file, Azure Blob, and/or console handlers.
+4. `setup_logging(config["logging"], config["logging"]["azure_log_partition_key"], override_level=args.log_level)` — called **once**, after params are loaded. This replaces the basicConfig handlers with the configured file, Azure Blob, and/or console handlers. If `--log-level` was passed on the CLI, it overrides the `log_level` value from `config.json`.
 
 If `load_params` or `load_strategy` crashes, the error is visible on the console via `basicConfig` — this is acceptable for a startup failure.
 

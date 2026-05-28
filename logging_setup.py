@@ -211,7 +211,11 @@ def _cleanup_old_logs(log_dir: str, retention_days: int, base_filename: str) -> 
 # --------------------------------------------------------------------------- #
 
 
-def setup_logging(log_config: dict, partition_key: str) -> None:
+def setup_logging(
+    log_config: dict,
+    partition_key: str,
+    override_level: str | None = None,
+) -> None:
     """Configure the root logger with the handlers specified in log_config.
 
     Clears all existing root handlers before attaching the new ones to prevent
@@ -226,9 +230,14 @@ def setup_logging(log_config: dict, partition_key: str) -> None:
         log_config: The "logging" sub-dict from config.json (or defaults).
         partition_key: Partition/blob name passed to AzureBlobHandler. Must
             come from config.json["logging"]["azure_log_partition_key"].
+        override_level: When provided, overrides log_config["log_level"].
+            Used by the CLI ``--log-level`` flag so the flag is always
+            authoritative over the config file value.
     """
     log_type: list = log_config.get("log_type", _DEFAULTS["logging"]["log_type"])
-    log_level_str: str = log_config.get("log_level", _DEFAULTS["logging"]["log_level"])
+    log_level_str: str = override_level or log_config.get(
+        "log_level", _DEFAULTS["logging"]["log_level"]
+    )
     log_dir: str = log_config.get("log_dir", _DEFAULTS["logging"]["log_dir"])
     log_file_name: str = log_config.get(
         "log_file_name", _DEFAULTS["logging"]["log_file_name"]

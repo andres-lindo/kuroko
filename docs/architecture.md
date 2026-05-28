@@ -21,8 +21,9 @@ kuroko.py  ← load_dotenv("credentials.env") runs at module scope, before main(
 ├── load_params("strategies/<StrategyName>.json") → types.SimpleNamespace
 │   └── api_mode required — determines REST or streaming wiring
 │
-├── setup_logging(config["logging"], partition_key)
-│   └── partition_key from config.json["logging"]["azure_log_partition_key"]
+├── setup_logging(config["logging"], partition_key, override_level=args.log_level)
+│   ├── partition_key from config.json["logging"]["azure_log_partition_key"]
+│   └── override_level from --log-level CLI arg (overrides config.json log_level when set)
 │
 ├── IGClient()
 │   ├── Reads env vars set by load_dotenv (username, password, api_key, acc_number)

@@ -234,6 +234,13 @@ def main():
         required=True,
         help="Strategy class name (e.g. RSIBollingerStrategy)",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        type=str.upper,
+        help="Set the root logging level (default: INFO)",
+    )
     args = parser.parse_args()
 
     project_root = os.path.dirname(os.path.abspath(__file__))
@@ -257,7 +264,7 @@ def main():
         "azure_log_partition_key",
         _DEFAULTS["logging"]["azure_log_partition_key"],
     )
-    setup_logging(config["logging"], partition_key)
+    setup_logging(config["logging"], partition_key, override_level=args.log_level)
 
     # Build trading_config from config["trading"]
     trading_config = types.SimpleNamespace(**config["trading"])

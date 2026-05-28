@@ -17,6 +17,7 @@ getLogger) on import. These are harmless in test context because:
 - We patch ig_client.IGService to prevent real authentication
 """
 
+import logging
 import sys
 import types
 from unittest.mock import MagicMock, call, patch
@@ -30,6 +31,7 @@ from kuroko import (
     load_strategy,
     main,
 )
+from logging_setup import setup_logging
 from strategies.RSIBollingerStrategy import RSIBollingerStrategy, load_params
 
 # --------------------------------------------------------------------------- #
@@ -560,3 +562,69 @@ class TestWireStrategyReturnStreamingFlag:
 
         # No stop() called — just confirms no AttributeError on None.stop()
         mock_strat.run.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# setup_logging — override_level parameter                                     #
+# --------------------------------------------------------------------------- #
+
+
+class TestSetupLoggingOverrideLevel:
+    """Tests for logging_setup.setup_logging(override_level=...) behaviour."""
+
+    def _minimal_config(self) -> dict:
+        """Return a minimal log_config that disables all file and Azure handlers."""
+        return {
+            "log_type": [],
+            "log_level": "INFO",
+            "log_dir": "logs",
+            "log_file_name": "kuroko.log",
+            "retention_days": 7,
+            "console_logging": False,
+            "structured_format": False,
+        }
+
+    def test_override_level_takes_precedence_over_config_value(self):
+        """When override_level='DEBUG', root logger is set to DEBUG regardless of config."""
+        config = self._minimal_config()
+        config["log_level"] = "WARNING"
+
+        setup_logging(config, partition_key="", override_level="DEBUG")
+
+        assert logging.getLogger().level == logging.DEBUG
+
+    def test_config_level_used_when_override_level_is_none(self):
+        """Without override_level, root logger level comes from log_config."""
+        config = self._minimal_config()
+        config["log_level"] = "ERROR"
+
+        setup_logging(config, partition_key="")
+
+        assert logging.getLogger().level == logging.ERROR
+
+    def test_main_passes_cli_log_level_to_setup_logging(self):
+        """main() passes args.log_level as override_level to setup_logging."""
+        mock_strategy_class = MagicMock()
+        mock_load_params = MagicMock(
+            return_value=types.SimpleNamespace(
+                api_mode="rest", candle_frequency="15min"
+            )
+        )
+
+        with patch.object(
+            sys,
+            "argv",
+            ["kuroko.py", "--strategy", "RSIBollingerStrategy", "--log-level", "DEBUG"],
+        ):
+            with patch(
+                "kuroko.load_strategy",
+                return_value=(mock_strategy_class, mock_load_params),
+            ):
+                with patch("kuroko.load_app_config", return_value=_make_main_config()):
+                    with patch("kuroko.setup_logging") as mock_setup:
+                        with patch("kuroko.IGClient"):
+                            with patch("kuroko._run_strategy"):
+                                main()
+
+        _args, _kwargs = mock_setup.call_args
+        assert _kwargs.get("override_level") == "DEBUG"
