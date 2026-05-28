@@ -172,6 +172,16 @@ class RSIBollingerStrategyV2:
         self.streaming_client = streaming_client
         self.trading_config = trading_config
         self.epic = trading_config.epic
+        logger.debug(
+            f"RSIBollingerStrategyV2 initialised: epic={self.epic} "
+            f"bb_period={params.bb_period} bb_std={params.bb_std} "
+            f"rsi_period={params.rsi_period} rsi_oversold={params.rsi_oversold} "
+            f"rsi_overbought={params.rsi_overbought} "
+            f"max_long={params.max_long_positions} max_short={params.max_short_positions} "
+            f"contract_size={params.contract_size} "
+            f"min_dist={params.min_dist_between_entries_ticks} "
+            f"take_profit_ticks={params.take_profit_ticks}"
+        )
 
         # Spread is calculated dynamically from each candle's OFR_CLOSE - BID_CLOSE.
         # None until the first candle is processed; profit checks use 0.0 as fallback.
@@ -181,6 +191,9 @@ class RSIBollingerStrategyV2:
         # Needs bb_period + rsi_period candles for both indicators to be valid
         min_window = max(params.bb_period, params.rsi_period) + 1
         self._candle_window: deque = deque(maxlen=min_window + 50)
+        logger.debug(
+            f"Candle window initialised: min_required={min_window} maxlen={min_window + 50}"
+        )
 
         # Independent position grids
         # Each entry: {"deal_id": str, "entry_price": float, "size": float}
@@ -221,6 +234,10 @@ class RSIBollingerStrategyV2:
             return None
 
         closes = np.array(list(self._candle_window), dtype=float)
+        logger.debug(
+            f"Computing indicators: window_size={window_size} "
+            f"close[-1]={closes[-1]:.2f} close[-5:]={[round(c, 2) for c in closes[-5:]]}"
+        )
 
         bb_upper, bb_middle, bb_lower = ta.BBANDS(
             closes,
@@ -240,6 +257,12 @@ class RSIBollingerStrategyV2:
         if any(np.isnan(v) for v in [current_bb_upper, current_bb_lower, current_rsi]):
             logger.debug("NaN indicators — skipping candle.")
             return None
+
+        logger.debug(
+            f"Indicators computed: close={current_close:.2f} "
+            f"BB=[{current_bb_lower:.2f}, {current_bb_middle:.2f}, {current_bb_upper:.2f}] "
+            f"RSI={current_rsi:.2f}"
+        )
 
         return {
             "bb_upper": current_bb_upper,
@@ -285,6 +308,10 @@ class RSIBollingerStrategyV2:
         The strategy then starts in cold-start mode with an empty candle window.
         """
         num_candles = max(self.params.bb_period, self.params.rsi_period) + 1
+        logger.debug(
+            f"Warm-up: requesting {num_candles} candles "
+            f"(bb_period={self.params.bb_period} rsi_period={self.params.rsi_period})"
+        )
         logger.info(
             f"Warm-up starting: fetching {num_candles} historical candles "
             f"({self.params.candle_frequency}) for {self.epic}."
@@ -305,12 +332,21 @@ class RSIBollingerStrategyV2:
                 logger.warning("Warm-up skipped — get_candles returned 0 rows.")
                 return
 
+            logger.debug(
+                f"Warm-up: get_candles returned {len(df)} rows "
+                f"(index range: {df.index[0]} → {df.index[-1]})"
+            )
+
             loaded = 0
             for _, row in df.iterrows():
                 self._candle_window.append(float(row["Close"]))
                 loaded += 1
 
             self._last_warmup_ts = df.index[-1].to_pydatetime()
+            logger.debug(
+                f"Warm-up: last REST candle ts={self._last_warmup_ts} "
+                f"window_size={len(self._candle_window)}"
+            )
 
             if loaded < num_candles:
                 logger.warning(
@@ -353,14 +389,31 @@ class RSIBollingerStrategyV2:
         # --- EXITS ---
         # Exit condition: price STRICTLY > bb_upper AND profit after spread > 0.
         spread = self._current_spread if self._current_spread is not None else 0.0
+        logger.debug(
+            f"_manage_longs: close={close:.2f} bb_lower={bb_lower:.2f} "
+            f"bb_upper={bb_upper:.2f} rsi={rsi:.2f} "
+            f"spread={spread:.4f} open_longs={len(self._long_positions)}"
+        )
         if close > bb_upper and self._long_positions:
+            logger.debug(
+                f"Long exit condition met: close={close:.2f} > bb_upper={bb_upper:.2f} "
+                f"evaluating {len(self._long_positions)} position(s)"
+            )
             to_close = []  # list of (pos, profit) tuples — profit computed once
             to_keep = []
             for pos in self._long_positions:
                 profit = _long_profit(close, pos["entry_price"], spread, pos["size"])
+                logger.debug(
+                    f"Long exit eval: deal_id={pos['deal_id']} "
+                    f"entry={pos['entry_price']:.2f} close={close:.2f} "
+                    f"spread={spread:.4f} size={pos['size']} profit={profit:.2f}"
+                )
                 if profit > 0:
                     to_close.append((pos, profit))
                 else:
+                    logger.debug(
+                        f"Long {pos['deal_id']} not profitable after spread — keeping"
+                    )
                     to_keep.append(pos)
 
             for pos, profit in to_close:
@@ -383,18 +436,38 @@ class RSIBollingerStrategyV2:
 
         # --- ENTRIES ---
         if close >= bb_lower or rsi >= self.params.rsi_oversold:
+            logger.debug(
+                f"Long entry skipped — signal not met: "
+                f"close={close:.2f} bb_lower={bb_lower:.2f} "
+                f"rsi={rsi:.2f} rsi_oversold={self.params.rsi_oversold}"
+            )
             return
         if len(self._long_positions) >= self.params.max_long_positions:
+            logger.debug(
+                f"Long entry skipped — max positions reached: "
+                f"{len(self._long_positions)}/{self.params.max_long_positions}"
+            )
             return
         if self._long_positions:
             last_entry = self._long_positions[-1]["entry_price"]
             if not _distance_ok(
                 close, last_entry, self.params.min_dist_between_entries_ticks
             ):
+                logger.debug(
+                    f"Long entry skipped — distance too small: "
+                    f"close={close:.2f} last_entry={last_entry:.2f} "
+                    f"distance={abs(close - last_entry):.2f} "
+                    f"min_dist={self.params.min_dist_between_entries_ticks}"
+                )
                 return
 
         limit_distance = self.params.take_profit_ticks
         size = self.params.contract_size
+        logger.debug(
+            f"Long entry signal: close={close:.2f} bb_lower={bb_lower:.2f} "
+            f"rsi={rsi:.2f} size={size} tp_dist={limit_distance} "
+            f"grid_level={len(self._long_positions) + 1}/{self.params.max_long_positions}"
+        )
 
         try:
             response = self.ig.open_position(
@@ -404,6 +477,7 @@ class RSIBollingerStrategyV2:
                 limit=limit_distance,
             )
             deal_id = _extract_deal_id(response)
+            logger.debug(f"open_position (LONG) response: deal_id={deal_id!r}")
             if deal_id == "unknown":
                 logger.critical(
                     f"LONG position opened but deal_id could not be extracted "
@@ -412,6 +486,10 @@ class RSIBollingerStrategyV2:
             else:
                 self._long_positions.append(
                     {"deal_id": deal_id, "entry_price": close, "size": size}
+                )
+                logger.debug(
+                    f"Long grid updated: {len(self._long_positions)} position(s) open "
+                    f"entries={[round(p['entry_price'], 2) for p in self._long_positions]}"
                 )
                 logger.info(
                     f"Opened LONG {deal_id} @ {close:.2f} | "
@@ -446,14 +524,31 @@ class RSIBollingerStrategyV2:
         # --- EXITS ---
         # Exit condition: price STRICTLY < bb_lower AND profit after spread > 0.
         spread = self._current_spread if self._current_spread is not None else 0.0
+        logger.debug(
+            f"_manage_shorts: close={close:.2f} bb_lower={bb_lower:.2f} "
+            f"bb_upper={bb_upper:.2f} rsi={rsi:.2f} "
+            f"spread={spread:.4f} open_shorts={len(self._short_positions)}"
+        )
         if close < bb_lower and self._short_positions:
+            logger.debug(
+                f"Short exit condition met: close={close:.2f} < bb_lower={bb_lower:.2f} "
+                f"evaluating {len(self._short_positions)} position(s)"
+            )
             to_close = []  # list of (pos, profit) tuples — profit computed once
             to_keep = []
             for pos in self._short_positions:
                 profit = _short_profit(close, pos["entry_price"], spread, pos["size"])
+                logger.debug(
+                    f"Short exit eval: deal_id={pos['deal_id']} "
+                    f"entry={pos['entry_price']:.2f} close={close:.2f} "
+                    f"spread={spread:.4f} size={pos['size']} profit={profit:.2f}"
+                )
                 if profit > 0:
                     to_close.append((pos, profit))
                 else:
+                    logger.debug(
+                        f"Short {pos['deal_id']} not profitable after spread — keeping"
+                    )
                     to_keep.append(pos)
 
             for pos, profit in to_close:
@@ -476,18 +571,38 @@ class RSIBollingerStrategyV2:
 
         # --- ENTRIES ---
         if close <= bb_upper or rsi <= self.params.rsi_overbought:
+            logger.debug(
+                f"Short entry skipped — signal not met: "
+                f"close={close:.2f} bb_upper={bb_upper:.2f} "
+                f"rsi={rsi:.2f} rsi_overbought={self.params.rsi_overbought}"
+            )
             return
         if len(self._short_positions) >= self.params.max_short_positions:
+            logger.debug(
+                f"Short entry skipped — max positions reached: "
+                f"{len(self._short_positions)}/{self.params.max_short_positions}"
+            )
             return
         if self._short_positions:
             last_entry = self._short_positions[-1]["entry_price"]
             if not _distance_ok(
                 close, last_entry, self.params.min_dist_between_entries_ticks
             ):
+                logger.debug(
+                    f"Short entry skipped — distance too small: "
+                    f"close={close:.2f} last_entry={last_entry:.2f} "
+                    f"distance={abs(close - last_entry):.2f} "
+                    f"min_dist={self.params.min_dist_between_entries_ticks}"
+                )
                 return
 
         limit_distance = self.params.take_profit_ticks
         size = self.params.contract_size
+        logger.debug(
+            f"Short entry signal: close={close:.2f} bb_upper={bb_upper:.2f} "
+            f"rsi={rsi:.2f} size={size} tp_dist={limit_distance} "
+            f"grid_level={len(self._short_positions) + 1}/{self.params.max_short_positions}"
+        )
 
         try:
             response = self.ig.open_position(
@@ -497,6 +612,7 @@ class RSIBollingerStrategyV2:
                 limit=limit_distance,
             )
             deal_id = _extract_deal_id(response)
+            logger.debug(f"open_position (SHORT) response: deal_id={deal_id!r}")
             if deal_id == "unknown":
                 logger.critical(
                     f"SHORT position opened but deal_id could not be extracted "
@@ -505,6 +621,10 @@ class RSIBollingerStrategyV2:
             else:
                 self._short_positions.append(
                     {"deal_id": deal_id, "entry_price": close, "size": size}
+                )
+                logger.debug(
+                    f"Short grid updated: {len(self._short_positions)} position(s) open "
+                    f"entries={[round(p['entry_price'], 2) for p in self._short_positions]}"
                 )
                 logger.info(
                     f"Opened SHORT {deal_id} @ {close:.2f} | "
@@ -530,6 +650,10 @@ class RSIBollingerStrategyV2:
         no retries, no partial state. If the broker call itself fails, the
         positions remain flagged and reconciliation is retried on the next candle.
         """
+        logger.debug(
+            f"Reconciliation triggered: "
+            f"longs={len(self._long_positions)} shorts={len(self._short_positions)}"
+        )
         try:
             broker_data = self.ig.get_open_positions()
         except Exception as e:
@@ -539,6 +663,9 @@ class RSIBollingerStrategyV2:
         # get_open_positions() returns a flat list of dicts. Each dict has a
         # top-level 'dealId' key (not nested under 'position').
         broker_deal_ids = {pos["dealId"] for pos in broker_data if "dealId" in pos}
+        logger.debug(
+            f"Broker reports {len(broker_deal_ids)} open position(s): {broker_deal_ids}"
+        )
 
         def _filter(positions: list[dict]) -> list[dict]:
             kept = []
@@ -585,6 +712,10 @@ class RSIBollingerStrategyV2:
             candle: OHLC dict delivered by IGStreamingClient callback.
                 Required keys: close, bid_close, ofr_close, spread.
         """
+        logger.debug(
+            f"_on_candle received: ts={candle.get('timestamp')} "
+            f"close={candle.get('close')} spread={candle.get('spread')}"
+        )
         missing = [k for k in self._REQUIRED_CANDLE_KEYS if k not in candle]
         if missing:
             logger.warning(
@@ -607,17 +738,22 @@ class RSIBollingerStrategyV2:
                 return
 
         if self._needs_reconciliation():
+            logger.debug("Reconciliation flag detected before processing candle.")
             self._reconcile_positions()
 
         self._update_spread_from_candle(candle)
         indicators = self._compute_indicators(candle)
         if indicators is None:
+            logger.debug(
+                f"Indicators not yet available — window_size={len(self._candle_window)}"
+            )
             return
 
         logger.debug(
             f"Candle processed: close={indicators['close']:.2f} "
             f"BB=[{indicators['bb_lower']:.2f}, {indicators['bb_upper']:.2f}] "
-            f"RSI={indicators['rsi']:.2f}"
+            f"RSI={indicators['rsi']:.2f} "
+            f"longs={len(self._long_positions)} shorts={len(self._short_positions)}"
         )
 
         self._manage_longs(indicators)
@@ -637,8 +773,13 @@ class RSIBollingerStrategyV2:
         """
         logger.info("RSIBollingerStrategyV2 starting.")
         self._stop_event.clear()
+        logger.debug("Stop event cleared — entering warm-up phase.")
         self._warmup()
+        logger.debug(
+            f"Warm-up complete — starting streaming client (window_size={len(self._candle_window)})."
+        )
         self.streaming_client.start(self._on_candle)
+        logger.debug("Streaming client started — blocking on stop event.")
         self._stop_event.wait()
         logger.info("RSIBollingerStrategyV2 stopped.")
 
@@ -649,8 +790,10 @@ class RSIBollingerStrategyV2:
         so no new candles arrive after stop() returns. Then sets _stop_event
         to unblock run().
         """
+        logger.debug("stop() called — halting streaming client and setting stop event.")
         self.streaming_client.stop()
         self._stop_event.set()
+        logger.debug("Stop event set — run() will unblock.")
 
 
 # --------------------------------------------------------------------------- #
