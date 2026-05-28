@@ -1,20 +1,20 @@
 {
-  "epic": "IX.D.FTSE.IFMM.IP",
+  "epic": "IX.D.SPTRD.IFMM.IP",
 
   "api_mode": "streaming",
   "candle_frequency": "1min",
   "operation_mode": "tick",
 
   "bb_period": 20,
-  "bb_std": 1.5,
-  "rsi_period": 14,
-  "rsi_oversold": 40.0,
-  "rsi_overbought": 60.0,
+  "bb_std": 2.0,
+  "rsi_period": 7,
+  "rsi_oversold": 30.0,
+  "rsi_overbought": 70.0,
 
   "max_long_positions": 10,
   "max_short_positions": 10,
 
-  "contract_size": 0.5,
+  "contract_size": 1.0,
   "min_dist_between_entries_ticks": 20,
   "take_profit_ticks": 10
 }

@@ -936,6 +936,8 @@ class RSIBollingerStrategyV2:
             self._reconcile_positions()
 
         bid = tick["bid"]
+        if bid <= 0:
+            return  # stale/heartbeat tick with no real price — skip all signal evaluation
         spread = tick["ofr"] - bid  # live spread from the tick itself
         bb_upper = indicators["bb_upper"]
         bb_lower = indicators["bb_lower"]

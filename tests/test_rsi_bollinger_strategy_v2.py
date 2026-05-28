@@ -174,7 +174,7 @@ class TestLongEntry:
         mock_ig.open_position.assert_called_once()
         call_kwargs = mock_ig.open_position.call_args.kwargs
         assert call_kwargs["side"] == "BUY"
-        assert call_kwargs["size"] == 0.5
+        assert call_kwargs["size"] == 1.0
 
     def test_long_entry_sets_take_profit_at_open(self, make_strategy_v2):
         """Broker take-profit set at entry_price + take_profit_ticks."""
@@ -296,7 +296,7 @@ class TestShortEntry:
         mock_ig.open_position.assert_called_once()
         call_kwargs = mock_ig.open_position.call_args.kwargs
         assert call_kwargs["side"] == "SELL"
-        assert call_kwargs["size"] == 0.5
+        assert call_kwargs["size"] == 1.0
 
     def test_short_entry_sets_take_profit_at_open(self, make_strategy_v2):
         """Broker take-profit set at entry_price - take_profit_ticks."""
@@ -1872,25 +1872,25 @@ class TestV2JsonConfig:
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
         assert data["bb_period"] == 20
 
-    def test_v2_json_bb_std_is_1_5(self):
-        """bb_std must be 1.5 per config."""
+    def test_v2_json_bb_std_is_2_0(self):
+        """bb_std must be 2.0 per config."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["bb_std"] == 1.5
+        assert data["bb_std"] == 2.0
 
-    def test_v2_json_rsi_period_is_14(self):
-        """rsi_period must be 14 per spec."""
+    def test_v2_json_rsi_period_is_7(self):
+        """rsi_period must be 7 per config."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["rsi_period"] == 14
+        assert data["rsi_period"] == 7
 
-    def test_v2_json_rsi_oversold_is_40(self):
-        """rsi_oversold must be 40 per config."""
+    def test_v2_json_rsi_oversold_is_30(self):
+        """rsi_oversold must be 30 per config."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["rsi_oversold"] == 40.0
+        assert data["rsi_oversold"] == 30.0
 
-    def test_v2_json_rsi_overbought_is_60(self):
-        """rsi_overbought must be 60 per config."""
+    def test_v2_json_rsi_overbought_is_70(self):
+        """rsi_overbought must be 70 per config."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["rsi_overbought"] == 60.0
+        assert data["rsi_overbought"] == 70.0
 
 
 # --------------------------------------------------------------------------- #

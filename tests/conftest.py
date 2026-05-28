@@ -93,7 +93,7 @@ def make_params_v2():
             "rsi_overbought": 70,
             "max_long_positions": 3,
             "max_short_positions": 3,
-            "contract_size": 0.5,
+            "contract_size": 1.0,
             "min_dist_between_entries_ticks": 10,
             "take_profit_ticks": 50.0,
             "operation_mode": "candle",
