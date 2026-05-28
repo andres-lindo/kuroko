@@ -17,22 +17,29 @@ Kuroko is split into two independent execution contexts that share no runtime st
 
 ```
 kuroko.py  ← load_dotenv("credentials.env") runs at module scope, before main()
-├── load_strategy(args.strategy) → (RSIBollingerStrategy, load_params)
-├── load_params("strategies/RSIBollingerStrategy.json") → types.SimpleNamespace
-│   └── keys: log_partition_key, candle_frequency, epic, max_positions, rsi_period, bb_period, ...
+├── load_strategy(args.strategy) → (StrategyClass, load_params)
+├── load_params("strategies/<StrategyName>.json") → types.SimpleNamespace
+│   └── api_mode required — determines REST or streaming wiring
 │
-├── AzureBlobHandler
-│   └── Azure Blob Storage → container: logs
-│       └── append-blob per params.log_partition_key, rotates at midnight UTC
+├── setup_logging(config["logging"], partition_key)
+│   └── partition_key from config.json["logging"]["azure_log_partition_key"]
 │
 ├── IGClient()
 │   ├── Reads env vars set by load_dotenv (username, password, api_key, acc_number)
 │   ├── Creates IG Markets REST session
 │   └── Creates ./cache/ directory for parquet persistence
 │
-└── RSIBollingerStrategy(params, ig_client).run()
-    └── main loop (15-min cadence, aligned to candle close)
+├── _wire_strategy(strategy_class, params, ig, trading_config)
+│   ├── api_mode == "rest"      → StrategyClass(params, ig_client, trading_config).run()
+│   └── api_mode == "streaming" → IGStreamingClient(ig.ig_service, epic)
+│                                  StrategyClass(params, ig_client, streaming_client, trading_config).run()
+│
+└── _run_strategy(strat, streaming_client)
+    ├── strat.run()  (blocks until shutdown)
+    └── streaming_client.stop()  (if streaming — teardown on exit)
 ```
+
+`api_mode` is required in every strategy JSON. A missing or unrecognised value raises `ConfigurationError` and exits with code 1.
 
 ### Components
 
@@ -52,13 +59,25 @@ Key methods: `get_candles()`, `get_open_positions()`, `open_position()`, `close_
 
 #### `RSIBollingerStrategy` (`strategies/RSIBollingerStrategy.py`)
 
-Contains all trading logic. Initialized with the config object from `strategies/RSIBollingerStrategy.json` and an `IGClient` instance. See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for entry logic, position sizing, exit logic, risk controls, and parameter reference.
+V1 strategy. Contains all trading logic. Uses REST polling on a 15-minute cadence. Initialized with `params`, `ig_client`, and `trading_config`. See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for entry logic, position sizing, exit logic, risk controls, and parameter reference.
+
+#### `RSIBollingerStrategyV2` (`strategies/RSIBollingerStrategyV2.py`)
+
+V2 strategy. Event-driven bidirectional mean-reversion. Receives 5-minute candles via `IGStreamingClient`. Maintains independent long and short position grids. No martingale, no ATR, no stop-loss. See [RSIBollingerStrategyV2 documentation](strategies/RSIBollingerStrategyV2.md) for full reference.
+
+#### `IGStreamingClient` (`ig_streaming_client.py`)
+
+Wraps `trading_ig`'s `IGStreamService` to deliver closed 5-minute OHLC candles via callback. Subscribes to `CHART:{epic}:5MINUTE` natively; falls back to `CHART:{epic}:TICK` with in-process `TickAggregator` if the native subscription fails. Candles are delivered from a dedicated worker thread, never directly from the Lightstreamer listener.
+
+Public API: `start(on_candle)`, `stop()`.
 
 #### `AzureBlobHandler` (`azure_log_handler.py`)
 
-Custom `logging.Handler` that ships all log records to Azure Blob Storage. Uses append-blob mode so multiple writes don't overwrite existing content. Rotates to a new blob daily at midnight UTC. Blob name format: `{log_partition_key}_{YYYY-MM-DD}.log`. The partition key is read from `log_partition_key` in `strategies/RSIBollingerStrategy.json`.
+Custom `logging.Handler` that ships all log records to Azure Blob Storage. Uses append-blob mode so multiple writes don't overwrite existing content. Rotates to a new blob daily at midnight UTC. Blob name format: `{log_partition_key}_{YYYY-MM-DD}.log`. The partition key is read from `azure_log_partition_key` in `config.json["logging"]`.
 
 ### Fault Tolerance and Self-Healing
+
+> Layers 1–5 and the maintenance window example below apply to **REST-mode strategies (V1)**. V2 (streaming) has a different recovery model: the Lightstreamer connection handles reconnection internally, and REST calls for position management are retried via `_safe_api_call` (Layer 1). V2 does not have a candle cache or a per-tick poll loop.
 
 The live trading engine is designed to survive transient IG API failures (maintenance windows, timeouts, empty responses) without operator intervention. Recovery is layered — each layer handles failures at its own level and passes only unrecoverable conditions upward.
 
@@ -96,13 +115,14 @@ while True:
 
 Each individual `close_position()` call is wrapped in its own retry loop: 3 attempts with 1s/2s backoff. A failure on one position does not block the remaining closes. Failed deal IDs are accumulated and reported in a single WARNING after all positions are processed.
 
-**Layer 6 — Startup config (`strategies/RSIBollingerStrategy.json` in `RSIBollingerStrategy.py`)**
+**Layer 6 — Startup config (`strategies/<StrategyName>.json`)**
 
-A failure here is fatal by design — the bot cannot trade without its configuration. `load_params()` handles three failure modes, each logging CRITICAL and calling `sys.exit(1)`:
+A failure here is fatal by design — the bot cannot trade without its configuration. `load_params()` handles failure modes, each logging CRITICAL and calling `sys.exit(1)`:
 
 1. **File errors** — missing file (`FileNotFoundError`), invalid JSON (`JSONDecodeError`), or unreadable file (`OSError`).
-2. **Schema errors** — `_validate_params()` checks that all 22 required keys are present and correctly typed (e.g. `int` fields reject `bool`, `float` fields accept `int`). All errors are collected and reported at once before exiting.
-3. **Format error** — `candle_frequency` must match the regex `^\d+min$` (e.g. `"15min"`).
+2. **Schema errors** — `_validate_params()` checks that all required keys are present and correctly typed (e.g. `int` fields reject `bool`, `float` fields accept `int`). All errors are collected and reported at once before exiting. The required keys and types differ by strategy — see the strategy documentation for the full schema.
+3. **Format errors** — V1 additionally validates that `candle_frequency` matches `^\d+min$` (e.g. `"15min"`). V2 has no such format-specific checks beyond type validation.
+4. **api_mode errors** — `_wire_strategy()` raises `ConfigurationError` if `api_mode` is missing or not `"rest"`/`"streaming"`.
 
 No retry is attempted; the process manager (systemd, supervisor, etc.) handles restart scheduling.
 
@@ -131,24 +151,26 @@ The process **never exits** on API failures. It retries every tick indefinitely 
 |---|---|
 | Extended outage (hours) | Bot keeps retrying every tick; produces one log entry per cycle; no trades during the outage |
 | `get_open_positions()` returning `[]` on error | Strategy sees zero open positions for that cycle; state reconciles on the next successful call |
-| Stale candle cache | Signals computed on data up to N minutes old; negligible on a 15-min candle strategy |
+| Stale candle cache (V1 only) | Signals computed on data up to N minutes old; negligible on a 15-min candle strategy |
 | No circuit breaker | No threshold for consecutive failures — the bot retries indefinitely; process manager handles restarts if needed |
 
 ### Configuration Flow
 
-Strategy parameters are stored in `strategies/RSIBollingerStrategy.json` and loaded at startup via `load_params()`. Changing a parameter requires editing the file and redeploying the bot.
+Strategy parameters are stored in `strategies/<StrategyName>.json` and loaded at startup via `load_params()`. Infrastructure parameters (`epic`, `leverage`, `demo_starting_balance`, `initial_cash_balance`, `security_buffer`) are stored in `config.json["trading"]` — they are not in the strategy JSON. Changing a parameter requires editing the appropriate file and redeploying the bot.
 
 ```
-strategies/RSIBollingerStrategy.json
+config.json
+├── ["trading"]  → types.SimpleNamespace(**data) → trading_config (epic, leverage, ...)
+└── ["logging"]  → setup_logging() (log_type, log_level, azure_log_partition_key, ...)
+
+strategies/<StrategyName>.json
 └── json.load() → dict
     └── types.SimpleNamespace(**data) → params
-        └── RSIBollingerStrategy(params=params, ig_client=ig)
-            └── self.params.candle_frequency / .epic / .max_positions / ...
+        ├── api_mode (required — "rest" or "streaming")
+        └── strategy-specific keys (rsi_period, bb_period, ...)
 ```
 
-See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for the full parameter reference.
-
-`table_storage_connection` is NOT in this file — it is read from the environment (`credentials.env`) exclusively for `AzureBlobHandler` log shipping.
+`table_storage_connection` is NOT in any JSON file — it is read from the environment (`credentials.env`) exclusively for `AzureBlobHandler` log shipping.
 
 ### Account Mode
 

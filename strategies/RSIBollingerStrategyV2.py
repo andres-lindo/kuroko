@@ -1,0 +1,641 @@
+"""Event-driven bidirectional mean-reversion strategy for IG Markets live trading.
+
+Implements independent long/short position grids using Bollinger Bands (BB) and
+RSI signals. Candles are delivered via a queue from IGStreamingClient. All trading
+logic runs on a single worker thread; REST calls are serialized through IGClient.
+
+No martingale, no ATR, no stop-loss. All positions use flat contract_size.
+"""
+
+import json
+import sys
+import types
+import threading
+import logging
+import talib as ta
+import numpy as np
+
+from collections import deque
+
+logger = logging.getLogger(__name__)
+
+
+# Expected type for each V2 parameter key.
+# float fields accept int values (e.g. 240 is valid for take_profit_ticks).
+_PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
+    "api_mode": str,
+    "candle_frequency": str,
+    "bb_period": int,
+    "bb_std": float,
+    "rsi_period": int,
+    "rsi_oversold": (
+        int,
+        float,
+    ),  # RSI values from TA-Lib are float; allow float thresholds
+    "rsi_overbought": (int, float),  # e.g. 29.5 or 70.0 are both valid
+    "max_long_positions": int,
+    "max_short_positions": int,
+    "contract_size": float,
+    "min_dist_between_entries_ticks": float,
+    "take_profit_ticks": float,
+}
+
+
+def _validate_params(data: dict, path: str) -> None:
+    """Validate that all required V2 keys are present and correctly typed.
+
+    Collects every missing key and every type mismatch before logging them
+    all at once, so a single bad file produces a complete error report.
+
+    Args:
+        data: Parsed JSON dict to validate.
+        path: File path used in error messages.
+
+    Raises:
+        SystemExit: If any key is missing or has the wrong type.
+    """
+    errors: list[str] = []
+
+    for key, expected in _PARAMS_SCHEMA.items():
+        if key not in data:
+            errors.append(f"  missing key: '{key}'")
+            continue
+
+        value = data[key]
+
+        if expected is bool:
+            if not isinstance(value, bool):
+                errors.append(
+                    f"  '{key}': expected bool, got {type(value).__name__} ({value!r})"
+                )
+        elif expected is int:
+            if isinstance(value, bool) or not isinstance(value, int):
+                errors.append(
+                    f"  '{key}': expected int, got {type(value).__name__} ({value!r})"
+                )
+        elif expected is float:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                errors.append(
+                    f"  '{key}': expected float, got {type(value).__name__} ({value!r})"
+                )
+        elif isinstance(expected, tuple):
+            # Multi-type schema entry (e.g. (int, float)) — value must match any allowed type
+            if isinstance(value, bool) or not isinstance(value, expected):
+                type_names = " | ".join(t.__name__ for t in expected)
+                errors.append(
+                    f"  '{key}': expected {type_names}, got {type(value).__name__} ({value!r})"
+                )
+        elif not isinstance(value, expected):
+            errors.append(
+                f"  '{key}': expected {expected.__name__}, got {type(value).__name__} ({value!r})"
+            )
+
+    if errors:
+        logger.critical(
+            f"Parameter validation failed for {path} — {len(errors)} error(s):\n"
+            + "\n".join(errors)
+        )
+        sys.exit(1)
+
+
+def load_params(
+    path: str = "strategies/RSIBollingerStrategyV2.json",
+) -> types.SimpleNamespace:
+    """Load and validate V2 strategy parameters from a JSON file.
+
+    Reads the JSON file at ``path``, validates all required keys and their
+    types, and returns the parameters as a SimpleNamespace for attribute-style
+    access.
+
+    Args:
+        path: Path to the JSON parameters file. Defaults to
+            ``strategies/RSIBollingerStrategyV2.json`` in the working directory.
+
+    Returns:
+        SimpleNamespace with one attribute per JSON key.
+
+    Raises:
+        SystemExit: If the file is missing, unreadable, contains invalid JSON,
+            has missing keys, or type mismatches.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        logger.critical(f"Parameters file not found: {path}")
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        logger.critical(f"Invalid JSON in {path}: {e}")
+        sys.exit(1)
+    except OSError as e:
+        logger.critical(f"Could not read {path}: {e}")
+        sys.exit(1)
+
+    _validate_params(data, path)
+
+    logger.info(f"Parameters loaded from {path}.")
+    return types.SimpleNamespace(**data)
+
+
+class RSIBollingerStrategyV2:
+    """Event-driven bidirectional mean-reversion strategy.
+
+    Consumes closed 5-minute candles from a queue (delivered by IGStreamingClient).
+    Maintains independent long and short position grids. Entry signals are
+    BB + RSI crossovers; exits are opposite-band crossovers with per-position
+    spread-aware profit check. All positions use flat contract_size.
+
+    Attributes:
+        params: Configuration object loaded from strategies/RSIBollingerStrategyV2.json.
+        ig: IGClient instance used for all broker interactions.
+        streaming_client: IGStreamingClient instance (owns the Lightstreamer connection).
+        trading_config: SimpleNamespace with infrastructure params (epic).
+    """
+
+    def __init__(self, params, ig_client, streaming_client, trading_config):
+        """Initialise strategy state.
+
+        Args:
+            params: SimpleNamespace loaded from RSIBollingerStrategyV2.json.
+                Required keys: bb_period, bb_std, rsi_period, rsi_oversold,
+                rsi_overbought, max_long_positions, max_short_positions,
+                contract_size, min_dist_between_entries_ticks, take_profit_ticks.
+            ig_client: Authenticated IGClient instance for REST position management.
+            streaming_client: IGStreamingClient instance for candle delivery.
+            trading_config: SimpleNamespace with infrastructure params sourced from
+                config.json["trading"]. Expected keys: epic.
+        """
+        self.params = params
+        self.ig = ig_client
+        self.streaming_client = streaming_client
+        self.trading_config = trading_config
+        self.epic = trading_config.epic
+
+        # Spread is calculated dynamically from each candle's OFR_CLOSE - BID_CLOSE.
+        # None until the first candle is processed; profit checks use 0.0 as fallback.
+        self._current_spread: float | None = None
+
+        # Rolling window of closed candles — minimum length for indicator calculation
+        # Needs bb_period + rsi_period candles for both indicators to be valid
+        min_window = max(params.bb_period, params.rsi_period) + 1
+        self._candle_window: deque = deque(maxlen=min_window + 50)
+
+        # Independent position grids
+        # Each entry: {"deal_id": str, "entry_price": float, "size": float}
+        self._long_positions: list[dict] = []
+        self._short_positions: list[dict] = []
+
+        # Stop event — set by stop() to signal run() to exit
+        self._stop_event: threading.Event = threading.Event()
+
+    # ---------------------------------------------------------------------- #
+    # Indicator computation                                                    #
+    # ---------------------------------------------------------------------- #
+
+    def _compute_indicators(self, candle: dict) -> dict | None:
+        """Add candle to the rolling window and compute BB and RSI.
+
+        Args:
+            candle: OHLC candle dict with at least a 'close' key.
+
+        Returns:
+            Dict with keys bb_upper, bb_middle, bb_lower, rsi, close when
+            enough history is available; None if the window is too short.
+        """
+        self._candle_window.append(candle["close"])
+
+        window_size = len(self._candle_window)
+        min_required = max(self.params.bb_period, self.params.rsi_period) + 1
+
+        if window_size < min_required:
+            logger.debug(
+                f"Candle window too small ({window_size}/{min_required}) — skipping."
+            )
+            return None
+
+        closes = np.array(list(self._candle_window), dtype=float)
+
+        bb_upper, bb_middle, bb_lower = ta.BBANDS(
+            closes,
+            timeperiod=self.params.bb_period,
+            nbdevup=self.params.bb_std,
+            nbdevdn=self.params.bb_std,
+            matype=0,
+        )
+        rsi = ta.RSI(closes, timeperiod=self.params.rsi_period)
+
+        current_close = closes[-1]
+        current_bb_upper = float(bb_upper[-1])
+        current_bb_middle = float(bb_middle[-1])
+        current_bb_lower = float(bb_lower[-1])
+        current_rsi = float(rsi[-1])
+
+        if any(np.isnan(v) for v in [current_bb_upper, current_bb_lower, current_rsi]):
+            logger.debug("NaN indicators — skipping candle.")
+            return None
+
+        return {
+            "bb_upper": current_bb_upper,
+            "bb_middle": current_bb_middle,
+            "bb_lower": current_bb_lower,
+            "rsi": current_rsi,
+            "close": current_close,
+        }
+
+    # ---------------------------------------------------------------------- #
+    # Spread update                                                            #
+    # ---------------------------------------------------------------------- #
+
+    def _update_spread_from_candle(self, candle: dict) -> None:
+        """Update the current spread from a candle's spread field.
+
+        The candle's ``spread`` key (OFR_CLOSE - BID_CLOSE) represents the
+        live market spread at candle close. Calling this before evaluating
+        exit conditions ensures profit calculations use the most recent spread.
+
+        Args:
+            candle: OHLC candle dict delivered by IGStreamingClient. Must
+                contain a ``spread`` key with a non-negative float value.
+        """
+        spread = candle.get("spread")
+        if spread is not None:
+            self._current_spread = float(spread)
+            logger.debug(f"Spread updated from candle: {self._current_spread:.4f}")
+
+    # ---------------------------------------------------------------------- #
+    # Long grid management                                                     #
+    # ---------------------------------------------------------------------- #
+
+    def _manage_longs(self, indicators: dict) -> None:
+        """Evaluate long exits then long entries using the latest indicators.
+
+        Exit condition: price STRICTLY > BB_upper AND profit after spread > 0.
+            (price == BB_upper does NOT trigger exit)
+        Entry condition: price STRICTLY < BB_lower AND RSI STRICTLY < rsi_oversold
+                         AND longs < max_long_positions
+                         AND distance from last entry >= min_dist_between_entries_ticks.
+            (price == BB_lower does NOT trigger entry)
+
+        Args:
+            indicators: Dict with bb_upper, bb_lower, rsi, close from
+                _compute_indicators.
+        """
+        close = indicators["close"]
+        bb_upper = indicators["bb_upper"]
+        bb_lower = indicators["bb_lower"]
+        rsi = indicators["rsi"]
+
+        # --- EXITS ---
+        # Exit condition: price STRICTLY > bb_upper AND profit after spread > 0.
+        spread = self._current_spread if self._current_spread is not None else 0.0
+        if close > bb_upper and self._long_positions:
+            to_close = []  # list of (pos, profit) tuples — profit computed once
+            to_keep = []
+            for pos in self._long_positions:
+                profit = _long_profit(close, pos["entry_price"], spread, pos["size"])
+                if profit > 0:
+                    to_close.append((pos, profit))
+                else:
+                    to_keep.append(pos)
+
+            for pos, profit in to_close:
+                closed_ok = False
+                try:
+                    self.ig.close_position(pos["deal_id"], "SELL", pos["size"])
+                    closed_ok = True
+                except Exception as e:
+                    logger.error(f"Failed to close long {pos['deal_id']}: {e}")
+                    pos["needs_reconciliation"] = True
+                    to_keep.append(pos)
+
+                if closed_ok:
+                    logger.info(
+                        f"Closed LONG {pos['deal_id']} @ {close:.2f} "
+                        f"(entry={pos['entry_price']:.2f}, profit={profit:.2f})"
+                    )
+
+            self._long_positions = to_keep
+
+        # --- ENTRIES ---
+        if close >= bb_lower or rsi >= self.params.rsi_oversold:
+            return
+        if len(self._long_positions) >= self.params.max_long_positions:
+            return
+        if self._long_positions:
+            last_entry = self._long_positions[-1]["entry_price"]
+            if not _distance_ok(
+                close, last_entry, self.params.min_dist_between_entries_ticks
+            ):
+                return
+
+        limit_distance = self.params.take_profit_ticks
+        size = self.params.contract_size
+
+        try:
+            response = self.ig.open_position(
+                epic=self.epic,
+                size=size,
+                side="BUY",
+                limit=limit_distance,
+            )
+            deal_id = _extract_deal_id(response)
+            if deal_id == "unknown":
+                logger.critical(
+                    f"LONG position opened but deal_id could not be extracted "
+                    f"(response={response!r}). Skipping grid entry to prevent phantom position."
+                )
+            else:
+                self._long_positions.append(
+                    {"deal_id": deal_id, "entry_price": close, "size": size}
+                )
+                logger.info(
+                    f"Opened LONG {deal_id} @ {close:.2f} | "
+                    f"size={size} | TP dist={limit_distance}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to open long position: {e}")
+
+    # ---------------------------------------------------------------------- #
+    # Short grid management                                                    #
+    # ---------------------------------------------------------------------- #
+
+    def _manage_shorts(self, indicators: dict) -> None:
+        """Evaluate short exits then short entries using the latest indicators.
+
+        Exit condition: price STRICTLY < BB_lower AND profit after spread > 0.
+            (price == BB_lower does NOT trigger exit)
+        Entry condition: price STRICTLY > BB_upper AND RSI STRICTLY > rsi_overbought
+                         AND shorts < max_short_positions
+                         AND distance from last entry >= min_dist_between_entries_ticks.
+            (price == BB_upper does NOT trigger entry)
+
+        Args:
+            indicators: Dict with bb_upper, bb_lower, rsi, close from
+                _compute_indicators.
+        """
+        close = indicators["close"]
+        bb_upper = indicators["bb_upper"]
+        bb_lower = indicators["bb_lower"]
+        rsi = indicators["rsi"]
+
+        # --- EXITS ---
+        # Exit condition: price STRICTLY < bb_lower AND profit after spread > 0.
+        spread = self._current_spread if self._current_spread is not None else 0.0
+        if close < bb_lower and self._short_positions:
+            to_close = []  # list of (pos, profit) tuples — profit computed once
+            to_keep = []
+            for pos in self._short_positions:
+                profit = _short_profit(close, pos["entry_price"], spread, pos["size"])
+                if profit > 0:
+                    to_close.append((pos, profit))
+                else:
+                    to_keep.append(pos)
+
+            for pos, profit in to_close:
+                closed_ok = False
+                try:
+                    self.ig.close_position(pos["deal_id"], "BUY", pos["size"])
+                    closed_ok = True
+                except Exception as e:
+                    logger.error(f"Failed to close short {pos['deal_id']}: {e}")
+                    pos["needs_reconciliation"] = True
+                    to_keep.append(pos)
+
+                if closed_ok:
+                    logger.info(
+                        f"Closed SHORT {pos['deal_id']} @ {close:.2f} "
+                        f"(entry={pos['entry_price']:.2f}, profit={profit:.2f})"
+                    )
+
+            self._short_positions = to_keep
+
+        # --- ENTRIES ---
+        if close <= bb_upper or rsi <= self.params.rsi_overbought:
+            return
+        if len(self._short_positions) >= self.params.max_short_positions:
+            return
+        if self._short_positions:
+            last_entry = self._short_positions[-1]["entry_price"]
+            if not _distance_ok(
+                close, last_entry, self.params.min_dist_between_entries_ticks
+            ):
+                return
+
+        limit_distance = self.params.take_profit_ticks
+        size = self.params.contract_size
+
+        try:
+            response = self.ig.open_position(
+                epic=self.epic,
+                size=size,
+                side="SELL",
+                limit=limit_distance,
+            )
+            deal_id = _extract_deal_id(response)
+            if deal_id == "unknown":
+                logger.critical(
+                    f"SHORT position opened but deal_id could not be extracted "
+                    f"(response={response!r}). Skipping grid entry to prevent phantom position."
+                )
+            else:
+                self._short_positions.append(
+                    {"deal_id": deal_id, "entry_price": close, "size": size}
+                )
+                logger.info(
+                    f"Opened SHORT {deal_id} @ {close:.2f} | "
+                    f"size={size} | TP dist={limit_distance}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to open short position: {e}")
+
+    # ---------------------------------------------------------------------- #
+    # Reconciliation                                                           #
+    # ---------------------------------------------------------------------- #
+
+    def _reconcile_positions(self) -> None:
+        """Reconcile local position grids against the broker's open positions.
+
+        Called before entry evaluation whenever any local position is flagged
+        ``needs_reconciliation=True`` (set after a failed close_position call).
+        Fetches the current open positions from the broker and removes any local
+        position that is no longer present at the broker. Positions that are
+        still open at the broker have their flag cleared.
+
+        Designed to be simple — one broker API call per reconciliation trigger,
+        no retries, no partial state. If the broker call itself fails, the
+        positions remain flagged and reconciliation is retried on the next candle.
+        """
+        try:
+            broker_data = self.ig.get_open_positions()
+        except Exception as e:
+            logger.error(f"Failed to fetch open positions for reconciliation: {e}")
+            return
+
+        # get_open_positions() returns a flat list of dicts. Each dict has a
+        # top-level 'dealId' key (not nested under 'position').
+        broker_deal_ids = {pos["dealId"] for pos in broker_data if "dealId" in pos}
+
+        def _filter(positions: list[dict]) -> list[dict]:
+            kept = []
+            for pos in positions:
+                if pos["deal_id"] in broker_deal_ids:
+                    pos.pop("needs_reconciliation", None)
+                    kept.append(pos)
+                else:
+                    logger.warning(
+                        f"Reconciliation: removing phantom position {pos['deal_id']} "
+                        f"(not found at broker)"
+                    )
+            return kept
+
+        self._long_positions = _filter(self._long_positions)
+        self._short_positions = _filter(self._short_positions)
+        logger.info("Position reconciliation complete.")
+
+    def _needs_reconciliation(self) -> bool:
+        """Return True if any local position is flagged for reconciliation."""
+        return any(
+            pos.get("needs_reconciliation")
+            for pos in self._long_positions + self._short_positions
+        )
+
+    # ---------------------------------------------------------------------- #
+    # Candle handler                                                           #
+    # ---------------------------------------------------------------------- #
+
+    _REQUIRED_CANDLE_KEYS = ("close", "bid_close", "ofr_close", "spread")
+
+    def _on_candle(self, candle: dict) -> None:
+        """Process a single closed candle: update spread, compute indicators, manage grids.
+
+        Called from the worker thread after dequeuing a candle from the
+        streaming client's delivery mechanism. The candle's spread field
+        (OFR_CLOSE - BID_CLOSE) is recorded first so that exit profit checks
+        always use the most recent live spread.
+
+        Malformed candles (missing required keys) are logged and skipped
+        explicitly rather than propagating a KeyError.
+
+        Args:
+            candle: OHLC dict delivered by IGStreamingClient callback.
+                Required keys: close, bid_close, ofr_close, spread.
+        """
+        missing = [k for k in self._REQUIRED_CANDLE_KEYS if k not in candle]
+        if missing:
+            logger.warning(
+                f"Skipping malformed candle — missing required keys: {missing}"
+            )
+            return
+
+        if self._needs_reconciliation():
+            self._reconcile_positions()
+
+        self._update_spread_from_candle(candle)
+        indicators = self._compute_indicators(candle)
+        if indicators is None:
+            return
+
+        logger.debug(
+            f"Candle processed: close={indicators['close']:.2f} "
+            f"BB=[{indicators['bb_lower']:.2f}, {indicators['bb_upper']:.2f}] "
+            f"RSI={indicators['rsi']:.2f}"
+        )
+
+        self._manage_longs(indicators)
+        self._manage_shorts(indicators)
+
+    # ---------------------------------------------------------------------- #
+    # Main loop                                                                #
+    # ---------------------------------------------------------------------- #
+
+    def run(self) -> None:
+        """Start streaming and block until stop() is called.
+
+        Registers _on_candle as the callback directly with the streaming client
+        and calls start(). The IGStreamingClient's own worker thread delivers
+        candles to _on_candle — no intermediate re-queuing in this class.
+        run() then blocks on _stop_event until stop() is called.
+        """
+        logger.info("RSIBollingerStrategyV2 starting.")
+        self._stop_event.clear()
+        self.streaming_client.start(self._on_candle)
+        self._stop_event.wait()
+        logger.info("RSIBollingerStrategyV2 stopped.")
+
+    def stop(self) -> None:
+        """Signal the run() loop to exit and halt candle delivery immediately.
+
+        Calls streaming_client.stop() to disconnect the Lightstreamer session
+        so no new candles arrive after stop() returns. Then sets _stop_event
+        to unblock run().
+        """
+        self.streaming_client.stop()
+        self._stop_event.set()
+
+
+# --------------------------------------------------------------------------- #
+# Utilities                                                                    #
+# --------------------------------------------------------------------------- #
+
+
+def _long_profit(close: float, entry_price: float, spread: float, size: float) -> float:
+    """Compute unrealised profit for a long position after spread.
+
+    Args:
+        close: Current close price.
+        entry_price: Price at which the long was opened.
+        spread: Instrument bid/ask spread in points.
+        size: Position size in contracts.
+
+    Returns:
+        Unrealised profit. Positive means profitable.
+    """
+    return (close - entry_price - spread) * size
+
+
+def _short_profit(
+    close: float, entry_price: float, spread: float, size: float
+) -> float:
+    """Compute unrealised profit for a short position after spread.
+
+    Args:
+        close: Current close price.
+        entry_price: Price at which the short was opened.
+        spread: Instrument bid/ask spread in points.
+        size: Position size in contracts.
+
+    Returns:
+        Unrealised profit. Positive means profitable.
+    """
+    return (entry_price - close - spread) * size
+
+
+def _distance_ok(close: float, last_entry: float, min_ticks: float) -> bool:
+    """Return True when the distance between close and last entry meets the minimum.
+
+    Args:
+        close: Current close price.
+        last_entry: Entry price of the most recent grid position.
+        min_ticks: Minimum required distance in ticks (points).
+
+    Returns:
+        True when abs(close - last_entry) >= min_ticks.
+    """
+    return abs(close - last_entry) >= min_ticks
+
+
+def _extract_deal_id(response) -> str:
+    """Extract deal_id from an IG open_position response.
+
+    Args:
+        response: Return value of IGClient.open_position (dict or MagicMock).
+
+    Returns:
+        Deal ID string, or 'unknown' if extraction fails.
+    """
+    try:
+        if hasattr(response, "get"):
+            return response.get("dealReference", "unknown") or "unknown"
+        return "unknown"
+    except Exception:
+        return "unknown"

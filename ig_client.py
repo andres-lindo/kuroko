@@ -62,6 +62,19 @@ class IGClient:
         self.cache_dir = Path("./cache")
         self.cache_dir.mkdir(exist_ok=True)
 
+    @property
+    def ig_service(self):
+        """Return the underlying IGService instance for streaming auth.
+
+        Provides read-only access to the authenticated IGService so that
+        callers (e.g. IGStreamingClient) can create a streaming session
+        from the same REST auth without re-authenticating.
+
+        Returns:
+            The active IGService object created during __init__.
+        """
+        return self._svc
+
     def _safe_api_call(self, func, *args, max_retries=3, **kwargs):
         """Execute an API call with retry and session-refresh logic.
 
@@ -297,9 +310,23 @@ class IGClient:
             if open_positions.empty:
                 return []
 
-            return open_positions[
-                ["dealReference", "dealId", "level", "size", "createdDate", "direction"]
-            ].to_dict(orient="records")
+            expected_cols = [
+                "dealReference",
+                "dealId",
+                "level",
+                "size",
+                "createdDate",
+                "direction",
+            ]
+            missing_cols = [c for c in expected_cols if c not in open_positions.columns]
+            if missing_cols:
+                log.warning(
+                    f"get_open_positions: unexpected DataFrame schema — missing columns "
+                    f"{missing_cols}. Returning empty list to avoid KeyError."
+                )
+                return []
+
+            return open_positions[expected_cols].to_dict(orient="records")
         except Exception as e:
             log.error(f"Error fetching open positions: {e}")
             return []

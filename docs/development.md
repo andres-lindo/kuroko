@@ -99,9 +99,9 @@ pre-commit run --all-files
 - **Formatter**: black (enforced via pre-commit, line length default: 88)
 - **Language**: all code, variable names, inline comments, docstrings, and log messages must be in English
 - **Secrets**: never commit `credentials.env` or any file containing API keys or connection strings
-- **Config changes**: strategy parameters (signal and risk tuning) for live trading are stored in `strategies/RSIBollingerStrategy.json` and committed to the repository. Edit that file directly and redeploy the bot to apply changes. See [RSIBollingerStrategy documentation](../docs/strategies/RSIBollingerStrategy.md) for the full parameter reference. Infrastructure/deployment parameters (`epic`, `leverage`, `demo_starting_balance`, `initial_cash_balance`, `security_buffer`) are stored in `config.json["trading"]` — they are not in the strategy JSON.
+- **Config changes**: strategy parameters (signal and risk tuning) for live trading are stored in `strategies/<StrategyName>.json` and committed to the repository. Edit the file for the strategy you are running and redeploy the bot to apply changes. See the strategy documentation for the full parameter reference ([V1](../docs/strategies/RSIBollingerStrategy.md), [V2](../docs/strategies/RSIBollingerStrategyV2.md)). Infrastructure/deployment parameters (`epic`, `leverage`, `demo_starting_balance`, `initial_cash_balance`, `security_buffer`) are stored in `config.json["trading"]` — they are not in the strategy JSON.
 
-> **Note**: `strategies/RSIBollingerStrategy.json` (live) and `backtest/strategies/RSIBollingerStrategy.json` (backtest) are independent files. Tuning results from Optuna must be manually applied to the live config. See [backtest/README.md](../backtest/README.md) for details.
+> **Note**: `strategies/RSIBollingerStrategy.json` (live V1) and `backtest/strategies/RSIBollingerStrategy.json` (backtest) are independent files. Tuning results from Optuna must be manually applied to the live config. See [backtest/README.md](../backtest/README.md) for details.
 
 - **Dependencies**: add new external packages to `requirements.txt` (root) or `backtest/requirements.txt` depending on which execution context requires them
 
@@ -300,4 +300,58 @@ The `strategies/` directory is a Python package (contains `__init__.py`). The mo
 
 After updating the live strategy module, update the corresponding values in `strategies/<StrategyClassName>.json` and commit before deploying.
 
+#### api_mode (required in every strategy JSON)
+
+Every strategy JSON **must** declare `"api_mode"`. Valid values:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"rest"` | `kuroko.py` uses the existing REST polling flow. No streaming client is created. |
+| `"streaming"` | `kuroko.py` creates `IGStreamingClient` from `IGClient.ig_service` and passes it to the strategy constructor. |
+
+`kuroko.py` raises `ConfigurationError` (and exits with code 1) if `api_mode` is absent or has any other value. There is no implicit fallback.
+
+#### REST-mode strategy (reference: RSIBollingerStrategy)
+
+Constructor signature: `__init__(self, params, ig_client, trading_config)`
+
+The strategy receives a polling interval via `params.candle_frequency` and calls
+`ig_client` REST methods directly inside its run loop.
+
 See [RSIBollingerStrategy documentation](../docs/strategies/RSIBollingerStrategy.md) for the reference implementation.
+
+#### Streaming-mode strategy (reference: RSIBollingerStrategyV2)
+
+Constructor signature: `__init__(self, params, ig_client, streaming_client, trading_config)`
+
+The extra `streaming_client` argument is an `IGStreamingClient` instance. The
+strategy registers `_on_candle` as the callback and blocks on a stop event:
+
+```python
+def run(self) -> None:
+    self._stop_event.clear()
+    self.streaming_client.start(self._on_candle)
+    self._stop_event.wait()
+
+def stop(self) -> None:
+    self.streaming_client.stop()  # halt candle delivery immediately
+    self._stop_event.set()        # unblock run()
+```
+
+`IGStreamingClient` maintains its own internal queue and worker thread. Candles
+flow: LS thread → `IGStreamingClient` queue → worker thread → `_on_candle()`.
+There is no intermediate queue inside the strategy. All trading logic and REST
+calls run on the streaming client's worker thread.
+
+When mocking `IGStreamingClient` in unit tests, patch `start()` to immediately
+invoke the callback with a pre-built candle dict, then assert on `ig_client`
+method calls:
+
+```python
+def fake_start(callback):
+    callback(candle)
+
+mock_streaming.start.side_effect = fake_start
+```
+
+See [RSIBollingerStrategyV2 documentation](../docs/strategies/RSIBollingerStrategyV2.md) for the full reference.

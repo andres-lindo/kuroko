@@ -1,4 +1,5 @@
 {
+  "api_mode": "rest",
   "candle_frequency": "15min",
   "lookback": 300,
 

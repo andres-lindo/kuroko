@@ -1,0 +1,17 @@
+{
+  "api_mode": "streaming",
+  "candle_frequency": "5min",
+
+  "bb_period": 20,
+  "bb_std": 2.0,
+  "rsi_period": 14,
+  "rsi_oversold": 30.0,
+  "rsi_overbought": 70.0,
+
+  "max_long_positions": 5,
+  "max_short_positions": 5,
+  
+  "contract_size": 0.1,
+  "min_dist_between_entries_ticks": 20,
+  "take_profit_ticks": 240.0
+}

@@ -80,7 +80,10 @@ table_storage_connection=DefaultEndpointsProtocol=https;AccountName=...
 
 > `ig_acc_type` controls live vs demo mode (`DEMO` or `LIVE`). See [`docs/architecture.md`](docs/architecture.md#account-mode) before switching to a live account.
 
-Strategy parameters are stored in `strategies/RSIBollingerStrategy.json` (live trading) and `backtest/strategies/RSIBollingerStrategy.json` (backtesting) — both committed to the repository. Edit the corresponding file before running. See [RSIBollingerStrategy documentation](docs/strategies/RSIBollingerStrategy.md) for the full parameter reference.
+Strategy parameters are stored in the corresponding `strategies/<StrategyName>.json` file and committed to the repository. Edit the file before running. See the strategy documentation for the full parameter reference:
+
+- [RSIBollingerStrategy](docs/strategies/RSIBollingerStrategy.md) — REST-polling, martingale grid, 15-min candles
+- [RSIBollingerStrategyV2](docs/strategies/RSIBollingerStrategyV2.md) — Lightstreamer streaming, bidirectional grids, 5-min candles
 
 ---
 
@@ -93,19 +96,23 @@ kuroko/
 ├── .pre-commit-config.yaml      # pre-commit hooks
 │
 ├── kuroko.py                    # Entry point — loads strategy dynamically
-├── ig_client.py                 # IG Markets API wrapper (auth, retry, caching)
+├── ig_client.py                 # IG Markets REST API wrapper (auth, retry, caching)
+├── ig_streaming_client.py       # Lightstreamer streaming client — delivers 5-min OHLC candles via callback
 ├── azure_log_handler.py         # Custom logging handler → Azure Blob Storage
 │
 ├── strategies/                  # Python package — live strategy modules (.py) and config files (.json)
 │   ├── __init__.py
-│   ├── RSIBollingerStrategy.py  # RSIBollingerStrategy: trading logic, signal generation, risk management
-│   └── RSIBollingerStrategy.json
+│   ├── RSIBollingerStrategy.py      # V1: REST-polling, martingale grid, 15-min candles
+│   ├── RSIBollingerStrategy.json
+│   ├── RSIBollingerStrategyV2.py    # V2: Lightstreamer streaming, bidirectional grids, 5-min candles
+│   └── RSIBollingerStrategyV2.json
 │
 ├── docs/
 │   ├── architecture.md          # Component breakdown, trading logic, config flow
 │   ├── development.md           # Branching model, pre-commit, conventions, adding strategies
 │   └── strategies/
-│       └── RSIBollingerStrategy.md  # Strategy parameters, entry/exit logic, protection mechanisms
+│       ├── RSIBollingerStrategy.md   # V1 strategy parameters, entry/exit logic, protection mechanisms
+│       └── RSIBollingerStrategyV2.md # V2 strategy parameters, entry/exit logic (streaming, bidirectional)
 │
 └── backtest/                    # Offline backtesting and optimization (isolated venv)
     ├── requirements.txt         # Backtest-specific dependencies
@@ -134,17 +141,23 @@ source venv/bin/activate          # macOS/Linux
 python kuroko.py --strategy <StrategyName>
 ```
 
-`--strategy` is required and must name the strategy class to run. The Azure Blob log partition key is read from `log_partition_key` in the strategy JSON config.
+`--strategy` is required and must name the strategy class to run.
 
 ```bash
+# REST-polling strategy (V1)
 python kuroko.py --strategy RSIBollingerStrategy
+
+# Streaming strategy (V2 — Lightstreamer, bidirectional grids)
+python kuroko.py --strategy RSIBollingerStrategyV2
 ```
 
-See [RSIBollingerStrategy documentation](docs/strategies/RSIBollingerStrategy.md) for parameter reference.
+See the strategy documentation for parameters and behaviour:
+- [RSIBollingerStrategy](docs/strategies/RSIBollingerStrategy.md)
+- [RSIBollingerStrategyV2](docs/strategies/RSIBollingerStrategyV2.md)
 
 Stop the bot with `CTRL+C`.
 
-> **Startup failure**: if the bot exits immediately with a `CRITICAL` log entry, first check the strategy module name (e.g. `strategies/RSIBollingerStrategy.py` must exist). Then verify that `strategies/RSIBollingerStrategy.json` contains valid JSON, has all 24 required keys with the correct types, and that `candle_frequency` matches the pattern `\d+min` (e.g. `"15min"`). The error log will list every missing key and type mismatch in one report. Startup failure is the only fatal failure — everything else is recovered automatically.
+> **Startup failure**: if the bot exits immediately with a `CRITICAL` log entry, first check the strategy module name (e.g. `strategies/RSIBollingerStrategy.py` must exist). Then verify that `strategies/<StrategyName>.json` contains valid JSON, has all required keys with the correct types (see the strategy docs for the full schema), and that `api_mode` is either `"rest"` or `"streaming"`. The error log will list every missing key and type mismatch in one report. Startup failure is the only fatal failure — everything else is recovered automatically.
 
 > **Runtime failures**: the bot does not crash on IG API errors. If the IG API is unavailable (maintenance window, timeout, empty response), the bot skips the affected cycle, logs a WARNING or ERROR, and retries on the next tick (~1 minute). It recovers automatically when the API comes back. See [`docs/architecture.md`](docs/architecture.md#fault-tolerance-and-self-healing) for the full recovery model.
 
@@ -160,3 +173,5 @@ The backtest module runs in its **own isolated environment** with its own depend
 
 - [`docs/architecture.md`](docs/architecture.md) — component breakdown, trading logic, configuration flow, backtest engine internals
 - [`docs/development.md`](docs/development.md) — branching model, pre-commit hooks, conventions, adding strategies
+- [`docs/strategies/RSIBollingerStrategy.md`](docs/strategies/RSIBollingerStrategy.md) — V1 strategy parameters and logic
+- [`docs/strategies/RSIBollingerStrategyV2.md`](docs/strategies/RSIBollingerStrategyV2.md) — V2 strategy parameters and logic (streaming)
