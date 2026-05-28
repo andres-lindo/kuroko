@@ -27,16 +27,49 @@ EPIC = "IX.D.NASDAQ.IFMM.IP"
 
 
 # ---------------------------------------------------------------------------
+# Lightstreamer ItemUpdate stub
+# ---------------------------------------------------------------------------
+
+
+class _FakeItemUpdate:
+    """Minimal stub mimicking a Lightstreamer ItemUpdate object.
+
+    The real Lightstreamer client passes an ItemUpdate to onItemUpdate
+    callbacks. Field values are retrieved via getValue("FIELD_NAME"), which
+    returns str | None (None when the field was not present in the update).
+    """
+
+    def __init__(self, fields: dict):
+        """Initialise with a field-value mapping.
+
+        Args:
+            fields: Dict of field names to string values (or None).
+        """
+        self._fields = fields
+
+    def getValue(self, field_name: str):
+        """Return the string value for a field, or None if absent.
+
+        Args:
+            field_name: Lightstreamer field name (e.g. 'BID_CLOSE').
+
+        Returns:
+            String value or None.
+        """
+        return self._fields.get(field_name)
+
+
+# ---------------------------------------------------------------------------
 # Fixtures (promoted from tests/streaming/conftest.py)
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
 def build_candle_update():
-    """Factory fixture: returns callable(**fields) → dict mimicking a Lightstreamer update.
+    """Factory fixture: returns callable(**fields) → _FakeItemUpdate mimicking a Lightstreamer update.
 
     Returns:
-        A factory function that builds a field-value map dict representing
+        A factory function that builds a _FakeItemUpdate representing
         a Lightstreamer item update for a candle subscription.
     """
 
@@ -52,8 +85,8 @@ def build_candle_update():
         cons_end="1",
         utm="1716825600000",
         ltv="0",
-    ) -> dict:
-        """Build a candle update dict with optional field overrides.
+    ) -> _FakeItemUpdate:
+        """Build a candle ItemUpdate stub with optional field overrides.
 
         Args:
             bid_open: BID_OPEN price as float.
@@ -69,21 +102,23 @@ def build_candle_update():
             ltv: LTV (last trade volume) as string.
 
         Returns:
-            Dict of field names to string values matching Lightstreamer format.
+            _FakeItemUpdate with field values matching Lightstreamer format.
         """
-        return {
-            "BID_OPEN": str(bid_open),
-            "BID_HIGH": str(bid_high),
-            "BID_LOW": str(bid_low),
-            "BID_CLOSE": str(bid_close),
-            "OFR_OPEN": str(ofr_open),
-            "OFR_HIGH": str(ofr_high),
-            "OFR_LOW": str(ofr_low),
-            "OFR_CLOSE": str(ofr_close),
-            "CONS_END": cons_end,
-            "UTM": utm,
-            "LTV": ltv,
-        }
+        return _FakeItemUpdate(
+            {
+                "BID_OPEN": str(bid_open),
+                "BID_HIGH": str(bid_high),
+                "BID_LOW": str(bid_low),
+                "BID_CLOSE": str(bid_close),
+                "OFR_OPEN": str(ofr_open),
+                "OFR_HIGH": str(ofr_high),
+                "OFR_LOW": str(ofr_low),
+                "OFR_CLOSE": str(ofr_close),
+                "CONS_END": cons_end,
+                "UTM": utm,
+                "LTV": ltv,
+            }
+        )
 
     return _factory
 
@@ -739,18 +774,20 @@ class TestCandleListenerCallbacks:
         """When UTM cannot be parsed, timestamp falls back to datetime.now(UTC)."""
         q = queue.Queue()
         listener = _CandleSubscriptionListener("CHART:TEST:5MINUTE", q)
-        values = {
-            "CONS_END": "1",
-            "UTM": "not_a_number",  # triggers ValueError → fallback to now()
-            "BID_OPEN": "100.0",
-            "BID_HIGH": "101.0",
-            "BID_LOW": "99.0",
-            "BID_CLOSE": "100.5",
-            "OFR_CLOSE": "100.7",
-            "LTV": "5",
-        }
+        update = _FakeItemUpdate(
+            {
+                "CONS_END": "1",
+                "UTM": "not_a_number",  # triggers ValueError → fallback to now()
+                "BID_OPEN": "100.0",
+                "BID_HIGH": "101.0",
+                "BID_LOW": "99.0",
+                "BID_CLOSE": "100.5",
+                "OFR_CLOSE": "100.7",
+                "LTV": "5",
+            }
+        )
 
-        listener.onItemUpdate(values)
+        listener.onItemUpdate(update)
 
         candle = q.get_nowait()
         assert isinstance(candle["timestamp"], datetime)
@@ -760,18 +797,20 @@ class TestCandleListenerCallbacks:
         """When LTV cannot be parsed, volume falls back to 0."""
         q = queue.Queue()
         listener = _CandleSubscriptionListener("CHART:TEST:5MINUTE", q)
-        values = {
-            "CONS_END": "1",
-            "UTM": "1716825600000",
-            "BID_OPEN": "100.0",
-            "BID_HIGH": "101.0",
-            "BID_LOW": "99.0",
-            "BID_CLOSE": "100.5",
-            "OFR_CLOSE": "100.7",
-            "LTV": "bad_volume",  # triggers ValueError → volume = 0
-        }
+        update = _FakeItemUpdate(
+            {
+                "CONS_END": "1",
+                "UTM": "1716825600000",
+                "BID_OPEN": "100.0",
+                "BID_HIGH": "101.0",
+                "BID_LOW": "99.0",
+                "BID_CLOSE": "100.5",
+                "OFR_CLOSE": "100.7",
+                "LTV": "bad_volume",  # triggers ValueError → volume = 0
+            }
+        )
 
-        listener.onItemUpdate(values)
+        listener.onItemUpdate(update)
 
         candle = q.get_nowait()
         assert candle["volume"] == 0
@@ -780,13 +819,15 @@ class TestCandleListenerCallbacks:
         """CONS_END=0 must not enqueue anything."""
         q = queue.Queue()
         listener = _CandleSubscriptionListener("CHART:TEST:5MINUTE", q)
-        values = {
-            "CONS_END": "0",
-            "BID_CLOSE": "100.0",
-            "OFR_CLOSE": "100.5",
-        }
+        update = _FakeItemUpdate(
+            {
+                "CONS_END": "0",
+                "BID_CLOSE": "100.0",
+                "OFR_CLOSE": "100.5",
+            }
+        )
 
-        listener.onItemUpdate(values)
+        listener.onItemUpdate(update)
 
         assert q.empty()
 
@@ -821,25 +862,29 @@ class TestTickListenerCallbacks:
         """_TickListener.onItemUpdate with unparseable values must not raise."""
         agg = TickAggregator(5, lambda c: None)
         listener = _TickListener("CHART:TEST:TICK", agg)
-        values = {
-            "BID": "not_a_float",  # triggers ValueError
-            "OFR": "100.5",
-            "UTM": "1716825600000",
-        }
+        update = _FakeItemUpdate(
+            {
+                "BID": "not_a_float",  # triggers ValueError
+                "OFR": "100.5",
+                "UTM": "1716825600000",
+            }
+        )
 
-        listener.onItemUpdate(values)  # must not raise
+        listener.onItemUpdate(update)  # must not raise
 
     def test_missing_tick_field_does_not_raise(self):
         """_TickListener.onItemUpdate with missing UTM field must not raise."""
         agg = TickAggregator(5, lambda c: None)
         listener = _TickListener("CHART:TEST:TICK", agg)
-        values = {
-            "BID": "100.0",
-            "OFR": "100.5",
-            # UTM absent — default "0" is used by .get()
-        }
+        update = _FakeItemUpdate(
+            {
+                "BID": "100.0",
+                "OFR": "100.5",
+                # UTM absent — getValue returns None, "or '0'" provides the default
+            }
+        )
 
-        listener.onItemUpdate(values)  # must not raise
+        listener.onItemUpdate(update)  # must not raise
 
 
 # ---------------------------------------------------------------------------

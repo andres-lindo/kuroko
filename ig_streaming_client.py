@@ -152,39 +152,37 @@ class _CandleSubscriptionListener:
     # These MUST be camelCase — the library dispatches to these exact method names.
     # snake_case versions would be silently ignored by the Lightstreamer dispatcher.
 
-    def onItemUpdate(self, values: dict) -> None:
+    def onItemUpdate(self, update) -> None:
         """Process a Lightstreamer item update.
 
         Called by the Lightstreamer library dispatcher (camelCase required).
         Enqueues a completed candle dict when CONS_END is '1'. Ignores all
         other updates (CONS_END=0 or missing).
 
-        In production, ``values`` is a dict-like field-value mapping.
-        In tests, a plain dict is passed directly to simulate LS behaviour.
-
         Args:
-            values: Field-value mapping from the Lightstreamer update.
+            update: Lightstreamer ItemUpdate object. Use update.getValue("FIELD")
+                to retrieve field values; returns str or None.
         """
-        cons_end = values.get("CONS_END", "0")
+        cons_end = update.getValue("CONS_END")
         if cons_end != "1":
             return
 
         try:
-            utm_ms = int(values.get("UTM", "0"))
+            utm_ms = int(update.getValue("UTM") or "0")
             timestamp = datetime.fromtimestamp(utm_ms / 1000.0, tz=timezone.utc)
         except (ValueError, TypeError):
             timestamp = datetime.now(tz=timezone.utc)
 
-        bid_close = float(values.get("BID_CLOSE", "0"))
-        ofr_close = float(values.get("OFR_CLOSE", "0"))
+        bid_close = float(update.getValue("BID_CLOSE") or "0")
+        ofr_close = float(update.getValue("OFR_CLOSE") or "0")
         try:
-            volume = int(values.get("LTV", "0"))
+            volume = int(update.getValue("LTV") or "0")
         except (ValueError, TypeError):
             volume = 0
         candle = {
-            "open": float(values.get("BID_OPEN", "0")),
-            "high": float(values.get("BID_HIGH", "0")),
-            "low": float(values.get("BID_LOW", "0")),
+            "open": float(update.getValue("BID_OPEN") or "0"),
+            "high": float(update.getValue("BID_HIGH") or "0"),
+            "low": float(update.getValue("BID_LOW") or "0"),
             "close": bid_close,
             "bid_close": bid_close,
             "ofr_close": ofr_close,
@@ -236,18 +234,19 @@ class _TickListener:
     # NOTE: The Lightstreamer Python client library uses camelCase callback names.
     # onItemUpdate MUST be camelCase — the library dispatches to this exact method name.
 
-    def onItemUpdate(self, values: dict) -> None:
+    def onItemUpdate(self, update) -> None:
         """Forward a tick update to the aggregator.
 
         Called by the Lightstreamer library dispatcher (camelCase required).
 
         Args:
-            values: Field-value mapping from the Lightstreamer update.
+            update: Lightstreamer ItemUpdate object. Use update.getValue("FIELD")
+                to retrieve field values; returns str or None.
         """
         try:
-            bid = float(values.get("BID", "0"))
-            ofr = float(values.get("OFR", "0"))
-            utm_ms = int(values.get("UTM", "0"))
+            bid = float(update.getValue("BID") or "0")
+            ofr = float(update.getValue("OFR") or "0")
+            utm_ms = int(update.getValue("UTM") or "0")
             utm = datetime.fromtimestamp(utm_ms / 1000.0, tz=timezone.utc)
             self._aggregator.on_tick(bid=bid, ofr=ofr, utm=utm)
         except (ValueError, TypeError) as e:
