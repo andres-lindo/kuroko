@@ -215,3 +215,4 @@ backtest/*.html
 backtest/tuning_output/*
 logs/
 
+CLAUDE.md
