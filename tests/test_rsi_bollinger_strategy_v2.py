@@ -12,6 +12,7 @@ All broker interactions are mocked — no live credentials required.
 """
 
 import json
+import os
 import queue
 import threading
 import types
@@ -874,10 +875,12 @@ class TestPhantomPositionReconciliation:
                 strat, "_manage_longs", side_effect=capture_positions_snapshot
             ),
             patch.object(strat, "_manage_shorts"),
+            patch.object(strat, "log_account_status"),
         ):
             strat._on_candle(candle)
 
-        # Reconciliation called the API exactly once
+        # Reconciliation called the API exactly once (log_account_status is patched
+        # to isolate the reconciliation call from the status-logging call)
         mock_ig.get_open_positions.assert_called_once()
         # DEAD position must already be gone when _manage_longs fires
         dead_ids = [p["deal_id"] for p in positions_at_manage_longs_call]
@@ -900,6 +903,7 @@ class TestPhantomPositionReconciliation:
         with (
             patch.object(strat, "_manage_longs"),
             patch.object(strat, "_manage_shorts"),
+            patch.object(strat, "log_account_status"),
         ):
             strat._on_candle(candle)
             mock_ig.get_open_positions.assert_not_called()
@@ -1874,10 +1878,10 @@ class TestV2JsonConfig:
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
         assert data["bb_period"] == 20
 
-    def test_v2_json_bb_std_is_1_5(self):
-        """bb_std must be 1.5 per config."""
+    def test_v2_json_bb_std_is_1_8(self):
+        """bb_std must be 1.8 per config."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["bb_std"] == 1.5
+        assert data["bb_std"] == 1.8
 
     def test_v2_json_rsi_period_is_7(self):
         """rsi_period must be 7 per config."""
@@ -3343,3 +3347,641 @@ class TestSeedPositionsFromBroker:
 
         assert not t.is_alive(), "run() did not return after stop()"
         mock_streaming.start.assert_called_once()
+
+
+# =========================================================================== #
+# Account status logging [REQ-1 through REQ-10]                                #
+# =========================================================================== #
+
+
+class TestAccountStatusLogging:
+    """log_account_status() emits account health, equity, margin, and grid breakdown (REQ-1–REQ-10)."""
+
+    # ---------------------------------------------------------------------- #
+    # Helpers                                                                  #
+    # ---------------------------------------------------------------------- #
+
+    @staticmethod
+    def _account_info(
+        balance: float = 10000.0,
+        deposit: float = 2000.0,
+        profit_loss: float = 500.0,
+        available: float = 8500.0,
+    ) -> dict:
+        """Build a minimal account summary dict."""
+        return {
+            "balance": balance,
+            "deposit": deposit,
+            "profitLoss": profit_loss,
+            "available": available,
+        }
+
+    @staticmethod
+    def _status_msgs(caplog, level):
+        """Return INFO log messages that contain 'STATUS' (the status log line)."""
+        import logging
+
+        return [
+            r.message
+            for r in caplog.records
+            if r.levelno == level and "STATUS" in r.message
+        ]
+
+    # ---------------------------------------------------------------------- #
+    # REQ-1: Method existence                                                  #
+    # ---------------------------------------------------------------------- #
+
+    def test_method_exists_and_is_callable(self, make_strategy_v2):
+        """log_account_status is callable on a live strategy instance (REQ-1)."""
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info()
+        mock_ig.get_open_positions.return_value = []
+
+        assert callable(getattr(strat, "log_account_status", None))
+
+    # ---------------------------------------------------------------------- #
+    # REQ-2: Early return on missing account data                              #
+    # ---------------------------------------------------------------------- #
+
+    def test_early_return_on_empty_dict(self, make_strategy_v2, caplog):
+        """When get_account_summary returns {}, a WARNING is logged and no STATUS INFO is emitted (REQ-2)."""
+        import logging
+
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = {}
+
+        with caplog.at_level(logging.DEBUG):
+            strat.log_account_status()
+
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        assert not any(
+            r.levelno == logging.INFO and "STATUS" in r.message for r in caplog.records
+        )
+
+    def test_early_return_on_none(self, make_strategy_v2, caplog):
+        """When get_account_summary returns None, a WARNING is logged and no STATUS INFO is emitted (REQ-2)."""
+        import logging
+
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = None
+
+        with caplog.at_level(logging.DEBUG):
+            strat.log_account_status()
+
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+        assert not any(
+            r.levelno == logging.INFO and "STATUS" in r.message for r in caplog.records
+        )
+
+    # ---------------------------------------------------------------------- #
+    # REQ-3: used_margin from broker positions (LIVE mode)                     #
+    # ---------------------------------------------------------------------- #
+
+    def test_used_margin_from_broker_positions_live(self, make_strategy_v2, caplog):
+        """In LIVE mode, used_margin is derived from broker open positions (REQ-3).
+
+        One position: size=1, level=20000, leverage=20 → used_margin = 1000.
+        """
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=4000.0, deposit=0.0, profit_loss=0.0, available=3500.0
+        )
+        # size=1, level=20000, leverage=20 → used_margin = 1000
+        mock_ig.get_open_positions.return_value = [
+            {"size": 1.0, "level": 20000.0, "epic": "IX.D.SPTRD.IFMM.IP"}
+        ]
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "1000" in msgs[0]
+
+    def test_positions_filtered_by_epic_for_margin_calc(self, make_strategy_v2, caplog):
+        """Positions for a different epic are excluded from used_margin calculation (REQ-3).
+
+        Broker returns two positions: one matching self.epic and one for a different epic.
+        Only the matching position contributes to used_margin.
+        Matching: size=1, level=20000, leverage=20 → used_margin=1000.
+        Non-matching: size=10, level=4000 → excluded → used_margin stays 1000.
+        """
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=4000.0, deposit=0.0, profit_loss=0.0, available=3500.0
+        )
+        mock_ig.get_open_positions.return_value = [
+            {"size": 1.0, "level": 20000.0, "epic": "IX.D.SPTRD.IFMM.IP"},
+            {"size": 10.0, "level": 4000.0, "epic": "IX.D.NASDAQ.IFMM.IP"},
+        ]
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        # used_margin = 1 * 20000 / 20 = 1000 (wrong-epic position excluded)
+        assert "Used Margin: $1000.00" in msgs[0]
+        # If both positions were included: used_margin = 1000 + 2000 = 3000
+        assert "Used Margin: $3000.00" not in msgs[0]
+
+    # ---------------------------------------------------------------------- #
+    # REQ-4: free_margin in LIVE mode comes from account available             #
+    # ---------------------------------------------------------------------- #
+
+    def test_free_margin_computed_from_equity_minus_used_margin_live(
+        self, make_strategy_v2, caplog
+    ):
+        """In LIVE mode, free_margin = equity - used_margin (self-consistent) (REQ-4).
+
+        balance=4000, profitLoss=0 → equity=4000. No positions → used_margin=0.
+        free_margin = 4000 - 0 = 4000.
+        """
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=4000.0, deposit=0.0, profit_loss=0.0, available=3500.0
+        )
+        mock_ig.get_open_positions.return_value = []
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "4000" in msgs[0]
+
+    # ---------------------------------------------------------------------- #
+    # REQ-5: equity in LIVE mode = balance + profitLoss                        #
+    # ---------------------------------------------------------------------- #
+
+    def test_equity_live_mode_balance_plus_profit_loss(self, make_strategy_v2, caplog):
+        """In LIVE mode, current_equity = balance + profitLoss (REQ-5)."""
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        # 4000 + 200 = 4200
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=4000.0, deposit=0.0, profit_loss=200.0, available=3500.0
+        )
+        mock_ig.get_open_positions.return_value = []
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "4200" in msgs[0]
+
+    # ---------------------------------------------------------------------- #
+    # REQ-5b: equity in DEMO mode = virtual_balance + profitLoss               #
+    # ---------------------------------------------------------------------- #
+
+    def test_equity_demo_mode_virtual_balance(self, make_strategy_v2, caplog):
+        """In DEMO mode, equity = (initial_cash_balance + realized_profit) + profitLoss (REQ-5b).
+
+        Conftest defaults: initial_cash_balance=4000, demo_starting_balance=20000.
+        balance=20200 → realized_profit = 200; virtual_balance = 4200; equity = 4200 + 50 = 4250.
+        """
+        import logging
+
+        strat, mock_ig, _ = make_strategy_v2()
+        assert not strat.is_live_account
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=20200.0, deposit=0.0, profit_loss=50.0, available=0.0
+        )
+        mock_ig.get_open_positions.return_value = []
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "4250" in msgs[0]
+
+    # ---------------------------------------------------------------------- #
+    # REQ-6: Margin level health thresholds                                    #
+    # ---------------------------------------------------------------------- #
+
+    def test_margin_health_idle_when_no_open_positions(self, make_strategy_v2, caplog):
+        """No broker positions → used_margin == 0 → [IDLE] with margin level N/A (REQ-6)."""
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=10000.0, deposit=0.0, profit_loss=0.0, available=10000.0
+        )
+        mock_ig.get_open_positions.return_value = []
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "[IDLE]" in msgs[0]
+        assert "N/A" in msgs[0]
+
+    def test_margin_health_danger_below_120(self, make_strategy_v2, caplog):
+        """margin_level_pct < 120 → [DANGER] (REQ-6).
+
+        LIVE: one position size=1 level=20000, leverage=20 → used_margin=1000.
+        balance=800, profit_loss=0 → equity=800. 800/1000=80% < 120 → DANGER.
+        """
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=800.0, deposit=0.0, profit_loss=0.0, available=0.0
+        )
+        mock_ig.get_open_positions.return_value = [
+            {"size": 1.0, "level": 20000.0, "epic": "IX.D.SPTRD.IFMM.IP"}
+        ]
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "[DANGER]" in msgs[0]
+
+    def test_margin_health_alert_between_120_and_200(self, make_strategy_v2, caplog):
+        """120 <= margin_level_pct < 200 → [ALERT] (REQ-6).
+
+        LIVE: used_margin=1000, balance=1500, profit_loss=0 → equity=1500. 150% → ALERT.
+        """
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=1500.0, deposit=0.0, profit_loss=0.0, available=500.0
+        )
+        mock_ig.get_open_positions.return_value = [
+            {"size": 1.0, "level": 20000.0, "epic": "IX.D.SPTRD.IFMM.IP"}
+        ]
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "[ALERT]" in msgs[0]
+
+    def test_margin_health_healthy_at_or_above_200(self, make_strategy_v2, caplog):
+        """margin_level_pct >= 200 → [HEALTHY] (REQ-6).
+
+        LIVE: used_margin=1000, balance=2500, profit_loss=0 → equity=2500. 250% → HEALTHY.
+        """
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=2500.0, deposit=0.0, profit_loss=0.0, available=1500.0
+        )
+        mock_ig.get_open_positions.return_value = [
+            {"size": 1.0, "level": 20000.0, "epic": "IX.D.SPTRD.IFMM.IP"}
+        ]
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "[HEALTHY]" in msgs[0]
+
+    def test_margin_health_boundary_at_exactly_120(self, make_strategy_v2, caplog):
+        """Exact 120% → [ALERT], not [DANGER] (REQ-6 boundary).
+
+        LIVE: used_margin=1000, balance=1200, profit_loss=0 → 120% → ALERT.
+        """
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=1200.0, deposit=0.0, profit_loss=0.0, available=200.0
+        )
+        mock_ig.get_open_positions.return_value = [
+            {"size": 1.0, "level": 20000.0, "epic": "IX.D.SPTRD.IFMM.IP"}
+        ]
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "[ALERT]" in msgs[0]
+        assert "[DANGER]" not in msgs[0]
+
+    def test_margin_health_boundary_at_exactly_200(self, make_strategy_v2, caplog):
+        """Exact 200% → [HEALTHY], not [ALERT] (REQ-6 boundary).
+
+        LIVE: used_margin=1000, balance=2000, profit_loss=0 → 200% → HEALTHY.
+        """
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=2000.0, deposit=0.0, profit_loss=0.0, available=1000.0
+        )
+        mock_ig.get_open_positions.return_value = [
+            {"size": 1.0, "level": 20000.0, "epic": "IX.D.SPTRD.IFMM.IP"}
+        ]
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "[HEALTHY]" in msgs[0]
+        assert "[ALERT]" not in msgs[0]
+
+    # ---------------------------------------------------------------------- #
+    # REQ-7: Per-grid position breakdown from LOCAL grids                      #
+    # ---------------------------------------------------------------------- #
+
+    def test_per_grid_avg_entry_weighted(self, make_strategy_v2, caplog):
+        """Both grids populated: size-weighted avg entry from local grids shown per grid (REQ-7)."""
+        import logging
+
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=20000.0, deposit=2000.0, profit_loss=0.0, available=8000.0
+        )
+        mock_ig.get_open_positions.return_value = []
+        # longs: (19000*1 + 19100*2) / 3 = 57200/3 = 19066.67
+        strat._long_positions = [
+            {"deal_id": "D1", "entry_price": 19000.0, "size": 1.0},
+            {"deal_id": "D2", "entry_price": 19100.0, "size": 2.0},
+        ]
+        # shorts: 19200 * 1 / 1 = 19200.00
+        strat._short_positions = [
+            {"deal_id": "D3", "entry_price": 19200.0, "size": 1.0},
+        ]
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        msg = msgs[0]
+        assert "Longs: 2" in msg
+        assert "19066.67" in msg
+        assert "Shorts: 1" in msg
+        assert "19200.00" in msg
+
+    def test_per_grid_avg_entry_empty_grid_returns_na(self, make_strategy_v2, caplog):
+        """Empty grids: avg entry shows N/A and count 0 (REQ-7)."""
+        import logging
+
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=20000.0, deposit=0.0, profit_loss=0.0, available=10000.0
+        )
+        mock_ig.get_open_positions.return_value = []
+        strat._long_positions = []
+        strat._short_positions = []
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        msg = msgs[0]
+        assert "Longs: 0" in msg
+        assert "Shorts: 0" in msg
+        assert msg.count("N/A") >= 2
+
+    def test_per_grid_avg_entry_zero_size_returns_na(self, make_strategy_v2, caplog):
+        """Grid with all zero sizes returns N/A avg entry (REQ-7 degenerate)."""
+        import logging
+
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=20000.0, deposit=0.0, profit_loss=0.0, available=0.0
+        )
+        mock_ig.get_open_positions.return_value = []
+        strat._long_positions = [{"deal_id": "D1", "entry_price": 19000.0, "size": 0.0}]
+        strat._short_positions = []
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "N/A" in msgs[0]
+
+    def test_per_grid_avg_entry_split_by_direction(self, make_strategy_v2, caplog):
+        """long_avg and short_avg appear separately in the log line (REQ-7)."""
+        import logging
+
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=20000.0, deposit=0.0, profit_loss=0.0, available=0.0
+        )
+        mock_ig.get_open_positions.return_value = []
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 5000.0, "size": 1.0}]
+        strat._short_positions = [{"deal_id": "S1", "entry_price": 6000.0, "size": 1.0}]
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        msg = msgs[0]
+        assert "Longs: 1 (avg: 5000.00)" in msg
+        assert "Shorts: 1 (avg: 6000.00)" in msg
+        assert "Total: 2" in msg
+
+    # ---------------------------------------------------------------------- #
+    # REQ-8: Log line format — plain text, no emojis                           #
+    # ---------------------------------------------------------------------- #
+
+    def test_log_line_starts_with_status_no_emoji(self, make_strategy_v2, caplog):
+        """INFO line starts with 'STATUS' (no emoji prefix) and contains [HEALTHY] (REQ-8)."""
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=2500.0, deposit=0.0, profit_loss=0.0, available=1500.0
+        )
+        # used_margin=1000 → 2500/1000=250% → HEALTHY
+        mock_ig.get_open_positions.return_value = [
+            {"size": 1.0, "level": 20000.0, "epic": "IX.D.SPTRD.IFMM.IP"}
+        ]
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
+        assert any(m.startswith("STATUS") for m in info_msgs)
+        assert any("[HEALTHY]" in m for m in info_msgs)
+        assert not any(
+            "📊" in m or "✅" in m or "⚠️" in m or "🚨" in m or "💤" in m
+            for m in info_msgs
+        )
+
+    # ---------------------------------------------------------------------- #
+    # REQ-8b: LIVE vs DEMO mode label in log line                              #
+    # ---------------------------------------------------------------------- #
+
+    def test_live_mode_label_in_log_line(self, make_strategy_v2, caplog):
+        """LIVE mode: log line contains 'LIVE' mode label (REQ-8b)."""
+        import logging
+
+        with patch.dict(os.environ, {"ig_acc_type": "LIVE"}):
+            strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=4000.0, deposit=0.0, profit_loss=0.0, available=4000.0
+        )
+        mock_ig.get_open_positions.return_value = []
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "LIVE" in msgs[0]
+
+    def test_demo_mode_label_in_log_line(self, make_strategy_v2, caplog):
+        """DEMO mode: log line contains 'VIRTUAL' mode label with leverage (REQ-8b)."""
+        import logging
+
+        strat, mock_ig, _ = make_strategy_v2()
+        assert not strat.is_live_account
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=20000.0, deposit=0.0, profit_loss=0.0, available=0.0
+        )
+        mock_ig.get_open_positions.return_value = []
+
+        with caplog.at_level(logging.INFO):
+            strat.log_account_status()
+
+        import logging as _logging
+
+        msgs = self._status_msgs(caplog, _logging.INFO)
+        assert len(msgs) == 1
+        assert "VIRTUAL" in msgs[0]
+        assert "1:20" in msgs[0]
+
+    # ---------------------------------------------------------------------- #
+    # REQ-9: Call site in _on_candle                                           #
+    # ---------------------------------------------------------------------- #
+
+    def test_call_site_in_on_candle_both_modes(self, make_strategy_v2, make_params_v2):
+        """log_account_status is called on every candle in both tick and candle mode (REQ-9).
+
+        The method fires unconditionally on each candle close (~every 5 min).
+        """
+        for mode in ("candle", "tick"):
+            params = make_params_v2(operation_mode=mode)
+            strat, mock_ig, _ = make_strategy_v2(params=params)
+            mock_ig.get_account_summary.return_value = self._account_info()
+            mock_ig.get_open_positions.return_value = []
+            # Pre-fill candle window so indicators are computable
+            for _ in range(25):
+                strat._candle_window.append(100.0)
+
+            with (
+                patch.object(strat, "log_account_status") as mock_log_status,
+                patch.object(strat, "_manage_longs"),
+                patch.object(strat, "_manage_shorts"),
+            ):
+                # Send 6 candles — log fires on every candle (6 calls total)
+                for _ in range(6):
+                    strat._on_candle(_make_candle(close=100.0))
+
+            assert (
+                mock_log_status.call_count == 6
+            ), f"Expected 6 calls in {mode} mode, got {mock_log_status.call_count}"
+
+    def test_not_called_during_warmup(self, make_strategy_v2):
+        """log_account_status is NOT called when indicators is None (warmup) (REQ-9)."""
+        strat, _, _ = make_strategy_v2()
+        # Do NOT pre-fill candle window → _compute_indicators returns None
+        assert len(strat._candle_window) == 0
+
+        with patch.object(strat, "log_account_status") as mock_log_status:
+            strat._on_candle(_make_candle(close=100.0))
+
+        mock_log_status.assert_not_called()
+
+    # ---------------------------------------------------------------------- #
+    # REQ-10: Exception isolation                                              #
+    # ---------------------------------------------------------------------- #
+
+    def test_exception_isolation_from_api(self, make_strategy_v2, caplog):
+        """RuntimeError from get_account_summary → ERROR logged, no propagation (REQ-10)."""
+        import logging
+
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.side_effect = RuntimeError("connection reset")
+
+        with caplog.at_level(logging.ERROR):
+            strat.log_account_status()  # must not raise
+
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+        assert any("connection reset" in r.message for r in caplog.records)
+
+    def test_exception_isolation_from_computation(self, make_strategy_v2, caplog):
+        """Malformed position dict (missing entry_price) → ERROR logged, no propagation (REQ-10)."""
+        import logging
+
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_account_summary.return_value = self._account_info(
+            balance=20000.0, deposit=0.0, profit_loss=0.0, available=0.0
+        )
+        mock_ig.get_open_positions.return_value = []
+        # Malformed: missing entry_price
+        strat._long_positions = [{"deal_id": "D1", "size": 1.0}]
+
+        with caplog.at_level(logging.ERROR):
+            strat.log_account_status()  # must not raise
+
+        assert any(r.levelno == logging.ERROR for r in caplog.records)

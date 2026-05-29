@@ -8,6 +8,7 @@ No martingale, no ATR, no stop-loss. All positions use flat contract_size.
 """
 
 import json
+import os
 import sys
 import types
 import threading
@@ -175,6 +176,12 @@ class RSIBollingerStrategyV2:
         self.streaming_client = streaming_client
         self.trading_config = trading_config
         self.epic = params.epic
+
+        # Account / mode attributes (mirrors V1)
+        self.is_live_account = os.getenv("ig_acc_type") == "LIVE"
+        self.leverage = self.trading_config.leverage
+        self.initial_cash_balance = self.trading_config.initial_cash_balance
+        self.demo_starting_balance = self.trading_config.demo_starting_balance
 
         # operation_mode: 'candle' or 'tick'. Invalid value falls back to 'candle'.
         _raw_mode = getattr(params, "operation_mode", "candle")
@@ -793,10 +800,123 @@ class RSIBollingerStrategyV2:
         # from live bid/ofr prices, then return early — tick handler owns entries/exits.
         if self._operation_mode == "tick":
             self._cached_indicators = indicators
+            self.log_account_status()
             return
 
         self._manage_longs(indicators)
         self._manage_shorts(indicators)
+
+        # Log account status AFTER trade decisions so the log reflects post-decision state.
+        self.log_account_status()
+
+    # ---------------------------------------------------------------------- #
+    # Account status logging                                                   #
+    # ---------------------------------------------------------------------- #
+
+    def log_account_status(self) -> None:
+        """Log account health, equity, margin, and per-grid position breakdown.
+
+        Reads ``balance`` and ``profitLoss`` from get_account_summary().
+        Calls get_open_positions() and filters to positions matching ``self.epic``
+        for margin calculations.
+
+        Computes margin level % and classifies health:
+          - used_margin == 0 → [IDLE]
+          - margin_level < 120% → [DANGER]
+          - margin_level < 200% → [ALERT]
+          - margin_level >= 200% → [HEALTHY]
+
+        ``used_margin`` is derived from broker positions filtered to ``self.epic``
+        and divided by ``self.leverage``.
+
+        LIVE mode: equity = balance + profitLoss.
+        DEMO (virtual) mode: equity is computed from the virtual starting balance
+        plus realized profit and open P&L; used_margin and free_margin are
+        derived from epic-filtered broker positions and the configured leverage.
+
+        Per-grid avg entry: size-weighted average of entry_price from the local
+        long and short position grids. Reports 'N/A' when a grid is empty.
+
+        Emits a single INFO log line starting with STATUS. Never raises — full
+        try/except with logger.error on failure.
+        """
+        try:
+            account_info = self.ig.get_account_summary()
+            if not account_info:
+                logger.warning(
+                    "Account data unavailable — skipping account status log."
+                )
+                return
+
+            raw_positions = self.ig.get_open_positions()
+            positions = (
+                [p for p in raw_positions if p.get("epic") == self.epic]
+                if raw_positions
+                else []
+            )
+
+            if self.is_live_account:
+                open_pnl = account_info.get("profitLoss", 0.0)
+                current_equity = account_info.get("balance", 0.0) + open_pnl
+                used_margin = (
+                    sum(
+                        p.get("size", 0.0) * p.get("level", 0.0) / self.leverage
+                        for p in positions
+                    )
+                    if positions
+                    else 0.0
+                )
+                free_margin = current_equity - used_margin
+                mode = "LIVE"
+            else:
+                open_pnl = account_info.get("profitLoss", 0.0)
+                realized_profit = (
+                    account_info.get("balance", self.demo_starting_balance)
+                    - self.demo_starting_balance
+                )
+                virtual_balance = self.initial_cash_balance + realized_profit
+                current_equity = virtual_balance + open_pnl
+                used_margin = (
+                    sum(
+                        p.get("size", 0.0) * p.get("level", 0.0) / self.leverage
+                        for p in positions
+                    )
+                    if positions
+                    else 0.0
+                )
+                free_margin = current_equity - used_margin
+                mode = f"VIRTUAL (1:{self.leverage})"
+
+            if used_margin == 0:
+                health_label = "[IDLE]"
+                margin_level_str = "N/A"
+            else:
+                margin_level_pct = (current_equity / used_margin) * 100
+                margin_level_str = f"{margin_level_pct:.1f}%"
+                if margin_level_pct < 120:
+                    health_label = "[DANGER]"
+                elif margin_level_pct < 200:
+                    health_label = "[ALERT]"
+                else:
+                    health_label = "[HEALTHY]"
+
+            n_longs = len(self._long_positions)
+            n_shorts = len(self._short_positions)
+            n_trades = n_longs + n_shorts
+            long_avg = _avg_entry(self._long_positions)
+            short_avg = _avg_entry(self._short_positions)
+
+            logger.info(
+                f"STATUS | Mode: {mode} | Equity: ${current_equity:.2f} | "
+                f"Used Margin: ${used_margin:.2f} | "
+                f"Margin Level: {margin_level_str} {health_label} | "
+                f"Free: ${free_margin:.2f} | "
+                f"Longs: {n_longs} (avg: {long_avg}) | "
+                f"Shorts: {n_shorts} (avg: {short_avg}) | "
+                f"Total: {n_trades}"
+            )
+        except Exception as e:
+            logger.error(f"log_account_status failed: {e}")
 
     # ---------------------------------------------------------------------- #
     # Tick handler                                                             #
@@ -1199,6 +1319,27 @@ class RSIBollingerStrategyV2:
 # --------------------------------------------------------------------------- #
 # Utilities                                                                    #
 # --------------------------------------------------------------------------- #
+
+
+def _avg_entry(positions: list[dict]) -> str:
+    """Compute the size-weighted average entry price for a position grid.
+
+    Args:
+        positions: List of position dicts, each with 'entry_price' and 'size'.
+            Reads the local grid list (not broker positions) so that the
+            avg reflects the actual entry prices recorded at order time.
+
+    Returns:
+        Size-weighted average formatted to two decimal places, or 'N/A'
+        when the list is empty or total size sums to zero.
+    """
+    if not positions:
+        return "N/A"
+    total_size = sum(p["size"] for p in positions)
+    if total_size == 0:
+        return "N/A"
+    weighted_sum = sum(p["size"] * p["entry_price"] for p in positions)
+    return f"{weighted_sum / total_size:.2f}"
 
 
 def _long_profit(close: float, entry_price: float, spread: float, size: float) -> float:
