@@ -93,10 +93,14 @@ Lightstreamer
    from the REST API via `IGClient.get_candles()` and appends each row's `Close`
    price directly to `_candle_window`. This pre-fills the window so that indicators
    are valid on the very first live streaming candle.
-2. **`streaming_client.start(_on_candle, on_tick=...)`** — opens the Lightstreamer
+2. **`_seed_positions_from_broker()`** — fetches all open positions from the broker
+   via `IGClient.get_open_positions()`, filters by `self.epic`, and populates
+   `_long_positions` / `_short_positions` so that the strategy correctly tracks
+   any positions that were open when the bot restarted.
+3. **`streaming_client.start(_on_candle, on_tick=...)`** — opens the Lightstreamer
    connection and begins delivering live candles. In tick mode, also opens a second
    subscription to `CHART:{epic}:TICK` via `_DirectTickListener`.
-3. **`_stop_event.wait()`** — blocks until `stop()` is called.
+4. **`_stop_event.wait()`** — blocks until `stop()` is called.
 
 ### Warm-up details
 
@@ -131,6 +135,30 @@ If `get_candles()` returns `None` or raises an exception, `_warmup()` logs a
 WARNING and returns without filling the window. The strategy proceeds to streaming
 with an empty candle window — identical to the previous cold-start behavior. There
 is no abort, no retry (the underlying `get_candles` already retries internally).
+
+### Position reconciliation at restart
+
+`_seed_positions_from_broker()` runs immediately after `_warmup()` and before
+streaming starts. It calls `IGClient.get_open_positions()`, filters the results
+by `self.epic`, sorts them by `createdDate` ascending (matching the runtime
+invariant relied on by the minimum-distance guard), and appends each position
+dict — `deal_id`, `entry_price`, `size` — to the appropriate grid.
+
+**Direction mapping**: `BUY` → `_long_positions`; `SELL` → `_short_positions`.
+Positions with an unexpected direction value are skipped with a WARNING.
+
+**No `entry_spread` on seeded positions**: positions restored from broker state
+have no recorded spread. In tick mode, `_tick_close_positions` uses the live
+tick spread as a fallback for profit checks — a WARNING is logged for every
+seeded LONG position noting this.
+
+**Capacity guard**: if the seeded count exceeds `max_long_positions` or
+`max_short_positions`, a WARNING is logged recommending operator review. The
+excess positions are still seeded — no positions are silently dropped.
+
+**Graceful degradation**: any exception from `get_open_positions()` or from
+parsing a single record is caught. The method logs a WARNING and continues —
+grids remain empty (or partially seeded) rather than aborting startup.
 
 ---
 
@@ -227,6 +255,7 @@ to `0.0` — a conservative fallback that never suppresses a profitable exit.
 | Behaviour | Detail |
 |-----------|--------|
 | Position grids | Long and short grids are independent; both may hold positions simultaneously |
+| Startup reconciliation | `_seed_positions_from_broker()` pre-populates both grids from broker state before streaming starts — open positions survive restarts |
 | Max positions per grid | `max_long_positions` for longs; `max_short_positions` for shorts |
 | Minimum entry distance | New entry rejected if `abs(close - last_entry) < min_dist_between_entries_ticks` |
 | Position sizing | Flat `contract_size` for every entry — no martingale, no scaling |

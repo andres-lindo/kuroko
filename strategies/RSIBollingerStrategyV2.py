@@ -1066,6 +1066,100 @@ class RSIBollingerStrategyV2:
     # Main loop                                                                #
     # ---------------------------------------------------------------------- #
 
+    def _seed_positions_from_broker(self) -> None:
+        """Seed local position grids from broker open positions at startup.
+
+        Fetches open positions via ig.get_open_positions(), filters by
+        self.epic, classifies by direction (BUY -> long, SELL -> short),
+        and populates _long_positions / _short_positions.
+
+        On failure, logs WARNING and returns — grids remain empty (same
+        as current behavior). No entry_spread is set on seeded positions;
+        _tick_close_positions uses its existing fallback.
+        """
+        try:
+            positions = self.ig.get_open_positions()
+
+            # Filter and sort by createdDate ascending so that the last element
+            # in each grid is the most recently opened position — matching the
+            # runtime invariant relied on by the min_dist guard.
+            matching = [r for r in positions if r.get("epic") == self.epic]
+
+            def _parse_created_date(record):
+                raw = record.get("createdDate", "")
+                if not raw:
+                    return datetime.min
+                try:
+                    # IG Markets format: "2026/05/29 10:00:00:000"
+                    return datetime.strptime(raw, "%Y/%m/%d %H:%M:%S:%f")
+                except (ValueError, TypeError):
+                    pass
+                try:
+                    # ISO 8601 fallback: "2026-05-29T10:00:00"
+                    return datetime.fromisoformat(raw)
+                except (ValueError, TypeError):
+                    logger.warning(
+                        f"Could not parse createdDate '{raw}' for deal "
+                        f"{record.get('dealId', 'unknown')} — using datetime.min"
+                    )
+                    return datetime.min
+
+            matching.sort(key=_parse_created_date)
+
+            longs_seeded = 0
+            shorts_seeded = 0
+            for record in matching:
+                try:
+                    direction = record.get("direction")
+                    pos = {
+                        "deal_id": record["dealId"],
+                        "entry_price": float(record["level"]),
+                        "size": float(record["size"]),
+                    }
+                    if direction == "BUY":
+                        self._long_positions.append(pos)
+                        longs_seeded += 1
+                        logger.warning(
+                            f"Seeded LONG {pos['deal_id']} has no entry_spread "
+                            f"(position restored from broker state after restart). "
+                            f"_tick_close_positions will use live tick spread as "
+                            f"fallback for profit checks."
+                        )
+                    elif direction == "SELL":
+                        self._short_positions.append(pos)
+                        shorts_seeded += 1
+                    else:
+                        logger.warning(
+                            f"Unexpected direction '{direction}' for deal "
+                            f"{record.get('dealId', 'unknown')} — position not "
+                            f"added to any grid."
+                        )
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.warning(
+                        f"Skipping malformed position record during seeding: {e} "
+                        f"(record={record!r})"
+                    )
+
+            if longs_seeded > self.params.max_long_positions:
+                logger.warning(
+                    f"Seeded {longs_seeded} long(s) exceeds max_long_positions "
+                    f"({self.params.max_long_positions}) — operator review recommended."
+                )
+            if shorts_seeded > self.params.max_short_positions:
+                logger.warning(
+                    f"Seeded {shorts_seeded} short(s) exceeds max_short_positions "
+                    f"({self.params.max_short_positions}) — operator review recommended."
+                )
+
+            logger.info(
+                f"Seeded {longs_seeded} long(s) and {shorts_seeded} short(s) "
+                f"from broker state for {self.epic}."
+            )
+        except Exception as e:
+            logger.warning(
+                f"_seed_positions_from_broker failed — starting with empty grids: {e}"
+            )
+
     def run(self) -> None:
         """Start streaming and block until stop() is called.
 
@@ -1078,8 +1172,10 @@ class RSIBollingerStrategyV2:
         self._stop_event.clear()
         logger.debug("Stop event cleared — entering warm-up phase.")
         self._warmup()
+        logger.debug("Warm-up complete — seeding positions from broker state.")
+        self._seed_positions_from_broker()
         logger.debug(
-            f"Warm-up complete — starting streaming client (window_size={len(self._candle_window)})."
+            f"Seeding complete — starting streaming client (window_size={len(self._candle_window)})."
         )
         on_tick = self._on_tick if self._operation_mode == "tick" else None
         self.streaming_client.start(self._on_candle, on_tick=on_tick)

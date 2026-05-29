@@ -3129,3 +3129,215 @@ class TestTickCloseInFlightGuard:
         strat._on_tick(tick)
 
         assert strat._tick_short_close_in_flight is False
+
+
+# --------------------------------------------------------------------------- #
+# Startup position reconciliation — seeding from broker state (REQ-2–REQ-7)   #
+# --------------------------------------------------------------------------- #
+
+_CANONICAL_POSITIONS = [
+    {
+        "dealReference": "REF1",
+        "dealId": "D1",
+        "level": 19000.0,
+        "size": 1.0,
+        "createdDate": "2026-05-29T10:00:00",
+        "direction": "BUY",
+        "epic": "IX.D.NASDAQ.IFMM.IP",
+    },
+    {
+        "dealReference": "REF2",
+        "dealId": "D2",
+        "level": 19100.0,
+        "size": 1.0,
+        "createdDate": "2026-05-29T11:00:00",
+        "direction": "SELL",
+        "epic": "IX.D.NASDAQ.IFMM.IP",
+    },
+    {
+        "dealReference": "REF3",
+        "dealId": "D3",
+        "level": 4500.0,
+        "size": 0.5,
+        "createdDate": "2026-05-29T12:00:00",
+        "direction": "BUY",
+        "epic": "IX.D.SPTRD.IFMM.IP",
+    },
+]
+
+
+class TestSeedPositionsFromBroker:
+    """_seed_positions_from_broker() seeds local grids from broker state at startup."""
+
+    # Epic used by _CANONICAL_POSITIONS — made explicit so the coupling to
+    # the fixture default is visible and self-documenting.
+    _SEED_EPIC = "IX.D.NASDAQ.IFMM.IP"
+
+    def test_happy_path_mixed_buy_sell(self, make_strategy_v2, make_params_v2):
+        """BUY and SELL for matching epic populate the correct grids; wrong epic is excluded.
+
+        Broker returns 3 positions: 1 BUY matching epic, 1 SELL matching epic,
+        1 BUY wrong epic. Only the two matching-epic positions are seeded.
+        """
+        params = make_params_v2(epic=self._SEED_EPIC)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.get_open_positions.return_value = _CANONICAL_POSITIONS
+
+        strat._seed_positions_from_broker()
+
+        assert strat._long_positions == [
+            {"deal_id": "D1", "entry_price": 19000.0, "size": 1.0}
+        ]
+        assert strat._short_positions == [
+            {"deal_id": "D2", "entry_price": 19100.0, "size": 1.0}
+        ]
+
+    def test_wrong_epic_excluded(self, make_strategy_v2, make_params_v2):
+        """Positions with a different epic are silently excluded from both grids."""
+        params = make_params_v2(epic=self._SEED_EPIC)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        wrong_epic_only = [
+            {
+                "dealReference": "REF3",
+                "dealId": "D3",
+                "level": 4500.0,
+                "size": 0.5,
+                "createdDate": "2026-05-29T12:00:00",
+                "direction": "BUY",
+                "epic": "IX.D.SPTRD.IFMM.IP",
+            }
+        ]
+        mock_ig.get_open_positions.return_value = wrong_epic_only
+
+        strat._seed_positions_from_broker()
+
+        assert strat._long_positions == []
+        assert strat._short_positions == []
+
+    def test_empty_broker_response(self, make_strategy_v2, make_params_v2):
+        """Empty broker response leaves both grids empty and does not raise."""
+        params = make_params_v2(epic=self._SEED_EPIC)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.get_open_positions.return_value = []
+
+        strat._seed_positions_from_broker()  # must not raise
+
+        assert strat._long_positions == []
+        assert strat._short_positions == []
+
+    def test_broker_exception_graceful_degradation(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """Exception from get_open_positions is caught; grids remain empty; WARNING logged."""
+        import logging
+
+        params = make_params_v2(epic=self._SEED_EPIC)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.get_open_positions.side_effect = Exception("network")
+
+        with caplog.at_level(logging.WARNING):
+            strat._seed_positions_from_broker()  # must not raise
+
+        assert strat._long_positions == []
+        assert strat._short_positions == []
+        assert any(
+            "WARNING" in r.levelname for r in caplog.records
+        ), "Expected at least one WARNING log entry after broker exception"
+
+    def test_run_call_sequence(self, make_strategy_v2):
+        """run() must call _warmup before _seed_positions_from_broker before streaming start.
+
+        Uses patch.object to spy on _warmup and _seed_positions_from_broker. The
+        streaming_client.start side_effect calls strat.stop() so run() unblocks.
+        Call order is verified via a shared call_log list.
+        """
+        strat, _, mock_streaming = make_strategy_v2()
+        call_log = []
+
+        def fake_warmup():
+            call_log.append("warmup")
+
+        def fake_seed():
+            call_log.append("seed")
+
+        def fake_start(callback, on_tick=None):
+            call_log.append("streaming_start")
+            strat.stop()
+
+        with (
+            patch.object(strat, "_warmup", side_effect=fake_warmup),
+            patch.object(strat, "_seed_positions_from_broker", side_effect=fake_seed),
+        ):
+            mock_streaming.start.side_effect = fake_start
+            t = threading.Thread(target=strat.run)
+            t.start()
+            t.join(timeout=2.0)
+
+        assert not t.is_alive(), "run() did not return after stop()"
+        assert call_log == [
+            "warmup",
+            "seed",
+            "streaming_start",
+        ], f"Expected [warmup, seed, streaming_start], got {call_log}"
+
+    def test_sort_order_by_created_date(self, make_strategy_v2, make_params_v2):
+        """Positions are sorted by createdDate ascending regardless of input order.
+
+        Broker returns two BUY positions for the correct epic with createdDate
+        values in REVERSE chronological order (newest first). After seeding,
+        _long_positions[0] must correspond to the earlier position and
+        _long_positions[-1] to the later one — confirming ascending sort.
+        """
+        params = make_params_v2(epic=self._SEED_EPIC)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.get_open_positions.return_value = [
+            {
+                "dealReference": "REF_LATER",
+                "dealId": "D_LATER",
+                "level": 19200.0,
+                "size": 1.0,
+                "createdDate": "2026/05/29 12:00:00:000",
+                "direction": "BUY",
+                "epic": self._SEED_EPIC,
+            },
+            {
+                "dealReference": "REF_EARLIER",
+                "dealId": "D_EARLIER",
+                "level": 19000.0,
+                "size": 1.0,
+                "createdDate": "2026/05/29 10:00:00:000",
+                "direction": "BUY",
+                "epic": self._SEED_EPIC,
+            },
+        ]
+
+        strat._seed_positions_from_broker()
+
+        assert len(strat._long_positions) == 2
+        assert strat._long_positions[0]["entry_price"] == 19000.0  # earlier
+        assert strat._long_positions[-1]["entry_price"] == 19200.0  # later
+
+    def test_seeding_failure_does_not_block_streaming(self, make_strategy_v2):
+        """streaming_client.start is called even when broker call raises internally inside seed.
+
+        _seed_positions_from_broker wraps all logic in try/except — when the
+        broker call raises, the method catches it and returns normally. run()
+        then proceeds to streaming_client.start() as if seeding succeeded.
+        """
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_open_positions.side_effect = Exception("network timeout")
+
+        def fake_warmup():
+            pass
+
+        def fake_start(callback, on_tick=None):
+            strat.stop()
+
+        mock_streaming.start.side_effect = fake_start
+        with patch.object(strat, "_warmup", side_effect=fake_warmup):
+            t = threading.Thread(target=strat.run)
+            t.start()
+            t.join(timeout=2.0)
+
+        assert not t.is_alive(), "run() did not return after stop()"
+        mock_streaming.start.assert_called_once()

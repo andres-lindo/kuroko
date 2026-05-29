@@ -311,8 +311,8 @@ class IGClient:
 
         Returns:
             List of dicts with keys: dealReference, dealId, level, size,
-            createdDate, direction. Returns an empty list on error or if
-            there are no open positions.
+            createdDate, direction, epic. Returns an empty list on error or
+            if there are no open positions.
         """
         try:
             open_positions = self._safe_api_call(self._svc.fetch_open_positions)
@@ -327,6 +327,7 @@ class IGClient:
                 "size",
                 "createdDate",
                 "direction",
+                "epic",
             ]
             missing_cols = [c for c in expected_cols if c not in open_positions.columns]
             if missing_cols:
