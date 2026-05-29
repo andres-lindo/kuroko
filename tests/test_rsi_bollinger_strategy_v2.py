@@ -1784,7 +1784,9 @@ class TestWireStrategyPassesResolution:
     ) -> types.SimpleNamespace:
         """Return a minimal streaming-mode params namespace."""
         return types.SimpleNamespace(
-            api_mode="streaming", candle_frequency=candle_frequency
+            api_mode="streaming",
+            candle_frequency=candle_frequency,
+            epic="IX.D.SPTRD.IFMM.IP",
         )
 
     @pytest.mark.parametrize(
