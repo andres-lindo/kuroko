@@ -754,9 +754,16 @@ class RSIBollingerStrategyV2:
 
         Called before entry evaluation whenever any local position is flagged
         ``needs_reconciliation=True`` (set after a failed close_position call).
-        Fetches the current open positions from the broker and removes any local
-        position that is no longer present at the broker. Positions that are
-        still open at the broker have their flag cleared.
+        Fetches the current open positions from the broker and performs two
+        passes:
+
+        1. **Removal pass** — removes local positions no longer present at the
+           broker (phantom positions closed by TP or manually). Clears the
+           ``needs_reconciliation`` flag on positions that are still open.
+        2. **Seed pass** — appends any broker position (filtered by
+           ``self.epic``) whose ``dealId`` is absent from both local grids.
+           This ensures positions opened after startup are not invisible to the
+           strategy. Uses the same dict format as ``_seed_positions_from_broker``.
 
         Designed to be simple — one broker API call per reconciliation trigger,
         no retries, no partial state. If the broker call itself fails, the
@@ -794,6 +801,51 @@ class RSIBollingerStrategyV2:
 
         self._long_positions = _filter(self._long_positions)
         self._short_positions = _filter(self._short_positions)
+
+        # Seed pass: add broker positions that are absent from local grids.
+        local_deal_ids = {
+            pos["deal_id"] for pos in self._long_positions + self._short_positions
+        }
+        for record in broker_data:
+            deal_id = record.get("dealId")
+            if not deal_id:
+                continue
+            if record.get("epic") != self.epic:
+                continue
+            if deal_id in local_deal_ids:
+                continue
+            try:
+                direction = record.get("direction")
+                pos = {
+                    "deal_id": deal_id,
+                    "entry_price": float(record["level"]),
+                    "size": float(record["size"]),
+                }
+                if direction == "BUY":
+                    self._long_positions.append(pos)
+                    local_deal_ids.add(deal_id)
+                    logger.info(
+                        f"Reconciliation: seeded missing LONG {deal_id} "
+                        f"(entry={pos['entry_price']}, size={pos['size']})"
+                    )
+                elif direction == "SELL":
+                    self._short_positions.append(pos)
+                    local_deal_ids.add(deal_id)
+                    logger.info(
+                        f"Reconciliation: seeded missing SHORT {deal_id} "
+                        f"(entry={pos['entry_price']}, size={pos['size']})"
+                    )
+                else:
+                    logger.warning(
+                        f"Reconciliation: unexpected direction '{direction}' for "
+                        f"deal {deal_id} — position not seeded."
+                    )
+            except (KeyError, ValueError, TypeError) as e:
+                logger.warning(
+                    f"Reconciliation: skipping malformed broker record for "
+                    f"{deal_id}: {e} (record={record!r})"
+                )
+
         logger.info("Position reconciliation complete.")
 
     def _needs_reconciliation(self) -> bool:

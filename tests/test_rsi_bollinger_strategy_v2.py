@@ -2703,6 +2703,129 @@ class TestReconcilePositionsException:
 
 
 # --------------------------------------------------------------------------- #
+# _reconcile_positions — seed missing broker positions (bidirectional)         #
+# --------------------------------------------------------------------------- #
+
+
+class TestReconcilePositionsSeedMissing:
+    """_reconcile_positions must seed broker positions absent from local grids."""
+
+    def test_reconcile_seeds_missing_long_from_broker(self, make_strategy_v2):
+        """BUY position at broker but absent from _long_positions is appended."""
+        strat, mock_ig, _ = make_strategy_v2()
+        strat._long_positions = []
+        strat._short_positions = []
+        mock_ig.get_open_positions.return_value = [
+            {
+                "dealId": "BROKER_LONG",
+                "epic": strat.epic,
+                "direction": "BUY",
+                "level": 95.0,
+                "size": 1.0,
+            }
+        ]
+
+        strat._reconcile_positions()
+
+        assert len(strat._long_positions) == 1
+        pos = strat._long_positions[0]
+        assert pos["deal_id"] == "BROKER_LONG"
+        assert pos["entry_price"] == 95.0
+        assert pos["size"] == 1.0
+
+    def test_reconcile_seeds_missing_short_from_broker(self, make_strategy_v2):
+        """SELL position at broker but absent from _short_positions is appended."""
+        strat, mock_ig, _ = make_strategy_v2()
+        strat._long_positions = []
+        strat._short_positions = []
+        mock_ig.get_open_positions.return_value = [
+            {
+                "dealId": "BROKER_SHORT",
+                "epic": strat.epic,
+                "direction": "SELL",
+                "level": 105.0,
+                "size": 0.5,
+            }
+        ]
+
+        strat._reconcile_positions()
+
+        assert len(strat._short_positions) == 1
+        pos = strat._short_positions[0]
+        assert pos["deal_id"] == "BROKER_SHORT"
+        assert pos["entry_price"] == 105.0
+        assert pos["size"] == 0.5
+
+    def test_reconcile_does_not_duplicate_existing_position(self, make_strategy_v2):
+        """Broker position already in local grid is not appended again."""
+        strat, mock_ig, _ = make_strategy_v2()
+        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0}]
+        strat._short_positions = []
+        mock_ig.get_open_positions.return_value = [
+            {
+                "dealId": "DEAL1",
+                "epic": strat.epic,
+                "direction": "BUY",
+                "level": 90.0,
+                "size": 1.0,
+            }
+        ]
+
+        strat._reconcile_positions()
+
+        assert len(strat._long_positions) == 1
+        assert strat._long_positions[0]["deal_id"] == "DEAL1"
+
+    def test_reconcile_skips_broker_positions_for_different_epic(
+        self, make_strategy_v2
+    ):
+        """Broker positions for a different epic are not seeded into local grids."""
+        strat, mock_ig, _ = make_strategy_v2()
+        strat._long_positions = []
+        strat._short_positions = []
+        mock_ig.get_open_positions.return_value = [
+            {
+                "dealId": "OTHER_EPIC_DEAL",
+                "epic": "DIFFERENT.EPIC",
+                "direction": "BUY",
+                "level": 100.0,
+                "size": 1.0,
+            }
+        ]
+
+        strat._reconcile_positions()
+
+        assert len(strat._long_positions) == 0
+        assert len(strat._short_positions) == 0
+
+    def test_reconcile_removal_and_seed_in_same_pass(self, make_strategy_v2):
+        """Removal of phantom local positions and seeding of new broker positions
+        both happen in a single reconciliation call."""
+        strat, mock_ig, _ = make_strategy_v2()
+        # PHANTOM exists locally but not at broker; NEW_BROKER exists at broker but not locally
+        strat._long_positions = [
+            {"deal_id": "PHANTOM", "entry_price": 80.0, "size": 1.0}
+        ]
+        strat._short_positions = []
+        mock_ig.get_open_positions.return_value = [
+            {
+                "dealId": "NEW_BROKER",
+                "epic": strat.epic,
+                "direction": "BUY",
+                "level": 85.0,
+                "size": 1.0,
+            }
+        ]
+
+        strat._reconcile_positions()
+
+        deal_ids = [p["deal_id"] for p in strat._long_positions]
+        assert "PHANTOM" not in deal_ids
+        assert "NEW_BROKER" in deal_ids
+        assert len(strat._long_positions) == 1
+
+
+# --------------------------------------------------------------------------- #
 # _on_candle — timezone normalization for warmup_ts (lines 599–607)           #
 # --------------------------------------------------------------------------- #
 
