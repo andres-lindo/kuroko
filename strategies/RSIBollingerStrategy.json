@@ -1,5 +1,6 @@
 {
   "api_mode": "rest",
+  "epic": "IX.D.NASDAQ.IFMM.IP",
   "candle_frequency": "15min",
   "lookback": 300,
 

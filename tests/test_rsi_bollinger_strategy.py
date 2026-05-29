@@ -594,6 +594,7 @@ class TestCloseAllPositions:
 # =========================================================================== #
 
 _VALID_V1_PARAMS: dict = {
+    "epic": "IX.D.NASDAQ.IFMM.IP",
     "candle_frequency": "15min",
     "lookback": 300,
     "max_positions": 5,
@@ -634,7 +635,6 @@ class TestV1LoadParams:
         result = load_params_v1(str(params_file))
 
         removed_keys = (
-            "epic",
             "leverage",
             "demo_starting_balance",
             "initial_cash_balance",
@@ -692,14 +692,13 @@ class TestV1LoadParams:
 class TestV1StrategyInit:
     """Tests for RSIBollingerStrategy.__init__ with trading_config wiring."""
 
-    def test_infra_attrs_sourced_from_trading_config(
+    def test_infra_attrs_sourced_from_params_and_trading_config(
         self, make_params_v1, make_trading_config
     ):
-        """Self.epic, leverage, etc. come from trading_config."""
-        params = make_params_v1()
+        """Self.epic comes from params; leverage and balance fields come from trading_config."""
+        params = make_params_v1(epic="IX.D.NASDAQ.IFMM.IP")
         ig_mock = MagicMock()
         trading_config = make_trading_config(
-            epic="IX.D.NASDAQ.IFMM.IP",
             leverage=20,
             demo_starting_balance=20000.0,
             initial_cash_balance=4000.0,
@@ -716,17 +715,16 @@ class TestV1StrategyInit:
         assert strat.initial_cash_balance == 4000.0
         assert strat.security_buffer == 1000.0
 
-    def test_trading_config_values_initialise_correctly_without_infra_on_params(
+    def test_epic_sourced_from_params_not_trading_config(
         self, make_params_v1, make_trading_config
     ):
-        """Params without infra keys still initialises correctly."""
-        params = make_params_v1()
-        assert not hasattr(params, "epic")
+        """Self.epic is read from params (strategy JSON), not from trading_config."""
+        params = make_params_v1(epic="IX.D.SP500.IFM.IP")
+        assert hasattr(params, "epic")
         assert not hasattr(params, "leverage")
 
         ig_mock = MagicMock()
         trading_config = make_trading_config(
-            epic="IX.D.SP500.IFM.IP",
             leverage=10,
             demo_starting_balance=50000.0,
             initial_cash_balance=5000.0,

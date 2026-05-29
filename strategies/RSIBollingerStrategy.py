@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # float fields accept int values (e.g. 240 is valid for take_profit_ticks).
 # bool fields are checked before int because bool is a subclass of int in Python.
 _PARAMS_SCHEMA: dict[str, type] = {
+    "epic": str,
     "candle_frequency": str,
     "lookback": int,
     "max_positions": int,
@@ -193,8 +194,8 @@ class RSIBollingerStrategy:
         # Safety flag — True when ig_acc_type="LIVE", False otherwise (including "DEMO")
         self.is_live_account = os.getenv("ig_acc_type") == "LIVE"
 
-        # Infrastructure parameters — sourced from config.json["trading"]
-        self.epic = trading_config.epic
+        # Infrastructure parameters — epic sourced from strategy JSON; others from config.json["trading"]
+        self.epic = params.epic
         self.leverage = trading_config.leverage
         self.demo_starting_balance = trading_config.demo_starting_balance
         self.initial_cash_balance = trading_config.initial_cash_balance

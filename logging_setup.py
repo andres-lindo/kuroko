@@ -33,7 +33,6 @@ _DEFAULTS: dict = {
         "azure_log_partition_key": "DEV_NQ100",
     },
     "trading": {
-        "epic": "IX.D.NASDAQ.IFMM.IP",
         "leverage": 20,
         "demo_starting_balance": 20000.0,
         "initial_cash_balance": 4000.0,
@@ -47,7 +46,6 @@ _FORMAT_LEGACY = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
 # Expected types for each key in the trading section
 _TRADING_TYPES: dict = {
-    "epic": str,
     "leverage": (int, float),
     "demo_starting_balance": (int, float),
     "initial_cash_balance": (int, float),

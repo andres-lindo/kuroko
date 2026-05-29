@@ -344,7 +344,6 @@ class TestLoadAppConfig:
                 "structured_format": False,
             },
             "trading": {
-                "epic": "IX.D.SP500.IFM.IP",
                 "leverage": 10,
                 "demo_starting_balance": 50000.0,
                 "initial_cash_balance": 5000.0,
@@ -359,7 +358,6 @@ class TestLoadAppConfig:
         assert result["logging"]["log_level"] == "DEBUG"
         assert result["logging"]["log_dir"] == "custom_logs"
         assert result["logging"]["retention_days"] == 14
-        assert result["trading"]["epic"] == "IX.D.SP500.IFM.IP"
         assert result["trading"]["leverage"] == 10
 
     def test_missing_file_returns_defaults_and_warns(self, tmp_path, caplog):
@@ -409,7 +407,7 @@ class TestLoadAppConfigTradingSection:
     """Tests for load_app_config() trading section handling."""
 
     def test_valid_trading_section_returns_all_keys(self, tmp_path):
-        """scenario 1: valid trading section — all 5 keys present and typed."""
+        """scenario 1: valid trading section — all 4 validated keys present and typed."""
         config_data = {
             "logging": {
                 "log_type": ["file"],
@@ -422,7 +420,6 @@ class TestLoadAppConfigTradingSection:
                 "azure_log_partition_key": "PROD_NQ100",
             },
             "trading": {
-                "epic": "IX.D.NASDAQ.IFMM.IP",
                 "leverage": 20,
                 "demo_starting_balance": 20000.0,
                 "initial_cash_balance": 4000.0,
@@ -436,7 +433,6 @@ class TestLoadAppConfigTradingSection:
 
         assert result["logging"]["azure_log_partition_key"] == "PROD_NQ100"
         trading = result["trading"]
-        assert trading["epic"] == "IX.D.NASDAQ.IFMM.IP"
         assert trading["leverage"] == 20
         assert trading["initial_cash_balance"] == 4000.0
 
@@ -460,7 +456,7 @@ class TestLoadAppConfigTradingSection:
             result = load_app_config(str(config_file))
 
         assert isinstance(result["trading"], dict)
-        assert result["trading"]["epic"] == "IX.D.NASDAQ.IFMM.IP"
+        assert result["trading"]["leverage"] == _DEFAULTS["trading"]["leverage"]
         assert any("missing or invalid 'trading'" in r.message for r in caplog.records)
 
     def test_null_trading_section_returns_defaults_and_warns(self, tmp_path, caplog):
@@ -501,7 +497,6 @@ class TestLoadAppConfigTradingSection:
                 "structured_format": True,
             },
             "trading": {
-                "epic": "IX.D.NASDAQ.IFMM.IP",
                 "leverage": "twenty",
                 "demo_starting_balance": 20000.0,
                 "initial_cash_balance": 4000.0,
@@ -530,7 +525,6 @@ class TestLoadAppConfigTradingSection:
                 "structured_format": True,
             },
             "trading": {
-                "epic": "IX.D.NASDAQ.IFMM.IP",
                 "leverage": True,
                 "demo_starting_balance": 20000.0,
                 "initial_cash_balance": 4000.0,
@@ -561,7 +555,6 @@ class TestLoadAppConfigTradingSection:
                 "structured_format": True,
             },
             "trading": {
-                "epic": "IX.D.NASDAQ.IFMM.IP",
                 "leverage": 20,
                 "demo_starting_balance": 20000.0,
                 "initial_cash_balance": 4000.0,
@@ -603,7 +596,7 @@ class TestLoadAppConfigTradingSection:
             result = load_app_config(str(config_file))
 
         assert isinstance(result["trading"], dict)
-        assert result["trading"]["epic"] == "IX.D.NASDAQ.IFMM.IP"
+        assert result["trading"]["leverage"] == _DEFAULTS["trading"]["leverage"]
         assert any("missing or invalid 'trading'" in r.message for r in caplog.records)
 
 

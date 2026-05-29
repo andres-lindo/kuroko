@@ -35,6 +35,7 @@ def make_params_v1():
         """
         defaults = {
             "api_mode": "rest",
+            "epic": "IX.D.NASDAQ.IFMM.IP",
             "candle_frequency": "15min",
             "lookback": 300,
             "max_positions": 5,
