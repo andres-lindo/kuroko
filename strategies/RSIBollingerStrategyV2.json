@@ -14,7 +14,7 @@
   "max_long_positions": 10,
   "max_short_positions": 10,
 
-  "contract_size": 1.0,
+  "contract_size": 2.0,
   "min_dist_between_entries_ticks": 20,
   "take_profit_ticks": 10
 }
