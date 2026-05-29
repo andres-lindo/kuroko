@@ -47,22 +47,23 @@ Indicators are computed and cached (`_cached_indicators`) on every candle close.
 Entry and exit signals are then evaluated on each live tick by `_on_tick()`, using
 the cached indicators together with the live `bid` and `ofr` prices from the tick.
 
-**Warmup gate**: `_on_tick` silently discards ticks until at least one candle has
-been processed. No WARNING is logged during this warmup period.
+**Warmup gate**: `_on_tick` silently discards ticks until `_cached_indicators` is set — which happens on the first streaming candle that produces valid indicators (requires `max(bb_period, rsi_period) + 1` entries in the candle window). After a successful warmup this is the first streaming candle. After a cold-start (warmup failure), this requires `max(bb_period, rsi_period)` additional streaming candles — 20 with default params. No WARNING is logged during this period.
 
-**In-flight guard**: `_tick_long_in_flight` and `_tick_short_in_flight` flags
-prevent duplicate REST calls if multiple ticks qualify before the first REST
-response returns. Each flag is set immediately before the REST call and reset in
-a `finally` block — so it is always `False` after `_on_tick` returns, even if the
-REST call raises an exception.
+**In-flight guards**: Four flags prevent duplicate REST calls in tick mode — two for open calls (`_tick_long_in_flight`, `_tick_short_in_flight`, managed inside `_tick_try_open`) and two for close calls (`_tick_long_close_in_flight`, `_tick_short_close_in_flight`, managed inside `_on_tick`'s own `finally` block). Each flag is set immediately before the REST call and reset in a `finally` block so it is always `False` after the handler returns, even if the call raises.
 
-**Spread**: In tick mode, exit profit is calculated using the live `ofr - bid`
-spread from the tick itself (sub-second accuracy), not the candle-close spread
-stored in `_current_spread`.
+**Spread and `entry_spread`**: LONG positions opened in tick mode store
+`entry_spread` — the bid/ask spread at the moment the position was opened.
+`_tick_close_positions` uses `entry_spread` (not the current exit-tick spread)
+for the LONG profit check. The rationale: mean-reversion entries tend to fire
+during volatile price spikes (wide spread); using the exit-tick spread (which
+is narrower during calmer exit conditions) would overstate profit and trigger
+premature exits. Seeded positions restored from `_seed_positions_from_broker()`
+do NOT have `entry_spread`. A WARNING is logged **once at startup** per seeded LONG position. At exit time, `_tick_close_positions` silently uses the live tick spread as the fallback — no per-tick warning is emitted. For SHORT positions, the live tick spread is always used directly.
+
+**Native subscription fallback**: If the native candle subscription fails (e.g., account tier restriction), `IGStreamingClient` falls back to tick aggregation. In that case the direct tick subscription (`CHART:{epic}:TICK`) is not opened, and tick-mode entry/exit signals are disabled for the session. A WARNING is logged. The strategy continues receiving synthetic candles from the tick aggregator and operates as if in candle mode.
 
 **Switching modes**: Set `"operation_mode": "tick"` in the strategy JSON and
-redeploy. To revert, set it back to `"candle"` (or remove the key — missing key
-defaults to `"candle"`).
+redeploy. To revert, set it back to `"candle"`.
 
 **Invalid value handling**: If `operation_mode` is set to an unrecognised value
 (e.g., `"turbo"`), the strategy logs a WARNING and falls back to `"candle"` mode.
@@ -150,7 +151,7 @@ Positions with an unexpected direction value are skipped with a WARNING.
 **No `entry_spread` on seeded positions**: positions restored from broker state
 have no recorded spread. In tick mode, `_tick_close_positions` uses the live
 tick spread as a fallback for profit checks — a WARNING is logged for every
-seeded LONG position noting this.
+seeded LONG position noting this. This WARNING fires regardless of `operation_mode` — in candle mode it is harmless and can be ignored.
 
 **Capacity guard**: if the seeded count exceeds `max_long_positions` or
 `max_short_positions`, a WARNING is logged recommending operator review. The
@@ -201,6 +202,11 @@ recently closed candle:
 - Distance from the last long entry price >= `min_dist_between_entries_ticks`
   (or no long positions are open)
 
+**In tick mode**: entry uses the live `bid` price instead of candle `close`.
+The same BB and RSI thresholds apply. `entry_price` is recorded as `bid` at
+the moment the tick fires (not the candle close). The distance check compares
+`bid` against `_long_positions[-1]["entry_price"]`.
+
 ### Short entry
 
 A short position is opened when ALL of the following are true:
@@ -210,6 +216,11 @@ A short position is opened when ALL of the following are true:
 - Current number of open short positions < `max_short_positions`
 - Distance from the last short entry price >= `min_dist_between_entries_ticks`
   (or no short positions are open)
+
+**In tick mode**: entry uses the live `bid` price instead of candle `close`.
+The same BB and RSI thresholds apply. `entry_price` is recorded as `bid` at
+the moment the tick fires (not the candle close). The distance check compares
+`bid` against `_short_positions[-1]["entry_price"]`.
 
 The long and short grids are evaluated independently on every candle. An
 active short signal does not suppress long entry evaluation and vice versa.
@@ -229,6 +240,12 @@ A long position is closed when BOTH of the following are true:
 Positions that are still underwater after spread remain open. Only profitable
 positions exit.
 
+**In tick mode**: exit uses the live `bid` price. The profit check uses
+`entry_spread` stored at open time (if present), falling back to the live
+tick spread when `entry_spread` is absent (e.g. positions seeded from broker
+state). Using the entry-time spread rather than the exit-tick spread prevents
+premature exits when the spread was wide at entry.
+
 ### Short exit
 
 A short position is closed when BOTH of the following are true:
@@ -236,6 +253,9 @@ A short position is closed when BOTH of the following are true:
 - `close < bb_lower` — price has closed below the lower Bollinger Band
 - `(entry_price - close - spread) * size > 0` — the position is profitable
   after the bid/ask spread
+
+**In tick mode**: exit uses the live `bid` price. The profit check uses the
+live tick spread directly (no stored entry spread for shorts).
 
 ### Spread calculation
 
@@ -256,6 +276,7 @@ to `0.0` — a conservative fallback that never suppresses a profitable exit.
 |-----------|--------|
 | Position grids | Long and short grids are independent; both may hold positions simultaneously |
 | Startup reconciliation | `_seed_positions_from_broker()` pre-populates both grids from broker state before streaming starts — open positions survive restarts |
+| Runtime reconciliation | If a `close_position` REST call fails, the position is flagged `needs_reconciliation=True`. On the next candle or tick, `_reconcile_positions()` fetches broker positions and removes any local position no longer present at the broker. |
 | Max positions per grid | `max_long_positions` for longs; `max_short_positions` for shorts |
 | Minimum entry distance | New entry rejected if `abs(close - last_entry) < min_dist_between_entries_ticks` |
 | Position sizing | Flat `contract_size` for every entry — no martingale, no scaling |
@@ -275,6 +296,57 @@ There is no programmatic stop-loss in V2. Risk is bounded by:
   `min_dist_between_entries_ticks` ticks.
 
 There is no drawdown freeze, no ATR rule, and no margin check in V2.
+
+---
+
+## Account Status Logging
+
+`log_account_status()` is called on every candle close — after trade decisions in candle mode, after caching indicators in tick mode. It is **not** called from `_on_tick`. It makes two broker REST calls per candle (`get_account_summary` and `get_open_positions`) and emits one `STATUS |` INFO log line.
+
+### Log format
+
+```
+STATUS | Mode: {mode} | Equity: ${equity} | Used Margin: ${used_margin} | Margin Level: {level} {health} | Free: ${free_margin} | Longs: {n} (avg: {price}) | Shorts: {n} (avg: {price}) | Total: {n}
+```
+
+`mode` is `LIVE` or `VIRTUAL (1:{leverage})` depending on `ig_acc_type`.
+
+### Equity and margin calculation
+
+**LIVE mode** (`ig_acc_type=LIVE`):
+
+| Field | Source |
+|-------|--------|
+| `current_equity` | `balance + profitLoss` from `get_account_summary()` |
+| `used_margin` | `sum(size × level / leverage)` over broker positions filtered to `self.epic` |
+| `free_margin` | `current_equity − used_margin` |
+
+**DEMO/VIRTUAL mode**:
+
+| Field | Source |
+|-------|--------|
+| `current_equity` | `initial_cash_balance + (balance − demo_starting_balance) + profitLoss` |
+| `used_margin` | `sum(size × level / leverage)` over broker positions filtered to `self.epic` |
+| `free_margin` | `current_equity − used_margin` |
+
+Only positions matching `self.epic` are included in the margin calculation.
+
+### Health labels
+
+| Label | Condition |
+|-------|-----------|
+| `[IDLE]` | No open positions (`used_margin == 0`) |
+| `[DANGER]` | Margin level < 120% |
+| `[ALERT]` | Margin level 120–199% |
+| `[HEALTHY]` | Margin level ≥ 200% |
+
+### Average entry prices
+
+`Longs` and `Shorts` avg entry prices are computed from the **local position grids** (`_long_positions`, `_short_positions`) using a size-weighted mean of `entry_price`. Returns `N/A` when the grid is empty.
+
+### Error handling
+
+Any exception from either broker call is caught by a broad `try/except`. The method logs an ERROR and returns without emitting the STATUS line — it never propagates to the caller.
 
 ---
 
@@ -317,21 +389,26 @@ loaded at startup into a `types.SimpleNamespace` via `load_params()`.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `api_mode` | string | `"streaming"` | Must be `"streaming"` — tells `kuroko.py` to instantiate `IGStreamingClient` |
-| `operation_mode` | string | `"candle"` | Signal evaluation mode. `"candle"`: signals fire on each closed candle (default). `"tick"`: indicators cached on candle close; signals fire on each live tick. Any other value logs a WARNING and falls back to `"candle"`. Missing key defaults to `"candle"`. |
-| `candle_frequency` | string | `"1min"` | Candle resolution in `"Nmin"` format (e.g. `"1min"`, `"5min"`, `"15min"`, `"60min"`). Mapped to IG Lightstreamer resolution strings (`"1MINUTE"`, `"5MINUTE"`, `"15MINUTE"`, `"1HOUR"`). Applied to both native candle subscription and tick-aggregation fallback. |
+| `operation_mode` | string | `"candle"` | Signal evaluation mode. `"candle"`: signals fire on each closed candle (default). `"tick"`: indicators cached on candle close; signals fire on each live tick. Any other value logs a WARNING and falls back to `"candle"`. Required field — removing it causes startup to fail with a CRITICAL log and `SystemExit(1)`. |
+| `candle_frequency` | string | `"5min"` | Candle resolution in `"Nmin"` format (e.g. `"1min"`, `"5min"`, `"15min"`, `"60min"`). Mapped to IG Lightstreamer resolution strings (`"1MINUTE"`, `"5MINUTE"`, `"15MINUTE"`, `"1HOUR"`). Applied to both native candle subscription and tick-aggregation fallback. |
 | `bb_period` | int | `20` | Bollinger Bands lookback period |
 | `bb_std` | float | `1.5` | Bollinger Bands standard deviation multiplier |
-| `rsi_period` | int | `14` | RSI lookback period |
-| `rsi_oversold` | int | `40` | RSI level below which long entries are considered |
-| `rsi_overbought` | int | `60` | RSI level above which short entries are considered |
-| `max_long_positions` | int | `5` | Maximum number of simultaneously open long positions |
-| `max_short_positions` | int | `5` | Maximum number of simultaneously open short positions |
-| `contract_size` | float | `0.1` | Position size in contracts — uniform for every entry |
-| `min_dist_between_entries_ticks` | float | `30` | Minimum price distance between consecutive entries in the same grid (ticks) |
-| `take_profit_ticks` | float | `30` | Broker take-profit distance from entry price (ticks) |
+| `rsi_period` | int | `7` | RSI lookback period |
+| `rsi_oversold` | float | `30.0` | RSI level below which long entries are considered |
+| `rsi_overbought` | float | `70.0` | RSI level above which short entries are considered |
+| `max_long_positions` | int | `10` | Maximum number of simultaneously open long positions |
+| `max_short_positions` | int | `10` | Maximum number of simultaneously open short positions |
+| `contract_size` | float | `3.0` | Position size in contracts — uniform for every entry |
+| `min_dist_between_entries_ticks` | float | `10` | Minimum price distance between consecutive entries in the same grid (ticks) |
+| `take_profit_ticks` | float | `8` | Broker take-profit distance from entry price (ticks) |
 
-Infrastructure parameters (`epic`, `leverage`, etc.) come from
-`config.json["trading"]` and are NOT stored in the strategy JSON.
+Infrastructure parameters (`leverage`, `initial_cash_balance`,
+`demo_starting_balance`) come from `config.json["trading"]`. `epic` is stored
+in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
+
+> **Note on types**: `float` fields accept integer values — `"take_profit_ticks": 8` and `"take_profit_ticks": 8.0` are both valid.
+
+> **Note**: `config.json["trading"]` also contains `security_buffer` (carried over from V1). V2 does not use it.
 
 > **Note**: `spread` is no longer a static config parameter. The strategy reads
 > spread dynamically from each candle's `OFR_CLOSE - BID_CLOSE` value delivered
@@ -345,19 +422,24 @@ Infrastructure parameters (`epic`, `leverage`, etc.) come from
 
 ```json
 {
+  "epic": "IX.D.SPTRD.IFMM.IP",
+
   "api_mode": "streaming",
-  "candle_frequency": "1min",
-  "operation_mode": "candle",
+  "candle_frequency": "5min",
+  "operation_mode": "tick",
+
   "bb_period": 20,
   "bb_std": 1.5,
-  "rsi_period": 14,
-  "rsi_oversold": 40,
-  "rsi_overbought": 60,
-  "max_long_positions": 5,
-  "max_short_positions": 5,
-  "contract_size": 0.1,
-  "min_dist_between_entries_ticks": 30,
-  "take_profit_ticks": 30
+  "rsi_period": 7,
+  "rsi_oversold": 30.0,
+  "rsi_overbought": 70.0,
+
+  "max_long_positions": 10,
+  "max_short_positions": 10,
+
+  "contract_size": 3.0,
+  "min_dist_between_entries_ticks": 10,
+  "take_profit_ticks": 8
 }
 ```
 
@@ -380,6 +462,8 @@ any exception).
 Stop the bot with `CTRL+C` — `kuroko.py` calls `streaming_client.stop()` in
 its `finally` block, which disconnects the Lightstreamer session cleanly.
 
+> Note: `strategy.stop()` is not called by `kuroko.py` on `CTRL+C`. The teardown sequence is: `KeyboardInterrupt` → `_run_strategy` catches it → `finally` calls `streaming_client.stop()` → Lightstreamer disconnects → worker thread drains the queue and exits.
+
 ---
 
 ## Differences from V1
@@ -387,7 +471,7 @@ its `finally` block, which disconnects the Lightstreamer session cleanly.
 | Feature | RSIBollingerStrategy (V1) | RSIBollingerStrategyV2 |
 |---------|---------------------------|------------------------|
 | Data source | REST polling (15-min candles, per-cycle API call) | Lightstreamer streaming (5-min candles by default, push) |
-| Candle resolution | Configurable via `candle_frequency` (default 15 min) | Configurable via `candle_frequency` (default 1min) |
+| Candle resolution | Configurable via `candle_frequency` (default 15 min) | Configurable via `candle_frequency` |
 | Directions | Long only (short entry is defined but rarely triggered in V1) | Bidirectional — independent long and short grids |
 | Position sizing | Martingale: each grid level multiplies base size by `martingale_multiplier` | Flat: every entry uses `contract_size` |
 | Stop-loss | ATR-based dynamic stop (`atr_sl_multiplier * ATR`) | None |
