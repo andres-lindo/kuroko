@@ -17,6 +17,7 @@ Kuroko is split into two independent execution contexts that share no runtime st
 
 ```
 kuroko.py  ← load_dotenv("credentials.env") runs at module scope, before main()
+├── load_app_config(config_path) → config dict
 ├── load_strategy(args.strategy) → (StrategyClass, load_params)
 ├── load_params("strategies/<StrategyName>.json") → types.SimpleNamespace
 │   └── api_mode required — determines REST or streaming wiring
@@ -25,6 +26,8 @@ kuroko.py  ← load_dotenv("credentials.env") runs at module scope, before main(
 │   ├── partition_key from config.json["logging"]["azure_log_partition_key"]
 │   └── override_level from --log-level CLI arg (overrides config.json log_level when set)
 │
+├── trading_config = SimpleNamespace(**config["trading"])
+│
 ├── IGClient()
 │   ├── Reads env vars set by load_dotenv (username, password, api_key, acc_number)
 │   ├── Creates IG Markets REST session
@@ -32,7 +35,8 @@ kuroko.py  ← load_dotenv("credentials.env") runs at module scope, before main(
 │
 ├── _wire_strategy(strategy_class, params, ig, trading_config)
 │   ├── api_mode == "rest"      → StrategyClass(params, ig_client, trading_config).run()
-│   └── api_mode == "streaming" → IGStreamingClient(ig.ig_service, epic)
+│   └── api_mode == "streaming" → resolution = candle_frequency_to_resolution(params.candle_frequency)
+│                                  IGStreamingClient(ig.ig_service, params.epic, resolution=resolution)
 │                                  StrategyClass(params, ig_client, streaming_client, trading_config).run()
 │
 └── _run_strategy(strat, streaming_client)
@@ -48,7 +52,7 @@ kuroko.py  ← load_dotenv("credentials.env") runs at module scope, before main(
 
 Wrapper around the `trading-ig` library. All API calls go through `_safe_api_call`, which provides:
 
-- **Retry with backoff**: up to 3 attempts, waits 1 → 2 → 4 seconds between attempts
+- **Retry with backoff**: up to 3 attempts; sleeps 1s before attempt 2 and 2s before attempt 3 (attempt 3 raises immediately — no 4-second wait)
 - **Token refresh**: detects expired session errors and calls `create_session()` before retrying. Session refresh is NOT triggered for `json.JSONDecodeError` — empty-body responses are content errors, not auth errors
 - **Maintenance window handling**: `json.JSONDecodeError` (IG returning an empty HTTP body) is included in the retry clause so transient outages are retried automatically
 - **Candle caching**: two-layer cache
@@ -60,25 +64,41 @@ Key methods: `get_candles()`, `get_open_positions()`, `open_position()`, `close_
 
 #### `RSIBollingerStrategy` (`strategies/RSIBollingerStrategy.py`)
 
-V1 strategy. Contains all trading logic. Uses REST polling on a 15-minute cadence. Initialized with `params`, `ig_client`, and `trading_config`. See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for entry logic, position sizing, exit logic, risk controls, and parameter reference.
+V1 strategy. Contains all trading logic. Uses REST polling at the interval configured by `candle_frequency` in its JSON (currently 15 min). Initialized with `params`, `ig_client`, and `trading_config`. See [RSIBollingerStrategy documentation](strategies/RSIBollingerStrategy.md) for entry logic, position sizing, exit logic, risk controls, and parameter reference.
 
 #### `RSIBollingerStrategyV2` (`strategies/RSIBollingerStrategyV2.py`)
 
-V2 strategy. Event-driven bidirectional mean-reversion. Receives 5-minute candles via `IGStreamingClient`. Maintains independent long and short position grids. No martingale, no ATR, no stop-loss. See [RSIBollingerStrategyV2 documentation](strategies/RSIBollingerStrategyV2.md) for full reference.
+V2 strategy. Event-driven bidirectional mean-reversion. Receives closed OHLC candles via `IGStreamingClient`. Maintains independent long and short position grids. No martingale, no ATR, no stop-loss. See [RSIBollingerStrategyV2 documentation](strategies/RSIBollingerStrategyV2.md) for full reference.
+
+**Startup sequence.** Before streaming begins, `run()` calls two methods in order:
+
+1. `_warmup()` — fetches historical candles via `IGClient.get_candles()` and pre-fills `_candle_window` so that Bollinger Band and RSI indicators are valid from the very first streaming candle. If the REST call returns `None` or raises, warm-up is skipped and the strategy starts in cold-start mode: `_candle_window` is empty and indicators are unavailable until enough streaming candles have accumulated.
+2. `_seed_positions_from_broker()` — fetches all open positions at startup and populates `_long_positions` / `_short_positions`, so the bot correctly tracks positions that were opened during a previous session.
+
+**Operation mode.** Controlled by `operation_mode` in the strategy JSON:
+
+- `"candle"` — entry and exit signals are evaluated on each closed candle via `_manage_longs()` / `_manage_shorts()`.
+- `"tick"` — indicators are cached on each candle close; entry and exit signals fire on every live tick via `_on_tick()`, enabling sub-candle precision. The current production config uses tick mode.
+
+**Exit mechanisms.** V2 uses two exit paths: (1) a broker-side take-profit limit order placed at open (`take_profit_ticks` above/below the entry price); and (2) a signal-driven exit evaluated on each candle or tick — when price crosses the opposite Bollinger Band and the position is profitable after spread, the position is closed via REST.
+
+**Runtime reconciliation.** When a `close_position()` REST call fails, the position is flagged `needs_reconciliation=True`. Before the next candle or tick is processed, `_reconcile_positions()` fetches broker positions and removes any phantom local entries. This is distinct from startup seeding — it fires during normal operation after failed closes.
 
 #### `IGStreamingClient` (`ig_streaming_client.py`)
 
-Wraps `trading_ig`'s `IGStreamService` to deliver closed 5-minute OHLC candles via callback. Subscribes to `CHART:{epic}:5MINUTE` natively; falls back to `CHART:{epic}:TICK` with in-process `TickAggregator` if the native subscription fails. Candles are delivered from a dedicated worker thread, never directly from the Lightstreamer listener.
+Wraps `trading_ig`'s `IGStreamService` to deliver closed OHLC candles at the configured resolution via callback. Subscribes to `CHART:{epic}:{resolution}` natively; falls back to `CHART:{epic}:TICK` with in-process `TickAggregator` if the native subscription fails. Candles are delivered from a dedicated worker thread, never directly from the Lightstreamer listener. Resolution is determined by `candle_frequency` in the strategy JSON, converted via `candle_frequency_to_resolution()`.
 
-Public API: `start(on_candle)`, `stop()`.
+Public API: `start(on_candle, on_tick=None)`, `stop()`. When `on_tick` is provided (tick mode), a second subscription to `CHART:{epic}:TICK` is opened via `_DirectTickListener`.
 
 #### `AzureBlobHandler` (`azure_log_handler.py`)
 
 Custom `logging.Handler` that ships all log records to Azure Blob Storage. Uses append-blob mode so multiple writes don't overwrite existing content. Rotates to a new blob daily at midnight UTC. Blob name format: `{log_partition_key}_{YYYY-MM-DD}.log`. The partition key is read from `azure_log_partition_key` in `config.json["logging"]`.
 
+Azure Blob log shipping is activated by including `"azure_table"` in the `log_type` array in `config.json["logging"]`. The default config has `"log_type": ["file"]`, so shipping is OFF unless explicitly enabled.
+
 ### Fault Tolerance and Self-Healing
 
-> Layers 1–5 and the maintenance window example below apply to **REST-mode strategies (V1)**. V2 (streaming) has a different recovery model: the Lightstreamer connection handles reconnection internally, and REST calls for position management are retried via `_safe_api_call` (Layer 1). V2 does not have a candle cache or a per-tick poll loop.
+> Layers 1–5 and the maintenance window example below apply to **REST-mode strategies (V1)**. V2 (streaming) has a different recovery model: the Lightstreamer connection handles reconnection internally, and REST calls for position management are retried via `_safe_api_call` (Layer 1). V2 does not have a per-candle REST poll loop. It uses IGClient's two-layer cache (in-memory + parquet) once during warmup via `get_candles()`, but not for ongoing signal calculation.
 
 The live trading engine is designed to survive transient IG API failures (maintenance windows, timeouts, empty responses) without operator intervention. Recovery is layered — each layer handles failures at its own level and passes only unrecoverable conditions upward.
 
@@ -86,15 +106,15 @@ The live trading engine is designed to survive transient IG API failures (mainte
 
 **Layer 1 — API call (`_safe_api_call`)**
 
-Every API call is retried up to 3 times with exponential backoff (1s, 2s, 4s). Handles: `ConnectionError`, `RequestException`, `IGException`, `json.JSONDecodeError`. Token-expired errors also trigger a session refresh before retrying. If all 3 attempts fail, the exception propagates to the caller.
+Every API call is retried up to 3 times with exponential backoff (1s → 2s between attempts). Handles: `ConnectionError`, `RequestException`, `IGException`, `json.JSONDecodeError`. Token-expired errors also trigger a session refresh before retrying. If all 3 attempts fail, the exception propagates to the caller.
 
 **Layer 2 — Candle fetch (`Strategy.get_candles`)**
 
-If `IGClient.get_candles()` raises after exhausting retries, `Strategy.get_candles()` catches the exception, logs an ERROR, and returns the last successfully fetched DataFrame from its internal cache. The strategy operates on stale data for that tick rather than crashing. If the cache is empty (first startup, first call ever failed), an empty DataFrame is returned and the cycle is skipped.
+`IGClient.get_candles()` returns `None` on initial load failure (not always raises). V1's `strategy.get_candles()` silently returns the cached `self.candles` unchanged when `None` is received. If `IGClient.get_candles()` raises after exhausting retries, `Strategy.get_candles()` catches the exception, logs an ERROR, and returns the last successfully fetched DataFrame from its internal cache. The strategy operates on stale data for that tick rather than crashing. If the cache is empty (first startup, first call ever failed), an empty DataFrame is returned and the cycle is skipped.
 
 **Layer 3 — Account data guard (`manage_positions`, `log_account_status`)**
 
-Both methods call `get_account_summary()` at the start of each cycle. If the API is down, `get_account_summary()` returns an empty dict `{}`. Both methods check `if not account_info` immediately and return with a WARNING log. The strategy does not trade on missing data — it skips the cycle entirely. All remaining key accesses use `.get(key, default)` so no `KeyError` can occur.
+In `manage_positions`, `get_account_summary()` is called after exit checks but before entry evaluation. If the API is down, `get_account_summary()` returns an empty dict `{}`. Both `manage_positions` and `log_account_status` check `if not account_info` immediately and return with a WARNING log. The strategy does not trade on missing data — it skips the cycle entirely. All remaining key accesses use `.get(key, default)` so no `KeyError` can occur.
 
 **Layer 4 — Per-cycle recovery (`Strategy.run` loop)**
 
@@ -112,9 +132,11 @@ while True:
     sleep until next_tick
 ```
 
-**Layer 5 — Position close retry (`close_all_positions`)**
+**Layer 5 — Position close retry (`close_all_positions`) — V1 only**
 
 Each individual `close_position()` call is wrapped in its own retry loop: 3 attempts with 1s/2s backoff. A failure on one position does not block the remaining closes. Failed deal IDs are accumulated and reported in a single WARNING after all positions are processed.
+
+> This layer applies to V1 only. V2 handles close failures inline within `_manage_longs()` / `_manage_shorts()` and flags failures with `needs_reconciliation=True` rather than retrying immediately.
 
 **Layer 6 — Startup config (`strategies/<StrategyName>.json`)**
 
@@ -122,7 +144,7 @@ A failure here is fatal by design — the bot cannot trade without its configura
 
 1. **File errors** — missing file (`FileNotFoundError`), invalid JSON (`JSONDecodeError`), or unreadable file (`OSError`).
 2. **Schema errors** — `_validate_params()` checks that all required keys are present and correctly typed (e.g. `int` fields reject `bool`, `float` fields accept `int`). All errors are collected and reported at once before exiting. The required keys and types differ by strategy — see the strategy documentation for the full schema.
-3. **Format errors** — V1 additionally validates that `candle_frequency` matches `^\d+min$` (e.g. `"15min"`). V2 has no such format-specific checks beyond type validation.
+3. **Format errors** — V1 additionally validates that `candle_frequency` matches `^[1-9]\d*min$` (e.g. `"15min"`, rejects `"0min"`). V2 has no such format-specific checks beyond type validation.
 4. **api_mode errors** — `_wire_strategy()` raises `ConfigurationError` if `api_mode` is missing or not `"rest"`/`"streaming"`.
 
 No retry is attempted; the process manager (systemd, supervisor, etc.) handles restart scheduling.
@@ -132,7 +154,7 @@ No retry is attempted; the process manager (systemd, supervisor, etc.) handles r
 ```
 IG API unavailable
 │
-├── Tick N:   _safe_api_call retries 3× in ~3s → raises
+├── Tick N:   _safe_api_call retries 3× (~3s total: 1s + 2s waits) → raises
 │             get_candles()  → returns stale cache (or empty DataFrame)
 │             manage_positions() → account_info is {} → WARNING → return
 │             run() except → logs "Trading cycle failed — will retry next tick"
@@ -157,16 +179,19 @@ The process **never exits** on API failures. It retries every tick indefinitely 
 
 ### Configuration Flow
 
-Strategy parameters are stored in `strategies/<StrategyName>.json` and loaded at startup via `load_params()`. Infrastructure parameters (`epic`, `leverage`, `demo_starting_balance`, `initial_cash_balance`, `security_buffer`) are stored in `config.json["trading"]` — they are not in the strategy JSON. Changing a parameter requires editing the appropriate file and redeploying the bot.
+Strategy parameters are stored in `strategies/<StrategyName>.json` and loaded at startup via `load_params()`. Infrastructure parameters (`leverage`, `demo_starting_balance`, `initial_cash_balance`, `security_buffer`) are stored in `config.json["trading"]`. Each strategy's own JSON contains `epic` (the IG instrument identifier). Changing a parameter requires editing the appropriate file and redeploying the bot.
+
+To change the traded instrument (`epic`), edit the relevant strategy JSON (`strategies/RSIBollingerStrategy.json` for V1, `strategies/RSIBollingerStrategyV2.json` for V2). Do not set `epic` in `config.json` — it is no longer read from there.
 
 ```
 config.json
-├── ["trading"]  → types.SimpleNamespace(**data) → trading_config (epic, leverage, ...)
+├── ["trading"]  → types.SimpleNamespace(**data) → trading_config (leverage, demo_starting_balance, initial_cash_balance, security_buffer)
 └── ["logging"]  → setup_logging() (log_type, log_level, azure_log_partition_key, ...)
 
 strategies/<StrategyName>.json
 └── json.load() → dict
     └── types.SimpleNamespace(**data) → params
+        ├── epic (IG instrument identifier)
         ├── api_mode (required — "rest" or "streaming")
         └── strategy-specific keys (rsi_period, bb_period, ...)
 ```
