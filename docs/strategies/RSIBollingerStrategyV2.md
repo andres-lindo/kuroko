@@ -299,6 +299,38 @@ There is no drawdown freeze, no ATR rule, and no margin check in V2.
 
 ---
 
+## Guardrails
+
+Guardrails are time-based restrictions that block specific actions regardless
+of signal state. They are checked before entries and never block exits.
+
+### Friday 14:00 NY — long entry block
+
+`_is_long_entry_allowed(ts=None) -> bool` returns `False` on any Friday at or
+after 14:00 New York time, preventing new long positions from being opened over
+the weekend. The rationale: positions left open Friday afternoon roll into
+Monday and accrue intraday fees with no active session to manage them.
+
+**What is blocked**: long entries only — in both candle mode (`_manage_longs`)
+and tick mode (`_on_tick`).
+
+**What is NOT blocked**: long exits, any short entry or exit. The guard is
+injected at the top of the entry block in each path, so the exit evaluation
+that precedes it still runs unconditionally.
+
+**DST handling**: the check converts the evaluation timestamp to
+`America/New_York` using `ZoneInfo("America/New_York")`. DST transitions are
+handled automatically — no hardcoded UTC offset.
+
+**Log message** (when blocked): `[GUARD] Long entry skipped — Friday after 14:00 NY`
+— logged at INFO level in candle mode, DEBUG in tick mode.
+
+**`ts` parameter**: when called with `ts=None` (runtime), wall-clock time is
+used. Passing an explicit `datetime` (e.g. in tests) converts it to NY timezone
+before the day/hour check.
+
+---
+
 ## Account Status Logging
 
 `log_account_status()` is called on every candle close — after trade decisions in candle mode, after caching indicators in tick mode. It is **not** called from `_on_tick`. It makes two broker REST calls per candle (`get_account_summary` and `get_open_positions`) and emits one `STATUS |` INFO log line.

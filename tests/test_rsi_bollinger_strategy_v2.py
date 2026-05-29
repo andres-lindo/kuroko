@@ -278,6 +278,107 @@ class TestLongEntryGuards:
 
 
 # --------------------------------------------------------------------------- #
+# Guardrails — Friday afternoon long block                                     #
+# --------------------------------------------------------------------------- #
+
+
+class TestGuardrails:
+    """_is_long_entry_allowed blocks longs on Fridays from 14:00 NY time."""
+
+    # -- unit: _is_long_entry_allowed -----------------------------------------
+
+    def test_allowed_on_weekday(self, make_strategy_v2):
+        """Returns True on a non-Friday weekday regardless of time."""
+        strat, _, _ = make_strategy_v2()
+        monday = datetime(2026, 1, 5, 16, 0, tzinfo=ZoneInfo("America/New_York"))
+        assert strat._is_long_entry_allowed(monday) is True
+
+    def test_allowed_friday_before_cutoff(self, make_strategy_v2):
+        """Returns True on Friday before 14:00 NY."""
+        strat, _, _ = make_strategy_v2()
+        friday_morning = datetime(
+            2026, 1, 2, 13, 59, tzinfo=ZoneInfo("America/New_York")
+        )
+        assert strat._is_long_entry_allowed(friday_morning) is True
+
+    def test_blocked_friday_at_cutoff(self, make_strategy_v2):
+        """Returns False on Friday exactly at 14:00 NY."""
+        strat, _, _ = make_strategy_v2()
+        friday_cutoff = datetime(2026, 1, 2, 14, 0, tzinfo=ZoneInfo("America/New_York"))
+        assert strat._is_long_entry_allowed(friday_cutoff) is False
+
+    def test_blocked_friday_after_cutoff(self, make_strategy_v2):
+        """Returns False on Friday after 14:00 NY."""
+        strat, _, _ = make_strategy_v2()
+        friday_evening = datetime(
+            2026, 1, 2, 18, 0, tzinfo=ZoneInfo("America/New_York")
+        )
+        assert strat._is_long_entry_allowed(friday_evening) is False
+
+    def test_blocked_friday_summer_dst(self, make_strategy_v2):
+        """Returns False on a summer Friday at 14:30 EDT (DST-aware)."""
+        strat, _, _ = make_strategy_v2()
+        summer_friday = datetime(
+            2026, 6, 5, 14, 30, tzinfo=ZoneInfo("America/New_York")
+        )
+        assert strat._is_long_entry_allowed(summer_friday) is False
+
+    def test_allowed_friday_utc_before_ny_cutoff(self, make_strategy_v2):
+        """UTC timestamp converts to NY winter time correctly (14:00 UTC = 09:00 EST → allowed)."""
+        strat, _, _ = make_strategy_v2()
+        # 2026-01-02 14:00 UTC = 2026-01-02 09:00 EST — Friday 09:00 → allowed
+        utc_ts = datetime(2026, 1, 2, 14, 0, tzinfo=timezone.utc)
+        assert strat._is_long_entry_allowed(utc_ts) is True
+
+    def test_blocked_friday_utc_converts_past_cutoff(self, make_strategy_v2):
+        """19:00 UTC = 14:00 EST on a winter Friday → blocked."""
+        strat, _, _ = make_strategy_v2()
+        # 2026-01-02 19:00 UTC = 2026-01-02 14:00 EST — Friday 14:00 → blocked
+        utc_ts = datetime(2026, 1, 2, 19, 0, tzinfo=timezone.utc)
+        assert strat._is_long_entry_allowed(utc_ts) is False
+
+    # -- integration: _manage_longs -------------------------------------------
+
+    def test_manage_longs_entry_blocked_by_guardrail(self, make_strategy_v2):
+        """Entry is skipped when _is_long_entry_allowed returns False."""
+        strat, mock_ig, _ = make_strategy_v2()
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
+        )
+        with patch.object(strat, "_is_long_entry_allowed", return_value=False):
+            strat._manage_longs(indicators)
+        mock_ig.open_position.assert_not_called()
+
+    def test_manage_longs_exit_not_blocked_by_guardrail(self, make_strategy_v2):
+        """Long exit fires even when _is_long_entry_allowed returns False."""
+        strat, mock_ig, _ = make_strategy_v2()
+        strat._long_positions = [{"deal_id": "X", "entry_price": 80.0, "size": 1.0}]
+        strat._current_spread = 0.0
+        indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=105.0
+        )
+        with patch.object(strat, "_is_long_entry_allowed", return_value=False):
+            strat._manage_longs(indicators)
+        mock_ig.close_position.assert_called_once_with("X", "SELL", 1.0)
+
+    # -- integration: _on_tick ------------------------------------------------
+
+    def test_on_tick_long_entry_blocked_by_guardrail(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick-mode long entry is skipped when _is_long_entry_allowed returns False."""
+        params = make_params_v2(operation_mode="tick")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=20.0, close=100.0
+        )
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+        with patch.object(strat, "_is_long_entry_allowed", return_value=False):
+            strat._on_tick(tick)
+        mock_ig.open_position.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
 # Short entry signal — REQ-8                                                   #
 # --------------------------------------------------------------------------- #
 

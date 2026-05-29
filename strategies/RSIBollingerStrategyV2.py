@@ -404,6 +404,22 @@ class RSIBollingerStrategyV2:
             )
 
     # ---------------------------------------------------------------------- #
+    # Guardrails                                                               #
+    # ---------------------------------------------------------------------- #
+
+    def _is_long_entry_allowed(self, ts: datetime | None = None) -> bool:
+        """Return False on Fridays from 14:00 New York time (DST-aware).
+
+        Args:
+            ts: Timestamp to evaluate. If None, uses the current wall-clock time.
+        """
+        if ts is None:
+            ts = datetime.now(ZoneInfo("America/New_York"))
+        else:
+            ts = ts.astimezone(ZoneInfo("America/New_York"))
+        return not (ts.weekday() == 4 and ts.hour >= 14)
+
+    # ---------------------------------------------------------------------- #
     # Long grid management                                                     #
     # ---------------------------------------------------------------------- #
 
@@ -475,6 +491,9 @@ class RSIBollingerStrategyV2:
             self._long_positions = to_keep
 
         # --- ENTRIES ---
+        if not self._is_long_entry_allowed():
+            logger.info("[GUARD] Long entry skipped — Friday after 14:00 NY")
+            return
         if close >= bb_lower or rsi >= self.params.rsi_oversold:
             logger.debug(
                 f"Long entry skipped — signal not met: "
@@ -1125,7 +1144,9 @@ class RSIBollingerStrategyV2:
             logger.debug("tick short_exit: skipped (in_flight) bid=%.5f", bid)
 
         # --- Long entry ---
-        if (
+        if not self._is_long_entry_allowed():
+            logger.debug("tick long_entry: skipped (guardrail) Friday after 14:00 NY")
+        elif (
             bid < bb_lower
             and rsi < self.params.rsi_oversold
             and not self._tick_long_in_flight
