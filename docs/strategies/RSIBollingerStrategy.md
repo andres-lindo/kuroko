@@ -160,7 +160,7 @@ Trading parameters are stored in `config.json["trading"]` and loaded via `load_a
 | Key | Type | Default | Source | Description |
 |-----|------|---------|--------|-------------|
 | `azure_log_partition_key` | string | `"DEV_NQ100"` | `config.json["logging"]` | Azure Blob Storage log blob label; passed to `setup_logging()` as `partition_key` |
-| `epic` | string | `"IX.D.NASDAQ.IFMM.IP"` | `config.json["trading"]` | IG Markets instrument identifier |
+| `epic` | string | `"IX.D.SPTRD.IFMM.IP"` | `config.json["trading"]` | IG Markets instrument identifier |
 | `leverage` | int | `20` | `config.json["trading"]` | Leverage ratio used for virtual margin calculation in DEMO mode |
 | `demo_starting_balance` | float | `20000.0` | `config.json["trading"]` | IG demo account reference balance used only for realized P&L calculation |
 | `initial_cash_balance` | float | `4000.0` | `config.json["trading"]` | Simulated capital base for virtual margin and drawdown floor |

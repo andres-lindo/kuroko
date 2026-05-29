@@ -93,7 +93,7 @@ class TestLoadParams:
     def test_valid_v2_json_loads_without_exit(self, tmp_path):
         """a well-formed V2 JSON file loads successfully."""
         data = {
-            "epic": "IX.D.NASDAQ.IFMM.IP",
+            "epic": "IX.D.SPTRD.IFMM.IP",
             "api_mode": "streaming",
             "operation_mode": "candle",
             "candle_frequency": "5min",
@@ -113,7 +113,7 @@ class TestLoadParams:
 
         params = load_params(str(path))
 
-        assert params.epic == "IX.D.NASDAQ.IFMM.IP"
+        assert params.epic == "IX.D.SPTRD.IFMM.IP"
         assert params.api_mode == "streaming"
         assert params.candle_frequency == "5min"
         assert params.bb_period == 20
@@ -1658,12 +1658,12 @@ class TestV2JsonCandleFrequency:
             data.get("candle_frequency"), str
         ), f"candle_frequency must be a string, got {type(data.get('candle_frequency'))!r}"
 
-    def test_v2_json_candle_frequency_default_is_1min(self):
-        """candle_frequency default value must be '1min'."""
+    def test_v2_json_candle_frequency_default_is_5min(self):
+        """candle_frequency default value must be '5min'."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
         assert (
-            data.get("candle_frequency") == "1min"
-        ), f"Expected candle_frequency='1min', got {data.get('candle_frequency')!r}"
+            data.get("candle_frequency") == "5min"
+        ), f"Expected candle_frequency='5min', got {data.get('candle_frequency')!r}"
 
 
 class TestV2ParamsSchema:
@@ -1739,7 +1739,7 @@ class TestTickFallbackUsesConfiguredResolution:
         """Build an IGStreamingClient with a given resolution and mocked stream service."""
         ig_service = MagicMock()
         client = IGStreamingClient(
-            ig_service, "IX.D.NASDAQ.IFMM.IP", resolution=resolution
+            ig_service, "IX.D.SPTRD.IFMM.IP", resolution=resolution
         )
         mock_stream_svc = MagicMock()
         mock_stream_svc.subscribe.return_value = None
@@ -1803,7 +1803,7 @@ class TestWireStrategyPassesResolution:
         mock_ig = MagicMock()
         mock_ig.ig_service = MagicMock(name="fake_ig_service")
         mock_strategy_class = MagicMock()
-        trading_config = types.SimpleNamespace(epic="IX.D.NASDAQ.IFMM.IP")
+        trading_config = types.SimpleNamespace(epic="IX.D.SPTRD.IFMM.IP")
 
         with patch("kuroko.IGStreamingClient") as mock_streaming_cls:
             _wire_strategy(
@@ -1814,7 +1814,7 @@ class TestWireStrategyPassesResolution:
             )
 
         mock_streaming_cls.assert_called_once_with(
-            mock_ig.ig_service, "IX.D.NASDAQ.IFMM.IP", resolution=expected_resolution
+            mock_ig.ig_service, "IX.D.SPTRD.IFMM.IP", resolution=expected_resolution
         )
 
 
@@ -1872,10 +1872,10 @@ class TestV2JsonConfig:
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
         assert data["bb_period"] == 20
 
-    def test_v2_json_bb_std_is_2_0(self):
-        """bb_std must be 2.0 per config."""
+    def test_v2_json_bb_std_is_1_5(self):
+        """bb_std must be 1.5 per config."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["bb_std"] == 2.0
+        assert data["bb_std"] == 1.5
 
     def test_v2_json_rsi_period_is_7(self):
         """rsi_period must be 7 per config."""
@@ -1948,7 +1948,7 @@ class TestValidateParamsBranches:
     def test_float_value_accepted_for_float_key(self, tmp_path):
         """An int value for a float key (e.g. take_profit_ticks=240) is accepted."""
         data = {
-            "epic": "IX.D.NASDAQ.IFMM.IP",
+            "epic": "IX.D.SPTRD.IFMM.IP",
             "api_mode": "streaming",
             "operation_mode": "candle",
             "candle_frequency": "5min",
@@ -2053,7 +2053,7 @@ class TestValidateParamsBranches:
         ) or importlib.import_module("strategies.RSIBollingerStrategyV2")
 
         base_data = {
-            "epic": "IX.D.NASDAQ.IFMM.IP",
+            "epic": "IX.D.SPTRD.IFMM.IP",
             "api_mode": "streaming",
             "operation_mode": "candle",
             "candle_frequency": "5min",
@@ -2086,7 +2086,7 @@ class TestValidateParamsBranches:
         ) or importlib.import_module("strategies.RSIBollingerStrategyV2")
 
         base_data = {
-            "epic": "IX.D.NASDAQ.IFMM.IP",
+            "epic": "IX.D.SPTRD.IFMM.IP",
             "api_mode": "streaming",
             "operation_mode": "candle",
             "candle_frequency": "5min",
@@ -3143,7 +3143,7 @@ _CANONICAL_POSITIONS = [
         "size": 1.0,
         "createdDate": "2026-05-29T10:00:00",
         "direction": "BUY",
-        "epic": "IX.D.NASDAQ.IFMM.IP",
+        "epic": "IX.D.SPTRD.IFMM.IP",
     },
     {
         "dealReference": "REF2",
@@ -3152,7 +3152,7 @@ _CANONICAL_POSITIONS = [
         "size": 1.0,
         "createdDate": "2026-05-29T11:00:00",
         "direction": "SELL",
-        "epic": "IX.D.NASDAQ.IFMM.IP",
+        "epic": "IX.D.SPTRD.IFMM.IP",
     },
     {
         "dealReference": "REF3",
@@ -3161,7 +3161,7 @@ _CANONICAL_POSITIONS = [
         "size": 0.5,
         "createdDate": "2026-05-29T12:00:00",
         "direction": "BUY",
-        "epic": "IX.D.SPTRD.IFMM.IP",
+        "epic": "IX.D.NASDAQ.IFMM.IP",
     },
 ]
 
@@ -3171,7 +3171,7 @@ class TestSeedPositionsFromBroker:
 
     # Epic used by _CANONICAL_POSITIONS — made explicit so the coupling to
     # the fixture default is visible and self-documenting.
-    _SEED_EPIC = "IX.D.NASDAQ.IFMM.IP"
+    _SEED_EPIC = "IX.D.SPTRD.IFMM.IP"
 
     def test_happy_path_mixed_buy_sell(self, make_strategy_v2, make_params_v2):
         """BUY and SELL for matching epic populate the correct grids; wrong epic is excluded.
@@ -3204,7 +3204,7 @@ class TestSeedPositionsFromBroker:
                 "size": 0.5,
                 "createdDate": "2026-05-29T12:00:00",
                 "direction": "BUY",
-                "epic": "IX.D.SPTRD.IFMM.IP",
+                "epic": "IX.D.NASDAQ.IFMM.IP",
             }
         ]
         mock_ig.get_open_positions.return_value = wrong_epic_only

@@ -24,7 +24,7 @@ from ig_streaming_client import (
 # Module-level constant
 # ---------------------------------------------------------------------------
 
-EPIC = "IX.D.NASDAQ.IFMM.IP"
+EPIC = "IX.D.SPTRD.IFMM.IP"
 
 
 # ---------------------------------------------------------------------------

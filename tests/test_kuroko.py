@@ -57,7 +57,7 @@ def _make_main_config() -> dict:
             "azure_log_partition_key": "test",
         },
         "trading": {
-            "epic": "IX.D.NASDAQ.IFMM.IP",
+            "epic": "IX.D.SPTRD.IFMM.IP",
             "leverage": 20,
             "demo_starting_balance": 20000.0,
             "initial_cash_balance": 4000.0,
@@ -207,7 +207,7 @@ class TestStreamingModeWiring:
         mock_ig = MagicMock()
         mock_ig.ig_service = MagicMock(name="fake_ig_service")
         mock_strategy_class = MagicMock()
-        trading_config = make_trading_config(epic="IX.D.NASDAQ.IFMM.IP")
+        trading_config = make_trading_config(epic="IX.D.SPTRD.IFMM.IP")
 
         with patch("kuroko.IGStreamingClient") as mock_streaming_cls:
             _wire_strategy(
@@ -218,7 +218,7 @@ class TestStreamingModeWiring:
             )
 
         mock_streaming_cls.assert_called_once_with(
-            mock_ig.ig_service, "IX.D.NASDAQ.IFMM.IP", resolution="5MINUTE"
+            mock_ig.ig_service, "IX.D.SPTRD.IFMM.IP", resolution="5MINUTE"
         )
 
     def test_streaming_mode_passes_streaming_client_to_strategy(

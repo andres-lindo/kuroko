@@ -191,7 +191,7 @@ def open_position(self, epic: str, size: float, side: str) -> dict:
     """Opens a new market position via the IG API.
 
     Args:
-        epic: Instrument identifier (e.g. 'IX.D.NASDAQ.IFMM.IP').
+        epic: Instrument identifier (e.g. 'IX.D.SPTRD.IFMM.IP').
         size: Position size in contracts.
         side: Trade direction, either 'BUY' or 'SELL'.
 

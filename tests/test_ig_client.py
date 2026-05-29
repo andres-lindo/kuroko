@@ -506,7 +506,7 @@ class TestGetOpenPositions:
                     "size": 0.13,
                     "createdDate": "2026-05-28T10:00:00",
                     "direction": "BUY",
-                    "epic": "IX.D.NASDAQ.IFMM.IP",
+                    "epic": "IX.D.SPTRD.IFMM.IP",
                 }
             ]
         )
@@ -517,7 +517,7 @@ class TestGetOpenPositions:
         assert len(result) == 1
         assert result[0]["dealId"] == "DEAL1"
         assert result[0]["direction"] == "BUY"
-        assert result[0]["epic"] == "IX.D.NASDAQ.IFMM.IP"
+        assert result[0]["epic"] == "IX.D.SPTRD.IFMM.IP"
 
     def test_returns_empty_list_when_no_positions(self, tmp_path):
         client, mock_svc = _make_client(tmp_path)

@@ -35,7 +35,7 @@ def make_params_v1():
         """
         defaults = {
             "api_mode": "rest",
-            "epic": "IX.D.NASDAQ.IFMM.IP",
+            "epic": "IX.D.SPTRD.IFMM.IP",
             "candle_frequency": "15min",
             "lookback": 300,
             "max_positions": 5,
@@ -84,11 +84,11 @@ def make_params_v2():
             SimpleNamespace populated with all 12 V2 signal/risk keys.
         """
         defaults = {
-            "epic": "IX.D.NASDAQ.IFMM.IP",
+            "epic": "IX.D.SPTRD.IFMM.IP",
             "api_mode": "streaming",
             "candle_frequency": "5min",
             "bb_period": 20,
-            "bb_std": 2.0,
+            "bb_std": 1.5,
             "rsi_period": 14,
             "rsi_oversold": 30,
             "rsi_overbought": 70,
@@ -129,7 +129,7 @@ def make_trading_config():
             SimpleNamespace with epic, leverage, and balance fields.
         """
         defaults = {
-            "epic": "IX.D.NASDAQ.IFMM.IP",
+            "epic": "IX.D.SPTRD.IFMM.IP",
             "spread": 1.0,
             "leverage": 20,
             "demo_starting_balance": 20000.0,

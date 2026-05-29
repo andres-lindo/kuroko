@@ -173,7 +173,7 @@ class TestGetCandles:
 
         strategy.get_candles()
 
-        mock_ig.get_candles.assert_called_once_with("IX.D.NASDAQ.IFMM.IP", "15min", 100)
+        mock_ig.get_candles.assert_called_once_with("IX.D.SPTRD.IFMM.IP", "15min", 100)
 
 
 # --------------------------------------------------------------------------- #
@@ -594,7 +594,7 @@ class TestCloseAllPositions:
 # =========================================================================== #
 
 _VALID_V1_PARAMS: dict = {
-    "epic": "IX.D.NASDAQ.IFMM.IP",
+    "epic": "IX.D.SPTRD.IFMM.IP",
     "candle_frequency": "15min",
     "lookback": 300,
     "max_positions": 5,
@@ -696,7 +696,7 @@ class TestV1StrategyInit:
         self, make_params_v1, make_trading_config
     ):
         """Self.epic comes from params; leverage and balance fields come from trading_config."""
-        params = make_params_v1(epic="IX.D.NASDAQ.IFMM.IP")
+        params = make_params_v1(epic="IX.D.SPTRD.IFMM.IP")
         ig_mock = MagicMock()
         trading_config = make_trading_config(
             leverage=20,
@@ -709,7 +709,7 @@ class TestV1StrategyInit:
             params=params, ig_client=ig_mock, trading_config=trading_config
         )
 
-        assert strat.epic == "IX.D.NASDAQ.IFMM.IP"
+        assert strat.epic == "IX.D.SPTRD.IFMM.IP"
         assert strat.leverage == 20
         assert strat.demo_starting_balance == 20000.0
         assert strat.initial_cash_balance == 4000.0

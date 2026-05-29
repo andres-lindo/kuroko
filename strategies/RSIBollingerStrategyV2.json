@@ -2,11 +2,11 @@
   "epic": "IX.D.SPTRD.IFMM.IP",
 
   "api_mode": "streaming",
-  "candle_frequency": "1min",
+  "candle_frequency": "5min",
   "operation_mode": "tick",
 
   "bb_period": 20,
-  "bb_std": 2.0,
+  "bb_std": 1.5,
   "rsi_period": 7,
   "rsi_oversold": 30.0,
   "rsi_overbought": 70.0,

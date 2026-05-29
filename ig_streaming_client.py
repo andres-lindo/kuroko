@@ -357,7 +357,7 @@ def _make_native_subscription(
     object returned from mock_stream_svc.subscribe.call_args.
 
     Args:
-        epic: Instrument identifier (e.g. 'IX.D.NASDAQ.IFMM.IP').
+        epic: Instrument identifier (e.g. 'IX.D.SPTRD.IFMM.IP').
         resolution: Candle resolution string (e.g. '5MINUTE').
         listener: Update handler to attach to the subscription.
 
@@ -551,7 +551,7 @@ class IGStreamingClient:
     Usage::
 
         resolution = candle_frequency_to_resolution("5min")  # -> "5MINUTE"
-        client = IGStreamingClient(ig.ig_service, epic="IX.D.NASDAQ.IFMM.IP",
+        client = IGStreamingClient(ig.ig_service, epic="IX.D.SPTRD.IFMM.IP",
                                    resolution=resolution)
         client.start(on_candle=my_callback)
         # ... strategy runs ...
@@ -575,7 +575,7 @@ class IGStreamingClient:
 
         Args:
             ig_service: Authenticated IGService instance from IGClient.ig_service.
-            epic: Instrument identifier (e.g. 'IX.D.NASDAQ.IFMM.IP').
+            epic: Instrument identifier (e.g. 'IX.D.SPTRD.IFMM.IP').
             resolution: Candle resolution for the native subscription (default '5MINUTE').
         """
         self._ig_service = ig_service

@@ -202,7 +202,7 @@ class IGClient:
         and merge them into the cache, so the API is queried minimally.
 
         Args:
-            epic: Instrument identifier (e.g. 'IX.D.NASDAQ.IFMM.IP').
+            epic: Instrument identifier (e.g. 'IX.D.SPTRD.IFMM.IP').
             res: Candle resolution string (e.g. '15min').
             num_points: Number of candles to return.
 
@@ -372,7 +372,7 @@ class IGClient:
         """Open a new market-order position.
 
         Args:
-            epic: Instrument identifier (e.g. 'IX.D.NASDAQ.IFMM.IP').
+            epic: Instrument identifier (e.g. 'IX.D.SPTRD.IFMM.IP').
             size: Number of contracts to trade.
             side: Trade direction, either 'BUY' or 'SELL'.
             currency: Currency code for the deal (default 'USD').
