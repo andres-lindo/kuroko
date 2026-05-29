@@ -777,9 +777,7 @@ class RSIBollingerStrategyV2:
                 )
                 return
 
-        if self._needs_reconciliation():
-            logger.debug("Reconciliation flag detected before processing candle.")
-            self._reconcile_positions()
+        self._reconcile_positions()
 
         self._update_spread_from_candle(candle)
         indicators = self._compute_indicators(candle)

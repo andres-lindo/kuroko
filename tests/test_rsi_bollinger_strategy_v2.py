@@ -889,13 +889,16 @@ class TestPhantomPositionReconciliation:
             f"but positions at call time were: {positions_at_manage_longs_call}"
         )
 
-    def test_reconcile_not_called_when_no_flagged_positions(self, make_strategy_v2):
-        """_reconcile_positions must NOT be called if no positions need reconciliation."""
+    def test_reconcile_runs_every_candle_and_preserves_live_positions(
+        self, make_strategy_v2
+    ):
+        """_reconcile_positions runs on every candle; positions still at broker are kept."""
         strat, mock_ig, _ = make_strategy_v2()
         strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 0.5}]
-        # No needs_reconciliation flag
+        mock_ig.get_open_positions.return_value = [
+            {"dealId": "DEAL1", "epic": strat.epic}
+        ]
 
-        # Enough history for indicators
         for _ in range(25):
             strat._candle_window.append(100.0)
         candle = _make_candle(close=100.0)
@@ -906,7 +909,8 @@ class TestPhantomPositionReconciliation:
             patch.object(strat, "log_account_status"),
         ):
             strat._on_candle(candle)
-            mock_ig.get_open_positions.assert_not_called()
+            mock_ig.get_open_positions.assert_called_once()
+            assert any(p["deal_id"] == "DEAL1" for p in strat._long_positions)
 
 
 # --------------------------------------------------------------------------- #
