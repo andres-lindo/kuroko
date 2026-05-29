@@ -351,7 +351,7 @@ class RSIBollingerStrategyV2:
         )
         try:
             df = self.ig.get_candles(
-                self.epic, self.params.candle_frequency, num_candles
+                self.epic, self.params.candle_frequency, num_candles, price_type="mid"
             )
 
             if df is None:

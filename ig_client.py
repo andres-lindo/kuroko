@@ -193,7 +193,13 @@ class IGClient:
             )
             return df
 
-    def get_candles(self, epic: str, res: str, num_points: int = 200) -> pd.DataFrame:
+    def get_candles(
+        self,
+        epic: str,
+        res: str,
+        num_points: int = 200,
+        price_type: str = "bid",
+    ) -> pd.DataFrame:
         """Return OHLC candles for the given epic, using cached data when possible.
 
         On the first call for an epic/resolution pair, fetches num_points + 1
@@ -205,6 +211,9 @@ class IGClient:
             epic: Instrument identifier (e.g. 'IX.D.SPTRD.IFMM.IP').
             res: Candle resolution string (e.g. '15min').
             num_points: Number of candles to return.
+            price_type: Which IG price series to use — 'bid', 'ask', or 'mid'.
+                Defaults to 'bid'. Use 'mid' to align indicator values with
+                broker charts that display mid prices.
 
         Returns:
             DataFrame with columns Open/High/Low/Close and a datetime index,
@@ -212,7 +221,7 @@ class IGClient:
             load fails after all retries — callers must handle None explicitly
             and treat it as "no data available for this tick."
         """
-        cache_key = f"{epic}_{res}"
+        cache_key = f"{epic}_{res}_{price_type}"
 
         # Try to warm the cache from disk on first access
         if cache_key not in self.candles_cache:
@@ -236,7 +245,12 @@ class IGClient:
                     res,
                     num_points + 1,  # one extra to guard against an incomplete bar
                 )
-                df = resp["prices"]["bid"]
+                prices = resp["prices"]
+                df = (
+                    (prices["bid"] + prices["ask"]) / 2
+                    if price_type == "mid"
+                    else prices[price_type]
+                )
 
                 # Drop the current (incomplete) candle if present
                 df = self._remove_incomplete_candle(df, res)
@@ -263,7 +277,12 @@ class IGClient:
             resp = self._safe_api_call(
                 self._svc.fetch_historical_prices_by_epic_and_num_points, epic, res, 3
             )
-            new_df = resp["prices"]["bid"]
+            prices = resp["prices"]
+            new_df = (
+                (prices["bid"] + prices["ask"]) / 2
+                if price_type == "mid"
+                else prices[price_type]
+            )
 
             # Drop the incomplete candle from the freshly fetched slice
             new_df = self._remove_incomplete_candle(new_df, res)

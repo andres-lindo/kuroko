@@ -352,14 +352,14 @@ class TestGetCandles:
 
         client.get_candles("EPIC.TEST", "15min", num_points=5)
 
-        parquet_file = tmp_path / "EPIC.TEST_15min.parquet"
+        parquet_file = tmp_path / "EPIC.TEST_15min_bid.parquet"
         assert parquet_file.exists()
 
     def test_cache_hit_skips_api_call(self, tmp_path):
         client, mock_svc = _make_client(tmp_path)
         df = _make_ohlc_df(n=5)
         # Pre-populate the in-memory cache
-        client.candles_cache["EPIC.TEST_15min"] = df
+        client.candles_cache["EPIC.TEST_15min_bid"] = df
 
         result = client.get_candles("EPIC.TEST", "15min", num_points=5)
 
@@ -382,7 +382,7 @@ class TestGetCandles:
         client, mock_svc = _make_client(tmp_path)
         df = _make_ohlc_df(n=5)
         # Write parquet directly to simulate a previous run
-        df.to_parquet(tmp_path / "EPIC.DISK_15min.parquet")
+        df.to_parquet(tmp_path / "EPIC.DISK_15min_bid.parquet")
 
         # Incremental fetch returns the same df (to satisfy the update merge)
         mock_svc.fetch_historical_prices_by_epic_and_num_points.return_value = (
@@ -393,7 +393,7 @@ class TestGetCandles:
 
         assert result is not None
         # Cache should now be populated from disk
-        assert "EPIC.DISK_15min" in client.candles_cache
+        assert "EPIC.DISK_15min_bid" in client.candles_cache
 
     def test_initial_load_failure_returns_none(self, tmp_path):
         client, mock_svc = _make_client(tmp_path)
@@ -409,7 +409,7 @@ class TestGetCandles:
     def test_incremental_update_merges_new_candles(self, tmp_path):
         client, mock_svc = _make_client(tmp_path)
         base_df = _make_ohlc_df(n=5)
-        client.candles_cache["EPIC.MERGE_15min"] = base_df
+        client.candles_cache["EPIC.MERGE_15min_bid"] = base_df
 
         # The incremental fetch returns one new candle beyond the current cache
         now = datetime.now().replace(second=0, microsecond=0)
@@ -428,6 +428,19 @@ class TestGetCandles:
         result = client.get_candles("EPIC.MERGE", "15min", num_points=5)
 
         assert result is not None
+
+    def test_price_type_mid_uses_mid_prices_and_separate_cache(self, tmp_path):
+        client, mock_svc = _make_client(tmp_path)
+        mid_df = _make_ohlc_df(n=5)
+        mock_svc.fetch_historical_prices_by_epic_and_num_points.return_value = {
+            "prices": {"bid": mid_df, "ask": mid_df}
+        }
+
+        result = client.get_candles("EPIC.MID", "5min", num_points=5, price_type="mid")
+
+        assert result is not None
+        assert "EPIC.MID_5min_mid" in client.candles_cache
+        assert (tmp_path / "EPIC.MID_5min_mid.parquet").exists()
 
 
 # --------------------------------------------------------------------------- #
