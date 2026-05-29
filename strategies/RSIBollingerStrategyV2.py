@@ -47,7 +47,7 @@ _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
 }
 
 
-def _validate_params(data: dict, path: str) -> None:
+def _validate_params(data: dict, path: str, *, fatal: bool = True) -> None:
     """Validate that all required V2 keys are present and correctly typed.
 
     Collects every missing key and every type mismatch before logging them
@@ -56,9 +56,12 @@ def _validate_params(data: dict, path: str) -> None:
     Args:
         data: Parsed JSON dict to validate.
         path: File path used in error messages.
+        fatal: When True (default), logs at CRITICAL and calls sys.exit(1).
+            When False, logs at ERROR and raises ValueError instead.
 
     Raises:
-        SystemExit: If any key is missing or has the wrong type.
+        SystemExit: If fatal is True and any key is missing or has the wrong type.
+        ValueError: If fatal is False and any key is missing or has the wrong type.
     """
     errors: list[str] = []
 
@@ -97,11 +100,16 @@ def _validate_params(data: dict, path: str) -> None:
             )
 
     if errors:
-        logger.critical(
+        msg = (
             f"Parameter validation failed for {path} — {len(errors)} error(s):\n"
             + "\n".join(errors)
         )
-        sys.exit(1)
+        if fatal:
+            logger.critical(msg)
+            sys.exit(1)
+        else:
+            logger.error(msg)
+            raise ValueError(msg)
 
 
 def load_params(
@@ -158,7 +166,41 @@ class RSIBollingerStrategyV2:
         trading_config: SimpleNamespace with infrastructure params (epic).
     """
 
-    def __init__(self, params, ig_client, streaming_client, trading_config):
+    # Parameters that can be applied live without restarting the bot.
+    _HOT_SAFE_PARAMS: frozenset = frozenset(
+        {
+            "rsi_oversold",
+            "rsi_overbought",
+            "max_long_positions",
+            "max_short_positions",
+            "min_dist_between_entries_ticks",
+            "take_profit_ticks",
+            "contract_size",
+            "bb_std",
+        }
+    )
+
+    # Parameters that require a full restart to take effect.
+    _RESTART_REQUIRED_PARAMS: frozenset = frozenset(
+        {
+            "bb_period",
+            "rsi_period",
+            "epic",
+            "candle_frequency",
+            "api_mode",
+            "operation_mode",
+        }
+    )
+
+    def __init__(
+        self,
+        params,
+        ig_client,
+        streaming_client,
+        trading_config,
+        *,
+        params_path: str | None = None,
+    ):
         """Initialise strategy state.
 
         Args:
@@ -170,6 +212,10 @@ class RSIBollingerStrategyV2:
             streaming_client: IGStreamingClient instance for candle delivery.
             trading_config: SimpleNamespace with infrastructure params sourced from
                 config.json["trading"].
+            params_path: Optional path to the strategy JSON file. When provided,
+                the strategy checks the file's mtime at each candle and hot-applies
+                safe parameter changes without restarting. When None (default),
+                hot-reload is disabled.
         """
         self.params = params
         self.ig = ig_client
@@ -220,6 +266,13 @@ class RSIBollingerStrategyV2:
         # Each entry: {"deal_id": str, "entry_price": float, "size": float}
         self._long_positions: list[dict] = []
         self._short_positions: list[dict] = []
+
+        # Hot-reload: path to the strategy JSON and its last observed mtime.
+        # When _params_path is None, hot-reload is disabled.
+        self._params_path: str | None = params_path
+        self._params_mtime: float = (
+            os.path.getmtime(params_path) if params_path else 0.0
+        )
 
         # Stop event — set by stop() to signal run() to exit
         self._stop_event: threading.Event = threading.Event()
@@ -751,6 +804,102 @@ class RSIBollingerStrategyV2:
         )
 
     # ---------------------------------------------------------------------- #
+    # Hot-reload                                                               #
+    # ---------------------------------------------------------------------- #
+
+    def _load_params_safe(self, path: str) -> types.SimpleNamespace | None:
+        """Load and validate strategy params without exiting on failure.
+
+        Wraps the module-level ``_validate_params`` call and catches all
+        expected failure modes (bad JSON, missing file, validation errors).
+
+        Args:
+            path: Absolute path to the strategy JSON file.
+
+        Returns:
+            SimpleNamespace with all param attributes on success, None on any
+            error. Logs an ERROR message before returning None.
+        """
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError, OSError) as exc:
+            logger.error(
+                f"[HOT-RELOAD] Failed to reload params — keeping current: {exc}"
+            )
+            return None
+
+        try:
+            _validate_params(data, path, fatal=False)
+        except ValueError as exc:
+            logger.error(
+                f"[HOT-RELOAD] Failed to reload params — keeping current: {exc}"
+            )
+            return None
+
+        return types.SimpleNamespace(**data)
+
+    def _reload_params_if_changed(self) -> None:
+        """Check params file mtime and hot-apply safe param changes.
+
+        Called as the first logic in ``_on_candle`` after the malformed-candle
+        guard. No-ops immediately when ``_params_path`` is None (reload disabled)
+        or when the file mtime has not changed since the last successful reload.
+
+        Hot-safe params are applied via individual ``setattr`` on ``self.params``.
+        Restart-required params are discarded with a WARNING log. On bad JSON or
+        validation failure, ``self.params`` is unchanged.
+        """
+        if self._params_path is None:
+            return
+
+        try:
+            current_mtime = os.path.getmtime(self._params_path)
+        except OSError:
+            return  # file temporarily unavailable — skip silently
+
+        if current_mtime == self._params_mtime:
+            return
+
+        logger.info("[HOT-RELOAD] Strategy params file changed — reloading")
+
+        new_params = self._load_params_safe(self._params_path)
+        if new_params is None:
+            # mtime already changed; don't update _params_mtime so next candle retries
+            return
+
+        applied = 0
+        discarded = 0
+
+        for key in self._HOT_SAFE_PARAMS:
+            old_val = getattr(self.params, key, None)
+            new_val = getattr(new_params, key, None)
+            if old_val != new_val:
+                logger.info("[HOT-RELOAD] %s: %s → %s", key, old_val, new_val)
+                setattr(self.params, key, new_val)
+                applied += 1
+
+        for key in self._RESTART_REQUIRED_PARAMS:
+            old_val = getattr(self.params, key, None)
+            new_val = getattr(new_params, key, None)
+            if old_val != new_val:
+                logger.warning(
+                    "[HOT-RELOAD] %s changed but requires restart — keeping %s",
+                    key,
+                    old_val,
+                )
+                discarded += 1
+
+        if applied > 0 or discarded > 0:
+            logger.info(
+                "[HOT-RELOAD] Applied %d param(s), discarded %d (restart required)",
+                applied,
+                discarded,
+            )
+
+        self._params_mtime = current_mtime
+
+    # ---------------------------------------------------------------------- #
     # Candle handler                                                           #
     # ---------------------------------------------------------------------- #
 
@@ -795,6 +944,8 @@ class RSIBollingerStrategyV2:
                     f"Skipping duplicate candle (warmup overlap): ts={candle['timestamp']}"
                 )
                 return
+
+        self._reload_params_if_changed()
 
         self._reconcile_positions()
 

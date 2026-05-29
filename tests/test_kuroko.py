@@ -243,6 +243,7 @@ class TestStreamingModeWiring:
             ig_client=mock_ig,
             streaming_client=mock_streaming_instance,
             trading_config=trading_config,
+            params_path=None,
         )
 
     def test_streaming_mode_returns_strategy_instance(

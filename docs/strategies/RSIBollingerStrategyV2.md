@@ -498,6 +498,58 @@ its `finally` block, which disconnects the Lightstreamer session cleanly.
 
 ---
 
+## Hot-Reload Config
+
+The strategy can apply changes to `strategies/RSIBollingerStrategyV2.json` at runtime — without restarting the bot. The file is checked on every candle close via `os.path.getmtime`. When the mtime changes, the file is re-parsed and validated; safe params are applied immediately to `self.params`.
+
+### How to trigger a reload
+
+1. Edit `strategies/RSIBollingerStrategyV2.json` and save.
+2. The change takes effect on the next closed candle (within 5 minutes with default frequency).
+3. Check the logs for `[HOT-RELOAD]` lines confirming what was applied.
+
+### Hot-safe parameters (apply without restart)
+
+| Parameter | Description |
+|-----------|-------------|
+| `rsi_oversold` | RSI threshold for long entry |
+| `rsi_overbought` | RSI threshold for short entry |
+| `max_long_positions` | Maximum simultaneous long positions |
+| `max_short_positions` | Maximum simultaneous short positions |
+| `min_dist_between_entries_ticks` | Minimum price distance between grid entries |
+| `take_profit_ticks` | Broker take-profit distance (also per-position exit threshold) |
+| `contract_size` | Position size for new entries |
+| `bb_std` | Bollinger Band standard deviation multiplier |
+
+### Restart-required parameters (change is logged but NOT applied)
+
+| Parameter | Reason |
+|-----------|--------|
+| `bb_period` | Changes the indicator calculation window — existing candle buffer would produce inconsistent results |
+| `rsi_period` | Same reason as `bb_period` |
+| `epic` | The streaming subscription is bound to the epic at startup |
+| `candle_frequency` | The streaming resolution is set when `IGStreamingClient` is created |
+| `api_mode` | Determines which execution path is used; wired at startup |
+| `operation_mode` | Determines whether `_on_candle` routes to tick or candle mode; wired at init |
+
+When a restart-required param changes, a `WARNING` is logged and the current value is kept.
+
+### Log messages
+
+| Level | Format |
+|-------|--------|
+| INFO | `[HOT-RELOAD] Strategy params file changed — reloading` |
+| INFO | `[HOT-RELOAD] <param>: <old> → <new>` |
+| WARNING | `[HOT-RELOAD] <param> changed but requires restart — keeping <old>` |
+| INFO | `[HOT-RELOAD] Applied <N> param(s), discarded <M> (restart required)` |
+| ERROR | `[HOT-RELOAD] Failed to reload params — keeping current: <exc>` |
+
+### Disabling hot-reload
+
+Hot-reload is enabled by default in `kuroko.py` (via `params_path=strategy_path`). To disable it, pass `params_path=None` when constructing the strategy. Existing tests that do not pass `params_path` are unaffected — reload is silently disabled.
+
+---
+
 ## Differences from V1
 
 | Feature | RSIBollingerStrategy (V1) | RSIBollingerStrategyV2 |

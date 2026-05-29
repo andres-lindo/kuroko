@@ -2187,6 +2187,340 @@ class TestValidateParamsBranches:
             with pytest.raises(SystemExit):
                 mod.load_params(str(path))
 
+
+# =========================================================================== #
+# Hot-reload config (hot-reload-config change)                                 #
+# =========================================================================== #
+
+# Minimal valid V2 JSON data used across hot-reload tests
+_HOT_RELOAD_BASE_PARAMS = {
+    "epic": "IX.D.SPTRD.IFMM.IP",
+    "api_mode": "streaming",
+    "operation_mode": "candle",
+    "candle_frequency": "5min",
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "rsi_period": 14,
+    "rsi_oversold": 30,
+    "rsi_overbought": 70,
+    "max_long_positions": 3,
+    "max_short_positions": 3,
+    "contract_size": 1.0,
+    "min_dist_between_entries_ticks": 10.0,
+    "take_profit_ticks": 50.0,
+}
+
+
+def _write_params_json(path, overrides=None):
+    """Write a valid V2 params JSON file, optionally overriding fields."""
+    data = dict(_HOT_RELOAD_BASE_PARAMS)
+    if overrides:
+        data.update(overrides)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+class TestLoadParamsSafe:
+    """_load_params_safe returns None on failure, SimpleNamespace on success (REQ-2)."""
+
+    def test_load_params_safe_returns_none_on_bad_json(
+        self, make_strategy_v2, tmp_path
+    ):
+        """_load_params_safe returns None when the file contains invalid JSON."""
+        strat, _, _ = make_strategy_v2()
+        bad_file = tmp_path / "bad.json"
+        bad_file.write_text("{invalid json", encoding="utf-8")
+
+        result = strat._load_params_safe(str(bad_file))
+
+        assert result is None
+
+    def test_load_params_safe_returns_none_on_missing_file(
+        self, make_strategy_v2, tmp_path
+    ):
+        """_load_params_safe returns None when the file does not exist."""
+        strat, _, _ = make_strategy_v2()
+        missing = str(tmp_path / "nonexistent.json")
+
+        result = strat._load_params_safe(missing)
+
+        assert result is None
+
+    def test_load_params_safe_returns_namespace_on_valid_json(
+        self, make_strategy_v2, tmp_path
+    ):
+        """_load_params_safe returns a SimpleNamespace when the file is valid."""
+        strat, _, _ = make_strategy_v2()
+        valid_file = tmp_path / "valid.json"
+        _write_params_json(valid_file)
+
+        result = strat._load_params_safe(str(valid_file))
+
+        assert result is not None
+        assert isinstance(result, types.SimpleNamespace)
+        assert result.rsi_oversold == 30
+
+    def test_load_params_safe_returns_none_on_validation_failure(
+        self, make_strategy_v2, tmp_path
+    ):
+        """_load_params_safe returns None when the JSON fails schema validation."""
+        strat, _, _ = make_strategy_v2()
+        bad_schema_file = tmp_path / "bad_schema.json"
+        # Missing required 'epic' key
+        data = dict(_HOT_RELOAD_BASE_PARAMS)
+        del data["epic"]
+        bad_schema_file.write_text(json.dumps(data), encoding="utf-8")
+
+        result = strat._load_params_safe(str(bad_schema_file))
+
+        assert result is None
+
+    def test_load_params_safe_logs_error_on_failure(
+        self, make_strategy_v2, tmp_path, caplog
+    ):
+        """_load_params_safe logs an ERROR message when the file is unreadable/invalid."""
+        import logging
+
+        strat, _, _ = make_strategy_v2()
+        bad_file = tmp_path / "bad.json"
+        bad_file.write_text("{bad", encoding="utf-8")
+
+        with caplog.at_level(logging.ERROR):
+            strat._load_params_safe(str(bad_file))
+
+        assert any(
+            "[HOT-RELOAD]" in record.message and record.levelno == logging.ERROR
+            for record in caplog.records
+        )
+
+
+class TestReloadParamsIfChanged:
+    """_reload_params_if_changed applies hot-safe params and discards restart-required (REQ-1–6)."""
+
+    def test_reload_no_op_when_mtime_unchanged(self, make_strategy_v2, tmp_path):
+        """No reload logic runs when the file mtime equals _params_mtime (REQ-1)."""
+        strat, _, _ = make_strategy_v2()
+        params_file = tmp_path / "params.json"
+        _write_params_json(params_file)
+
+        # Wire the strategy with the file path and set mtime to the current file mtime
+        strat._params_path = str(params_file)
+        strat._params_mtime = os.path.getmtime(str(params_file))
+
+        original_oversold = strat.params.rsi_oversold
+
+        strat._reload_params_if_changed()
+
+        # No change — value must be identical
+        assert strat.params.rsi_oversold == original_oversold
+
+    def test_reload_applies_hot_safe_params(self, make_strategy_v2, tmp_path):
+        """Hot-safe params are applied to self.params when the file changes (REQ-3)."""
+        strat, _, _ = make_strategy_v2()
+        params_file = tmp_path / "params.json"
+        _write_params_json(params_file, overrides={"rsi_oversold": 25})
+
+        strat._params_path = str(params_file)
+        strat._params_mtime = 0.0  # Force reload: mtime will be > 0
+
+        strat._reload_params_if_changed()
+
+        assert strat.params.rsi_oversold == 25
+
+    def test_reload_discards_restart_required_with_warning(
+        self, make_strategy_v2, tmp_path, caplog
+    ):
+        """Restart-required params are NOT applied; a WARNING is logged (REQ-4)."""
+        import logging
+
+        strat, _, _ = make_strategy_v2()
+        original_bb_period = strat.params.bb_period
+        params_file = tmp_path / "params.json"
+        # Write a different bb_period (restart-required)
+        _write_params_json(params_file, overrides={"bb_period": original_bb_period + 5})
+
+        strat._params_path = str(params_file)
+        strat._params_mtime = 0.0
+
+        with caplog.at_level(logging.WARNING):
+            strat._reload_params_if_changed()
+
+        # bb_period must remain unchanged
+        assert strat.params.bb_period == original_bb_period
+        # A WARNING must have been logged about bb_period
+        assert any(
+            "bb_period" in record.message and record.levelno == logging.WARNING
+            for record in caplog.records
+        )
+
+    def test_reload_bad_json_keeps_current_params(self, make_strategy_v2, tmp_path):
+        """On bad JSON, self.params is unchanged and no param is modified (REQ-2)."""
+        strat, _, _ = make_strategy_v2()
+        bad_file = tmp_path / "bad.json"
+        bad_file.write_text("{invalid", encoding="utf-8")
+
+        strat._params_path = str(bad_file)
+        strat._params_mtime = 0.0  # Force reload attempt
+        original_oversold = strat.params.rsi_oversold
+
+        strat._reload_params_if_changed()
+
+        assert strat.params.rsi_oversold == original_oversold
+
+    def test_reload_logs_summary_line(self, make_strategy_v2, tmp_path, caplog):
+        """A summary INFO line is logged when at least one param changed (REQ-5)."""
+        import logging
+
+        strat, _, _ = make_strategy_v2()
+        params_file = tmp_path / "params.json"
+        _write_params_json(params_file, overrides={"rsi_oversold": 25})
+
+        strat._params_path = str(params_file)
+        strat._params_mtime = 0.0
+
+        with caplog.at_level(logging.INFO):
+            strat._reload_params_if_changed()
+
+        assert any(
+            "[HOT-RELOAD]" in record.message
+            and ("Applied" in record.message or "applied" in record.message)
+            and record.levelno == logging.INFO
+            for record in caplog.records
+        )
+
+    def test_reload_no_summary_when_nothing_changed(
+        self, make_strategy_v2, tmp_path, caplog
+    ):
+        """No summary line is emitted when zero params differ after reload (REQ-5)."""
+        import logging
+
+        strat, _, _ = make_strategy_v2()
+        params_file = tmp_path / "params.json"
+        # Write the exact same values as the strategy's current params
+        _write_params_json(params_file)
+        # Reset strat params to match the file exactly
+        strat.params.rsi_oversold = 30
+        strat.params.rsi_overbought = 70
+        strat.params.take_profit_ticks = 50.0
+        strat.params.max_long_positions = 3
+        strat.params.max_short_positions = 3
+        strat.params.min_dist_between_entries_ticks = 10.0
+        strat.params.contract_size = 1.0
+        strat.params.bb_std = 2.0
+        strat.params.bb_period = 20
+        strat.params.rsi_period = 14
+        strat.params.epic = "IX.D.SPTRD.IFMM.IP"
+        strat.params.candle_frequency = "5min"
+        strat.params.api_mode = "streaming"
+        strat.params.operation_mode = "candle"
+
+        strat._params_path = str(params_file)
+        strat._params_mtime = 0.0
+
+        with caplog.at_level(logging.INFO):
+            strat._reload_params_if_changed()
+
+        # No "[HOT-RELOAD] Applied" summary line should be emitted
+        assert not any(
+            "[HOT-RELOAD]" in record.message
+            and "Applied" in record.message
+            and record.levelno == logging.INFO
+            for record in caplog.records
+        )
+
+    def test_reload_updates_params_mtime_on_success(self, make_strategy_v2, tmp_path):
+        """_params_mtime is updated to the new file mtime on successful reload (REQ-1)."""
+        strat, _, _ = make_strategy_v2()
+        params_file = tmp_path / "params.json"
+        _write_params_json(params_file)
+
+        strat._params_path = str(params_file)
+        strat._params_mtime = 0.0
+
+        strat._reload_params_if_changed()
+
+        expected_mtime = os.path.getmtime(str(params_file))
+        assert strat._params_mtime == expected_mtime
+
+    def test_reload_skips_when_params_path_is_none(self, make_strategy_v2):
+        """No reload occurs when _params_path is None (reload disabled)."""
+        strat, _, _ = make_strategy_v2()
+        strat._params_path = None
+        original_oversold = strat.params.rsi_oversold
+
+        strat._reload_params_if_changed()
+
+        assert strat.params.rsi_oversold == original_oversold
+
+
+class TestOnCandleCallsReload:
+    """_on_candle calls _reload_params_if_changed before indicator logic (REQ-1)."""
+
+    def test_on_candle_calls_reload_before_indicator_logic(self, make_strategy_v2):
+        """_reload_params_if_changed is called on every valid candle in _on_candle."""
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_open_positions.return_value = []
+
+        call_order = []
+
+        def reload_spy():
+            call_order.append("reload")
+
+        def compute_spy(candle):
+            call_order.append("compute")
+            return None  # Return None to stop further processing
+
+        with (
+            patch.object(strat, "_reload_params_if_changed", side_effect=reload_spy),
+            patch.object(strat, "_compute_indicators", side_effect=compute_spy),
+        ):
+            candle = _make_candle(close=100.0)
+            strat._on_candle(candle)
+
+        assert "reload" in call_order, "_reload_params_if_changed was never called"
+        assert call_order.index("reload") < call_order.index(
+            "compute"
+        ), "_reload_params_if_changed must be called before _compute_indicators"
+
+
+class TestHotReloadRoundTrip:
+    """Integration: edit JSON → fire candle → verify new param active (REQ-1 to REQ-6)."""
+
+    def test_hot_reload_round_trip(self, make_strategy_v2, tmp_path):
+        """Full round-trip: write updated JSON, call _on_candle, assert new hot-safe param active."""
+        strat, mock_ig, _ = make_strategy_v2()
+        mock_ig.get_open_positions.return_value = []
+
+        # Write params file with initial rsi_oversold=30
+        params_file = tmp_path / "params.json"
+        _write_params_json(params_file, overrides={"rsi_oversold": 30})
+
+        strat._params_path = str(params_file)
+        strat._params_mtime = os.path.getmtime(str(params_file))
+        strat.params.rsi_oversold = 30  # ensure starting state
+
+        # Now modify the file to change rsi_oversold to 25
+        _write_params_json(params_file, overrides={"rsi_oversold": 25})
+        # Touch the file to ensure mtime changes (some filesystems have 1-second resolution)
+        import time
+
+        time.sleep(0.01)
+        params_file.touch()
+
+        # Pre-fill candle window so indicators can be computed
+        for _ in range(25):
+            strat._candle_window.append(100.0)
+        candle = _make_candle(close=100.0)
+
+        with (
+            patch.object(strat, "_manage_longs"),
+            patch.object(strat, "_manage_shorts"),
+            patch.object(strat, "log_account_status"),
+        ):
+            strat._on_candle(candle)
+
+        # rsi_oversold must be updated to 25 after _on_candle
+        assert strat.params.rsi_oversold == 25
+
     def test_valid_bool_value_for_bool_schema_key_is_accepted(self, tmp_path):
         """Bool branch (lines 68-72): a valid bool value for a bool-typed schema key passes validation."""
         import sys

@@ -75,6 +75,7 @@ def _wire_strategy(
     ig,
     trading_config,
     return_streaming: bool = False,
+    params_path: str | None = None,
 ):
     """Instantiate the strategy with the appropriate clients for its api_mode.
 
@@ -91,6 +92,8 @@ def _wire_strategy(
             ``config.json["trading"]``.
         return_streaming: When True, return a ``(strategy, streaming_client)``
             tuple instead of only the strategy.  Useful for shutdown wiring.
+        params_path: Optional path to the strategy JSON file passed through to
+            the strategy constructor to enable hot-reload on candle close.
 
     Returns:
         The instantiated strategy, or ``(strategy, streaming_client)`` when
@@ -130,6 +133,7 @@ def _wire_strategy(
             ig_client=ig,
             streaming_client=streaming_client,
             trading_config=trading_config,
+            params_path=params_path,
         )
         logger.info("Streaming mode: IGStreamingClient wired to strategy.")
     else:
@@ -281,6 +285,7 @@ def main():
             ig=ig,
             trading_config=trading_config,
             return_streaming=True,
+            params_path=strategy_path,
         )
     except ConfigurationError as e:
         logger.critical(f"Configuration error: {e}")
