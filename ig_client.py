@@ -81,7 +81,11 @@ class IGClient:
 
         Retries up to max_retries times on connection or IG API errors.
         If the error message indicates an expired token, the session is
-        refreshed before retrying. Waits use exponential backoff (1, 2, 4 s).
+        refreshed before retrying. If the refresh itself returns a token error
+        (session completely dead, e.g. after a weekend), a full re-login with
+        credentials is attempted. If re-login also fails, the call raises
+        immediately without further retries. Waits use exponential backoff
+        (1, 2, 4 s) for non-auth errors.
 
         Args:
             func: Callable from self._svc to invoke.
@@ -123,6 +127,28 @@ class IGClient:
                             continue  # Retry with the new session
                         except Exception as refresh_error:
                             log.error(f"Error refreshing session: {refresh_error}")
+                            # Refresh itself returned a token error — the session is
+                            # completely dead (e.g. after a weekend). Attempt a full
+                            # re-login with credentials before giving up.
+                            if "token" in str(refresh_error).lower():
+                                log.warning(
+                                    "Token refresh failed with auth error. "
+                                    "Clearing stale session headers and attempting "
+                                    "full re-login..."
+                                )
+                                # trading_ig persists CST and X-SECURITY-TOKEN on
+                                # the requests.Session. IG validates these even on
+                                # POST /session, so they must be cleared before a
+                                # fresh login can succeed.
+                                for header in ("CST", "X-SECURITY-TOKEN"):
+                                    self._svc.session.headers.pop(header, None)
+                                try:
+                                    self._svc.create_session()
+                                    log.info("Full re-login succeeded.")
+                                    continue  # Retry the original call
+                                except Exception as relogin_error:
+                                    log.error(f"Full re-login failed: {relogin_error}")
+                                    raise  # Session unrecoverable — give up immediately
 
                 log.debug(
                     f"Connection error (attempt {attempt + 1}/{max_retries}): {e}"

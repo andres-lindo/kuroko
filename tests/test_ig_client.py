@@ -153,6 +153,91 @@ class TestSafeApiCall:
         # create_session was called once on init and once on token refresh
         assert mock_svc.create_session.call_count == 2
 
+    def test_full_relogin_triggered_when_token_refresh_returns_401(self, tmp_path):
+        """When token refresh itself returns 401, stale headers are cleared and
+        a full re-login is attempted.
+
+        Scenario: session is completely dead (e.g. after a weekend).
+        - func() raises token error on attempt 0 (dead session)
+        - create_session() (refresh) raises 401 — session still dead
+        - CST and X-SECURITY-TOKEN headers are cleared from the session
+        - create_session() (full re-login) succeeds — session restored
+        - func() succeeds on the next attempt after re-login
+
+        trading_ig persists CST/X-SECURITY-TOKEN on the requests.Session.
+        IG validates these even on POST /session, so they must be cleared
+        before a fresh login can succeed.
+        """
+        client, mock_svc = _make_client(tmp_path)
+        # Simulate stale auth headers on the session
+        mock_svc.session.headers = {
+            "CST": "stale-cst-token",
+            "X-SECURITY-TOKEN": "stale-security-token",
+            "Content-Type": "application/json",  # must survive
+        }
+        token_error = IGException(
+            'HTTP error: 401 {"errorCode":"error.security.client-token-invalid"}'
+        )
+        # refresh fails with 401; full re-login succeeds
+        mock_svc.create_session.side_effect = [
+            token_error,  # refresh attempt → fails with 401
+            {"accountType": "DEMO"},  # full re-login → succeeds
+        ]
+        # func fails once (dead session), then succeeds after re-login restores the session
+        func = MagicMock(side_effect=[token_error, {"ok": True}])
+
+        with patch("ig_client.sleep"):
+            result = client._safe_api_call(func, max_retries=3)
+
+        assert result == {"ok": True}
+        # create_session calls: 1 (init) + 1 (refresh attempt) + 1 (full re-login) = 3
+        assert mock_svc.create_session.call_count == 3
+        # Stale auth headers must be cleared before re-login
+        assert "CST" not in mock_svc.session.headers
+        assert "X-SECURITY-TOKEN" not in mock_svc.session.headers
+        # Unrelated headers must survive
+        assert mock_svc.session.headers["Content-Type"] == "application/json"
+
+    def test_gives_up_immediately_when_both_refresh_and_relogin_fail(self, tmp_path):
+        """When token refresh AND full re-login both fail, raise immediately.
+
+        The fixed code must not waste further retry iterations after a failed
+        re-login — if the session is unrecoverable, give up right away rather
+        than retrying func (which will fail again) and repeating the cycle.
+        """
+        client, mock_svc = _make_client(tmp_path)
+        token_error = IGException(
+            'HTTP error: 401 {"errorCode":"error.security.client-token-invalid"}'
+        )
+        # Both refresh and re-login always fail with token error
+        mock_svc.create_session.side_effect = token_error
+        func = MagicMock(side_effect=token_error)
+
+        with patch("ig_client.sleep"):
+            with pytest.raises(IGException):
+                client._safe_api_call(func, max_retries=3)
+
+        # func called once, then give up immediately (no further retries after failed re-login).
+        # create_session calls: 1 (init) + 1 (refresh) + 1 (re-login) = 3.
+        # The broken code calls create_session once per retry: 1 (init) + 3 (one refresh
+        # per retry attempt) = 4 total.
+        assert func.call_count == 1
+        assert mock_svc.create_session.call_count == 3
+
+    def test_relogin_not_triggered_when_token_refresh_succeeds(self, tmp_path):
+        """When token refresh succeeds, no additional create_session call is made."""
+        client, mock_svc = _make_client(tmp_path)
+        token_error = IGException("error: token expired")
+        mock_svc.create_session.return_value = {"accountType": "DEMO"}
+        func = MagicMock(side_effect=[token_error, {"ok": True}])
+
+        with patch("ig_client.sleep"):
+            result = client._safe_api_call(func, max_retries=3)
+
+        assert result == {"ok": True}
+        # Only one extra create_session call (the refresh) — no re-login needed
+        assert mock_svc.create_session.call_count == 2
+
     def test_json_decode_error_does_not_trigger_token_refresh(self, tmp_path):
         client, mock_svc = _make_client(tmp_path)
         init_call_count = mock_svc.create_session.call_count
