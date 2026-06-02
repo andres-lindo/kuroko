@@ -229,10 +229,16 @@ active short signal does not suppress long entry evaluation and vice versa.
 
 ## Exit Logic
 
+BB-cross exits are controlled by the `close_on_bb_cross` flag:
+
+- When `false` (default): the strategy skips BB-cross exits entirely and leaves positions to the broker TP. A `DEBUG` log is emitted when a crossing would have fired: `"BB cross exit skipped (close_on_bb_cross=False)"`.
+- When `true`: the strategy evaluates the conditions below and closes profitable positions.
+
 ### Long exit
 
-A long position is closed when BOTH of the following are true:
+A long position is closed when ALL of the following are true:
 
+- `close_on_bb_cross` is `true`
 - `close > bb_upper` — price has closed above the upper Bollinger Band
 - `(close - entry_price - spread) * size > 0` — the position is profitable
   after the bid/ask spread
@@ -248,8 +254,9 @@ premature exits when the spread was wide at entry.
 
 ### Short exit
 
-A short position is closed when BOTH of the following are true:
+A short position is closed when ALL of the following are true:
 
+- `close_on_bb_cross` is `true`
 - `close < bb_lower` — price has closed below the lower Bollinger Band
 - `(entry_price - close - spread) * size > 0` — the position is profitable
   after the bid/ask spread
@@ -433,6 +440,7 @@ loaded at startup into a `types.SimpleNamespace` via `load_params()`.
 | `contract_size` | float | `3.0` | Position size in contracts — uniform for every entry |
 | `min_dist_between_entries_ticks` | float | `10` | Minimum price distance between consecutive entries in the same grid (ticks) |
 | `take_profit_ticks` | float | `8` | Broker take-profit distance from entry price (ticks) |
+| `close_on_bb_cross` | bool | `false` | When `true`, the bot closes positions when the opposite Bollinger Band is crossed and `profit > 0` (long: `close > bb_upper`; short: `close < bb_lower`). When `false` (default), BB-cross exits are skipped and positions are left to the broker TP. Can be changed at runtime via hot-reload. |
 
 Infrastructure parameters (`leverage`, `initial_cash_balance`,
 `demo_starting_balance`) come from `config.json["trading"]`. `epic` is stored
@@ -471,7 +479,9 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
 
   "contract_size": 3.0,
   "min_dist_between_entries_ticks": 10,
-  "take_profit_ticks": 8
+  "take_profit_ticks": 8,
+
+  "close_on_bb_cross": false
 }
 ```
 
@@ -520,6 +530,7 @@ The strategy can apply changes to `strategies/RSIBollingerStrategyV2.json` at ru
 | `take_profit_ticks` | Broker take-profit distance (also per-position exit threshold) |
 | `contract_size` | Position size for new entries |
 | `bb_std` | Bollinger Band standard deviation multiplier |
+| `close_on_bb_cross` | Enable/disable BB-cross exits without restart |
 
 ### Restart-required parameters (change is logged but NOT applied)
 

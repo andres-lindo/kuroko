@@ -98,6 +98,7 @@ def make_params_v2():
             "min_dist_between_entries_ticks": 10,
             "take_profit_ticks": 50.0,
             "operation_mode": "candle",
+            "close_on_bb_cross": True,
         }
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)

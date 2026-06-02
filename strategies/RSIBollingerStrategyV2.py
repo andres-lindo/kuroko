@@ -44,6 +44,7 @@ _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
     "contract_size": float,
     "min_dist_between_entries_ticks": float,
     "take_profit_ticks": float,
+    "close_on_bb_cross": bool,
 }
 
 
@@ -177,6 +178,7 @@ class RSIBollingerStrategyV2:
             "take_profit_ticks",
             "contract_size",
             "bb_std",
+            "close_on_bb_cross",
         }
     )
 
@@ -503,45 +505,51 @@ class RSIBollingerStrategyV2:
             f"bb_upper={bb_upper:.2f} rsi={rsi:.2f} "
             f"spread={spread:.4f} open_longs={len(self._long_positions)}"
         )
-        if close > bb_upper and self._long_positions:
-            logger.debug(
-                f"Long exit condition met: close={close:.2f} > bb_upper={bb_upper:.2f} "
-                f"evaluating {len(self._long_positions)} position(s)"
-            )
-            to_close = []  # list of (pos, profit) tuples — profit computed once
-            to_keep = []
-            for pos in self._long_positions:
-                profit = _long_profit(close, pos["entry_price"], spread, pos["size"])
+        if not self.params.close_on_bb_cross:
+            if close > bb_upper and self._long_positions:
+                logger.debug("BB cross exit skipped (close_on_bb_cross=False)")
+        else:
+            if close > bb_upper and self._long_positions:
                 logger.debug(
-                    f"Long exit eval: deal_id={pos['deal_id']} "
-                    f"entry={pos['entry_price']:.2f} close={close:.2f} "
-                    f"spread={spread:.4f} size={pos['size']} profit={profit:.2f}"
+                    f"Long exit condition met: close={close:.2f} > bb_upper={bb_upper:.2f} "
+                    f"evaluating {len(self._long_positions)} position(s)"
                 )
-                if profit > 0:
-                    to_close.append((pos, profit))
-                else:
+                to_close = []  # list of (pos, profit) tuples — profit computed once
+                to_keep = []
+                for pos in self._long_positions:
+                    profit = _long_profit(
+                        close, pos["entry_price"], spread, pos["size"]
+                    )
                     logger.debug(
-                        f"Long {pos['deal_id']} not profitable after spread — keeping"
+                        f"Long exit eval: deal_id={pos['deal_id']} "
+                        f"entry={pos['entry_price']:.2f} close={close:.2f} "
+                        f"spread={spread:.4f} size={pos['size']} profit={profit:.2f}"
                     )
-                    to_keep.append(pos)
+                    if profit > 0:
+                        to_close.append((pos, profit))
+                    else:
+                        logger.debug(
+                            f"Long {pos['deal_id']} not profitable after spread — keeping"
+                        )
+                        to_keep.append(pos)
 
-            for pos, profit in to_close:
-                closed_ok = False
-                try:
-                    self.ig.close_position(pos["deal_id"], "SELL", pos["size"])
-                    closed_ok = True
-                except Exception as e:
-                    logger.error(f"Failed to close long {pos['deal_id']}: {e}")
-                    pos["needs_reconciliation"] = True
-                    to_keep.append(pos)
+                for pos, profit in to_close:
+                    closed_ok = False
+                    try:
+                        self.ig.close_position(pos["deal_id"], "SELL", pos["size"])
+                        closed_ok = True
+                    except Exception as e:
+                        logger.error(f"Failed to close long {pos['deal_id']}: {e}")
+                        pos["needs_reconciliation"] = True
+                        to_keep.append(pos)
 
-                if closed_ok:
-                    logger.info(
-                        f"Closed LONG {pos['deal_id']} @ {close:.2f} "
-                        f"(entry={pos['entry_price']:.2f}, profit={profit:.2f})"
-                    )
+                    if closed_ok:
+                        logger.info(
+                            f"Closed LONG {pos['deal_id']} @ {close:.2f} "
+                            f"(entry={pos['entry_price']:.2f}, profit={profit:.2f})"
+                        )
 
-            self._long_positions = to_keep
+                self._long_positions = to_keep
 
         # --- ENTRIES ---
         if not self._is_long_entry_allowed():
@@ -641,45 +649,51 @@ class RSIBollingerStrategyV2:
             f"bb_upper={bb_upper:.2f} rsi={rsi:.2f} "
             f"spread={spread:.4f} open_shorts={len(self._short_positions)}"
         )
-        if close < bb_lower and self._short_positions:
-            logger.debug(
-                f"Short exit condition met: close={close:.2f} < bb_lower={bb_lower:.2f} "
-                f"evaluating {len(self._short_positions)} position(s)"
-            )
-            to_close = []  # list of (pos, profit) tuples — profit computed once
-            to_keep = []
-            for pos in self._short_positions:
-                profit = _short_profit(close, pos["entry_price"], spread, pos["size"])
+        if not self.params.close_on_bb_cross:
+            if close < bb_lower and self._short_positions:
+                logger.debug("BB cross exit skipped (close_on_bb_cross=False)")
+        else:
+            if close < bb_lower and self._short_positions:
                 logger.debug(
-                    f"Short exit eval: deal_id={pos['deal_id']} "
-                    f"entry={pos['entry_price']:.2f} close={close:.2f} "
-                    f"spread={spread:.4f} size={pos['size']} profit={profit:.2f}"
+                    f"Short exit condition met: close={close:.2f} < bb_lower={bb_lower:.2f} "
+                    f"evaluating {len(self._short_positions)} position(s)"
                 )
-                if profit > 0:
-                    to_close.append((pos, profit))
-                else:
+                to_close = []  # list of (pos, profit) tuples — profit computed once
+                to_keep = []
+                for pos in self._short_positions:
+                    profit = _short_profit(
+                        close, pos["entry_price"], spread, pos["size"]
+                    )
                     logger.debug(
-                        f"Short {pos['deal_id']} not profitable after spread — keeping"
+                        f"Short exit eval: deal_id={pos['deal_id']} "
+                        f"entry={pos['entry_price']:.2f} close={close:.2f} "
+                        f"spread={spread:.4f} size={pos['size']} profit={profit:.2f}"
                     )
-                    to_keep.append(pos)
+                    if profit > 0:
+                        to_close.append((pos, profit))
+                    else:
+                        logger.debug(
+                            f"Short {pos['deal_id']} not profitable after spread — keeping"
+                        )
+                        to_keep.append(pos)
 
-            for pos, profit in to_close:
-                closed_ok = False
-                try:
-                    self.ig.close_position(pos["deal_id"], "BUY", pos["size"])
-                    closed_ok = True
-                except Exception as e:
-                    logger.error(f"Failed to close short {pos['deal_id']}: {e}")
-                    pos["needs_reconciliation"] = True
-                    to_keep.append(pos)
+                for pos, profit in to_close:
+                    closed_ok = False
+                    try:
+                        self.ig.close_position(pos["deal_id"], "BUY", pos["size"])
+                        closed_ok = True
+                    except Exception as e:
+                        logger.error(f"Failed to close short {pos['deal_id']}: {e}")
+                        pos["needs_reconciliation"] = True
+                        to_keep.append(pos)
 
-                if closed_ok:
-                    logger.info(
-                        f"Closed SHORT {pos['deal_id']} @ {close:.2f} "
-                        f"(entry={pos['entry_price']:.2f}, profit={profit:.2f})"
-                    )
+                    if closed_ok:
+                        logger.info(
+                            f"Closed SHORT {pos['deal_id']} @ {close:.2f} "
+                            f"(entry={pos['entry_price']:.2f}, profit={profit:.2f})"
+                        )
 
-            self._short_positions = to_keep
+                self._short_positions = to_keep
 
         # --- ENTRIES ---
         if close <= bb_upper or rsi <= self.params.rsi_overbought:
@@ -1297,54 +1311,64 @@ class RSIBollingerStrategyV2:
         )
 
         # --- Long exit ---
-        if (
-            not self._tick_long_close_in_flight
-            and bid > bb_upper
-            and self._long_positions
-        ):
-            logger.debug(
-                "tick long_exit: triggered bid=%.5f > bb_upper=%.5f positions=%d",
-                bid,
-                bb_upper,
-                len(self._long_positions),
-            )
-            self._tick_long_close_in_flight = True
-            try:
-                self._long_positions = self._tick_close_positions(
-                    self._long_positions, "SELL", bid, spread, "long"
+        if not self.params.close_on_bb_cross:
+            if bid > bb_upper and self._long_positions:
+                logger.debug("BB cross exit skipped (close_on_bb_cross=False)")
+        else:
+            if (
+                not self._tick_long_close_in_flight
+                and bid > bb_upper
+                and self._long_positions
+            ):
+                logger.debug(
+                    "tick long_exit: triggered bid=%.5f > bb_upper=%.5f positions=%d",
+                    bid,
+                    bb_upper,
+                    len(self._long_positions),
                 )
-            finally:
-                self._tick_long_close_in_flight = False
-        elif (
-            self._tick_long_close_in_flight and bid > bb_upper and self._long_positions
-        ):
-            logger.debug("tick long_exit: skipped (in_flight) bid=%.5f", bid)
+                self._tick_long_close_in_flight = True
+                try:
+                    self._long_positions = self._tick_close_positions(
+                        self._long_positions, "SELL", bid, spread, "long"
+                    )
+                finally:
+                    self._tick_long_close_in_flight = False
+            elif (
+                self._tick_long_close_in_flight
+                and bid > bb_upper
+                and self._long_positions
+            ):
+                logger.debug("tick long_exit: skipped (in_flight) bid=%.5f", bid)
 
         # --- Short exit ---
-        if (
-            not self._tick_short_close_in_flight
-            and bid < bb_lower
-            and self._short_positions
-        ):
-            logger.debug(
-                "tick short_exit: triggered bid=%.5f < bb_lower=%.5f positions=%d",
-                bid,
-                bb_lower,
-                len(self._short_positions),
-            )
-            self._tick_short_close_in_flight = True
-            try:
-                self._short_positions = self._tick_close_positions(
-                    self._short_positions, "BUY", bid, spread, "short"
+        if not self.params.close_on_bb_cross:
+            if bid < bb_lower and self._short_positions:
+                logger.debug("BB cross exit skipped (close_on_bb_cross=False)")
+        else:
+            if (
+                not self._tick_short_close_in_flight
+                and bid < bb_lower
+                and self._short_positions
+            ):
+                logger.debug(
+                    "tick short_exit: triggered bid=%.5f < bb_lower=%.5f positions=%d",
+                    bid,
+                    bb_lower,
+                    len(self._short_positions),
                 )
-            finally:
-                self._tick_short_close_in_flight = False
-        elif (
-            self._tick_short_close_in_flight
-            and bid < bb_lower
-            and self._short_positions
-        ):
-            logger.debug("tick short_exit: skipped (in_flight) bid=%.5f", bid)
+                self._tick_short_close_in_flight = True
+                try:
+                    self._short_positions = self._tick_close_positions(
+                        self._short_positions, "BUY", bid, spread, "short"
+                    )
+                finally:
+                    self._tick_short_close_in_flight = False
+            elif (
+                self._tick_short_close_in_flight
+                and bid < bb_lower
+                and self._short_positions
+            ):
+                logger.debug("tick short_exit: skipped (in_flight) bid=%.5f", bid)
 
         # --- Long entry ---
         if not self._is_long_entry_allowed():

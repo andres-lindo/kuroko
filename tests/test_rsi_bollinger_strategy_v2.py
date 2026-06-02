@@ -108,6 +108,7 @@ class TestLoadParams:
             "contract_size": 0.1,
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240.0,
+            "close_on_bb_cross": False,
         }
         path = tmp_path / "RSIBollingerStrategyV2.json"
         path.write_text(json.dumps(data))
@@ -2073,6 +2074,7 @@ class TestValidateParamsBranches:
             "contract_size": 0.1,
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240,  # int value for float field — should be accepted
+            "close_on_bb_cross": False,
         }
         path = tmp_path / "v2.json"
         path.write_text(json.dumps(data))
@@ -2149,8 +2151,8 @@ class TestValidateParamsBranches:
     def test_non_bool_value_for_bool_schema_key_triggers_sys_exit(self, tmp_path):
         """Bool branch (lines 69-70): a non-bool value for a bool-typed schema key causes SystemExit.
 
-        No production key uses bool, so this branch is tested by temporarily
-        patching _PARAMS_SCHEMA to include a bool-typed key.
+        Tested by temporarily patching _PARAMS_SCHEMA with an extra bool-typed key
+        set to a non-bool value so the rejection path is exercised in isolation.
 
         Note: import the live module object at call time to handle the rare case
         where test_kuroko.py flushes the strategies package from sys.modules,
@@ -2178,6 +2180,7 @@ class TestValidateParamsBranches:
             "contract_size": 0.1,
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240.0,
+            "close_on_bb_cross": False,
             "test_flag": "not_a_bool",  # string for a bool-typed key → must be rejected
         }
         path = tmp_path / "v2.json"
@@ -2208,6 +2211,7 @@ _HOT_RELOAD_BASE_PARAMS = {
     "contract_size": 1.0,
     "min_dist_between_entries_ticks": 10.0,
     "take_profit_ticks": 50.0,
+    "close_on_bb_cross": True,
 }
 
 
@@ -2545,6 +2549,7 @@ class TestHotReloadRoundTrip:
             "contract_size": 0.1,
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240.0,
+            "close_on_bb_cross": False,
             "test_flag": True,  # valid bool — must pass
         }
         path = tmp_path / "v2.json"
@@ -4547,3 +4552,232 @@ class TestAccountStatusLogging:
             strat.log_account_status()  # must not raise
 
         assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+
+# =========================================================================== #
+# close_on_bb_cross feature flag (REQ-close-on-bb-cross)                      #
+# =========================================================================== #
+
+
+class TestCloseonBBCross:
+    """close_on_bb_cross=False disables BB-cross exits in candle and tick modes."""
+
+    # ---------------------------------------------------------------------- #
+    # Candle mode — long exit                                                 #
+    # ---------------------------------------------------------------------- #
+
+    def test_long_exit_fires_when_flag_true(self, make_strategy_v2, make_params_v2):
+        """With close_on_bb_cross=True, a profitable long is closed at BB upper."""
+        params = make_params_v2(close_on_bb_cross=True)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0}]
+        indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=105.0
+        )
+
+        strat._manage_longs(indicators)
+
+        mock_ig.close_position.assert_called_once_with("DEAL1", "SELL", 1.0)
+
+    def test_long_exit_blocked_when_flag_false(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """With close_on_bb_cross=False, BB cross is detected but exit is skipped."""
+        import logging
+
+        params = make_params_v2(close_on_bb_cross=False)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0}]
+        indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=105.0
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="strategies.RSIBollingerStrategyV2"):
+            strat._manage_longs(indicators)
+
+        mock_ig.close_position.assert_not_called()
+        assert any(
+            "BB cross exit skipped" in r.message for r in caplog.records
+        ), "Expected DEBUG log 'BB cross exit skipped (close_on_bb_cross=False)'"
+
+    # ---------------------------------------------------------------------- #
+    # Candle mode — short exit                                                #
+    # ---------------------------------------------------------------------- #
+
+    def test_short_exit_fires_when_flag_true(self, make_strategy_v2, make_params_v2):
+        """With close_on_bb_cross=True, a profitable short is closed at BB lower."""
+        params = make_params_v2(close_on_bb_cross=True)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._short_positions = [
+            {"deal_id": "DEAL2", "entry_price": 110.0, "size": 1.0}
+        ]
+        indicators = _make_indicators(
+            bb_upper=150.0, bb_lower=100.0, rsi=50.0, close=95.0
+        )
+
+        strat._manage_shorts(indicators)
+
+        mock_ig.close_position.assert_called_once_with("DEAL2", "BUY", 1.0)
+
+    def test_short_exit_blocked_when_flag_false(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """With close_on_bb_cross=False, BB cross is detected but exit is skipped."""
+        import logging
+
+        params = make_params_v2(close_on_bb_cross=False)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._short_positions = [
+            {"deal_id": "DEAL2", "entry_price": 110.0, "size": 1.0}
+        ]
+        indicators = _make_indicators(
+            bb_upper=150.0, bb_lower=100.0, rsi=50.0, close=95.0
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="strategies.RSIBollingerStrategyV2"):
+            strat._manage_shorts(indicators)
+
+        mock_ig.close_position.assert_not_called()
+        assert any(
+            "BB cross exit skipped" in r.message for r in caplog.records
+        ), "Expected DEBUG log 'BB cross exit skipped (close_on_bb_cross=False)'"
+
+    # ---------------------------------------------------------------------- #
+    # Tick mode — long exit                                                   #
+    # ---------------------------------------------------------------------- #
+
+    def test_tick_long_exit_fires_when_flag_true(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """With close_on_bb_cross=True, tick long exit closes profitable positions."""
+        params = make_params_v2(operation_mode="tick", close_on_bb_cross=True)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
+        )
+        strat._long_positions = [
+            {"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0, "entry_spread": 0.0}
+        ]
+        # bid > bb_upper → exit condition
+        tick = {"bid": 105.0, "ofr": 106.0, "utm": 0}
+
+        mock_ig.close_position.return_value = None
+        strat._on_tick(tick)
+
+        mock_ig.close_position.assert_called_once_with("DEAL1", "SELL", 1.0)
+
+    def test_tick_long_exit_blocked_when_flag_false(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """With close_on_bb_cross=False, tick long exit is skipped with DEBUG log."""
+        import logging
+
+        params = make_params_v2(operation_mode="tick", close_on_bb_cross=False)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
+        )
+        strat._long_positions = [
+            {"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0, "entry_spread": 0.0}
+        ]
+        tick = {"bid": 105.0, "ofr": 106.0, "utm": 0}
+
+        with caplog.at_level(logging.DEBUG, logger="strategies.RSIBollingerStrategyV2"):
+            strat._on_tick(tick)
+
+        mock_ig.close_position.assert_not_called()
+        assert any(
+            "BB cross exit skipped" in r.message for r in caplog.records
+        ), "Expected DEBUG log 'BB cross exit skipped (close_on_bb_cross=False)'"
+
+    # ---------------------------------------------------------------------- #
+    # Tick mode — short exit                                                  #
+    # ---------------------------------------------------------------------- #
+
+    def test_tick_short_exit_fires_when_flag_true(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """With close_on_bb_cross=True, tick short exit closes profitable positions."""
+        params = make_params_v2(operation_mode="tick", close_on_bb_cross=True)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
+        )
+        strat._short_positions = [
+            {"deal_id": "DEAL2", "entry_price": 110.0, "size": 1.0}
+        ]
+        # bid < bb_lower → exit condition
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        mock_ig.close_position.return_value = None
+        strat._on_tick(tick)
+
+        mock_ig.close_position.assert_called_once_with("DEAL2", "BUY", 1.0)
+
+    def test_tick_short_exit_blocked_when_flag_false(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """With close_on_bb_cross=False, tick short exit is skipped with DEBUG log."""
+        import logging
+
+        params = make_params_v2(operation_mode="tick", close_on_bb_cross=False)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
+        )
+        strat._short_positions = [
+            {"deal_id": "DEAL2", "entry_price": 110.0, "size": 1.0}
+        ]
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        with caplog.at_level(logging.DEBUG, logger="strategies.RSIBollingerStrategyV2"):
+            strat._on_tick(tick)
+
+        mock_ig.close_position.assert_not_called()
+        assert any(
+            "BB cross exit skipped" in r.message for r in caplog.records
+        ), "Expected DEBUG log 'BB cross exit skipped (close_on_bb_cross=False)'"
+
+    # ---------------------------------------------------------------------- #
+    # Hot-reload: close_on_bb_cross is hot-safe                               #
+    # ---------------------------------------------------------------------- #
+
+    def test_hot_reload_enables_exits_when_flag_changes_false_to_true(
+        self, make_strategy_v2, make_params_v2, tmp_path
+    ):
+        """Hot-reload from close_on_bb_cross=False to True causes exits to fire."""
+        import time
+
+        # Write initial params JSON with close_on_bb_cross=False
+        base = dict(_HOT_RELOAD_BASE_PARAMS)
+        base["close_on_bb_cross"] = False
+        params_file = tmp_path / "v2.json"
+        params_file.write_text(json.dumps(base), encoding="utf-8")
+
+        params = make_params_v2(close_on_bb_cross=False, operation_mode="candle")
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._params_path = str(params_file)
+        strat._params_mtime = params_file.stat().st_mtime
+
+        # Confirm exits are blocked before reload
+        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0}]
+        indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=105.0
+        )
+        strat._manage_longs(indicators)
+        mock_ig.close_position.assert_not_called()
+
+        # Update JSON to enable the flag and force mtime change
+        base["close_on_bb_cross"] = True
+        params_file.write_text(json.dumps(base), encoding="utf-8")
+        new_mtime = strat._params_mtime + 1
+        os.utime(str(params_file), (new_mtime, new_mtime))
+
+        strat._reload_params_if_changed()
+
+        assert strat.params.close_on_bb_cross is True
+
+        # Now exits should fire
+        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0}]
+        strat._manage_longs(indicators)
+        mock_ig.close_position.assert_called_once_with("DEAL1", "SELL", 1.0)
