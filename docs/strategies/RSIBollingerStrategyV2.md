@@ -19,10 +19,9 @@ differences from V1:
    price data.
 2. **Bidirectional grids** — long and short grids are independent. Both can
    hold open positions at the same time.
-3. **Simplified risk model** — no martingale sizing, no ATR stop-loss, no
-   drawdown freeze. Broker-level take-profit is the sole exit mechanism for
-   trend continuations; per-position spread-aware profit is the guard for
-   mean-reversion exits.
+3. **Simplified risk model** — no martingale sizing, no ATR, no drawdown
+   freeze. Broker-level take-profit and stop-loss are set at open; per-position
+   spread-aware profit is the guard for mean-reversion exits.
 
 V2 also supports an optional **tick mode** (`operation_mode: "tick"`) where
 entry and exit signals are evaluated on every live tick using indicators cached
@@ -288,17 +287,20 @@ to `0.0` — a conservative fallback that never suppresses a profitable exit.
 | Minimum entry distance | New entry rejected if `abs(close - last_entry) < min_dist_between_entries_ticks` |
 | Position sizing | Flat `contract_size` for every entry — no martingale, no scaling |
 | Broker take-profit | Set at `entry_price + take_profit_ticks` (long) or `entry_price - take_profit_ticks` (short) at open |
+| Broker stop-loss | Set at `entry_price - stop_loss_ticks` (long) or `entry_price + stop_loss_ticks` (short) at open |
 
 ---
 
 ## Risk Management
 
-There is no programmatic stop-loss in V2. Risk is bounded by:
+Risk is bounded by:
 
 - **Position caps** (`max_long_positions`, `max_short_positions`) — hard upper
   limit on exposure in each direction.
 - **Broker-level take-profit** — set as a limit order at open; the broker
   closes the position automatically if the target is reached.
+- **Broker-level stop-loss** — set at open via `stop_loss_ticks`; the broker
+  closes the position automatically if the loss threshold is hit.
 - **Entry distance guard** — prevents adding to a losing grid faster than
   `min_dist_between_entries_ticks` ticks.
 
@@ -440,6 +442,7 @@ loaded at startup into a `types.SimpleNamespace` via `load_params()`.
 | `contract_size` | float | `3.0` | Position size in contracts — uniform for every entry |
 | `min_dist_between_entries_ticks` | float | `10` | Minimum price distance between consecutive entries in the same grid (ticks) |
 | `take_profit_ticks` | float | `8` | Broker take-profit distance from entry price (ticks) |
+| `stop_loss_ticks` | float | `16` | Broker stop-loss distance from entry price (ticks) |
 | `close_on_bb_cross` | bool | `false` | When `true`, the bot closes positions when the opposite Bollinger Band is crossed and `profit > 0` (long: `close > bb_upper`; short: `close < bb_lower`). When `false` (default), BB-cross exits are skipped and positions are left to the broker TP. Can be changed at runtime via hot-reload. |
 
 Infrastructure parameters (`leverage`, `initial_cash_balance`,
@@ -480,6 +483,7 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
   "contract_size": 3.0,
   "min_dist_between_entries_ticks": 10,
   "take_profit_ticks": 8,
+  "stop_loss_ticks": 16,
 
   "close_on_bb_cross": false
 }
@@ -528,6 +532,7 @@ The strategy can apply changes to `strategies/RSIBollingerStrategyV2.json` at ru
 | `max_short_positions` | Maximum simultaneous short positions |
 | `min_dist_between_entries_ticks` | Minimum price distance between grid entries |
 | `take_profit_ticks` | Broker take-profit distance (also per-position exit threshold) |
+| `stop_loss_ticks` | Broker stop-loss distance from entry price |
 | `contract_size` | Position size for new entries |
 | `bb_std` | Bollinger Band standard deviation multiplier |
 | `close_on_bb_cross` | Enable/disable BB-cross exits without restart |

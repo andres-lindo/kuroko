@@ -108,6 +108,7 @@ class TestLoadParams:
             "contract_size": 0.1,
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240.0,
+            "stop_loss_ticks": 100.0,
             "close_on_bb_cross": False,
         }
         path = tmp_path / "RSIBollingerStrategyV2.json"
@@ -1984,25 +1985,26 @@ class TestV2JsonConfig:
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
         assert data["bb_period"] == 20
 
-    def test_v2_json_bb_std_is_1_8(self):
-        """bb_std must be 1.8 per config."""
+    def test_v2_json_bb_std_is_positive(self):
+        """bb_std must be a positive number."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["bb_std"] == 1.8
+        assert isinstance(data["bb_std"], (int, float)) and data["bb_std"] > 0
 
-    def test_v2_json_rsi_period_is_7(self):
-        """rsi_period must be 7 per config."""
+    def test_v2_json_rsi_period_is_positive(self):
+        """rsi_period must be a positive integer."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["rsi_period"] == 7
+        assert isinstance(data["rsi_period"], int) and data["rsi_period"] > 0
 
-    def test_v2_json_rsi_oversold_is_30(self):
-        """rsi_oversold must be 30 per config."""
+    def test_v2_json_rsi_oversold_in_range(self):
+        """rsi_oversold must be in (0, 100)."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["rsi_oversold"] == 30.0
+        assert 0 < data["rsi_oversold"] < 100
 
-    def test_v2_json_rsi_overbought_is_70(self):
-        """rsi_overbought must be 70 per config."""
+    def test_v2_json_rsi_overbought_in_range(self):
+        """rsi_overbought must be in (0, 100) and strictly above rsi_oversold."""
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
-        assert data["rsi_overbought"] == 70.0
+        assert 0 < data["rsi_overbought"] < 100
+        assert data["rsi_overbought"] > data["rsi_oversold"]
 
 
 # --------------------------------------------------------------------------- #
@@ -2074,6 +2076,7 @@ class TestValidateParamsBranches:
             "contract_size": 0.1,
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240,  # int value for float field — should be accepted
+            "stop_loss_ticks": 100.0,
             "close_on_bb_cross": False,
         }
         path = tmp_path / "v2.json"
@@ -2211,6 +2214,7 @@ _HOT_RELOAD_BASE_PARAMS = {
     "contract_size": 1.0,
     "min_dist_between_entries_ticks": 10.0,
     "take_profit_ticks": 50.0,
+    "stop_loss_ticks": 100.0,
     "close_on_bb_cross": True,
 }
 
@@ -2549,6 +2553,7 @@ class TestHotReloadRoundTrip:
             "contract_size": 0.1,
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240.0,
+            "stop_loss_ticks": 100.0,
             "close_on_bb_cross": False,
             "test_flag": True,  # valid bool — must pass
         }

@@ -4,7 +4,7 @@ Implements independent long/short position grids using Bollinger Bands (BB) and
 RSI signals. Candles are delivered via a queue from IGStreamingClient. All trading
 logic runs on a single worker thread; REST calls are serialized through IGClient.
 
-No martingale, no ATR, no stop-loss. All positions use flat contract_size.
+No martingale, no ATR. All positions use flat contract_size with configurable TP and SL distances.
 """
 
 import json
@@ -44,6 +44,7 @@ _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
     "contract_size": float,
     "min_dist_between_entries_ticks": float,
     "take_profit_ticks": float,
+    "stop_loss_ticks": (int, float),
     "close_on_bb_cross": bool,
 }
 
@@ -176,6 +177,7 @@ class RSIBollingerStrategyV2:
             "max_short_positions",
             "min_dist_between_entries_ticks",
             "take_profit_ticks",
+            "stop_loss_ticks",
             "contract_size",
             "bb_std",
             "close_on_bb_cross",
@@ -249,7 +251,8 @@ class RSIBollingerStrategyV2:
             f"max_long={params.max_long_positions} max_short={params.max_short_positions} "
             f"contract_size={params.contract_size} "
             f"min_dist={params.min_dist_between_entries_ticks} "
-            f"take_profit_ticks={params.take_profit_ticks}"
+            f"take_profit_ticks={params.take_profit_ticks} "
+            f"stop_loss_ticks={params.stop_loss_ticks}"
         )
 
         # Spread is calculated dynamically from each candle's OFR_CLOSE - BID_CLOSE.
@@ -582,10 +585,11 @@ class RSIBollingerStrategyV2:
                 return
 
         limit_distance = self.params.take_profit_ticks
+        stop_distance = self.params.stop_loss_ticks
         size = self.params.contract_size
         logger.debug(
             f"Long entry signal: close={close:.2f} bb_lower={bb_lower:.2f} "
-            f"rsi={rsi:.2f} size={size} tp_dist={limit_distance} "
+            f"rsi={rsi:.2f} size={size} tp_dist={limit_distance} sl_dist={stop_distance} "
             f"grid_level={len(self._long_positions) + 1}/{self.params.max_long_positions}"
         )
 
@@ -595,6 +599,7 @@ class RSIBollingerStrategyV2:
                 size=size,
                 side="BUY",
                 limit=limit_distance,
+                stop=stop_distance,
             )
             deal_id = _extract_deal_id(response)
             logger.debug(f"open_position (LONG) response: deal_id={deal_id!r}")
@@ -613,7 +618,7 @@ class RSIBollingerStrategyV2:
                 )
                 logger.info(
                     f"Opened LONG {deal_id} @ {close:.2f} | "
-                    f"size={size} | TP dist={limit_distance}"
+                    f"size={size} | TP dist={limit_distance} | SL dist={stop_distance}"
                 )
         except Exception as e:
             logger.error(f"Failed to open long position: {e}")
@@ -723,10 +728,11 @@ class RSIBollingerStrategyV2:
                 return
 
         limit_distance = self.params.take_profit_ticks
+        stop_distance = self.params.stop_loss_ticks
         size = self.params.contract_size
         logger.debug(
             f"Short entry signal: close={close:.2f} bb_upper={bb_upper:.2f} "
-            f"rsi={rsi:.2f} size={size} tp_dist={limit_distance} "
+            f"rsi={rsi:.2f} size={size} tp_dist={limit_distance} sl_dist={stop_distance} "
             f"grid_level={len(self._short_positions) + 1}/{self.params.max_short_positions}"
         )
 
@@ -736,6 +742,7 @@ class RSIBollingerStrategyV2:
                 size=size,
                 side="SELL",
                 limit=limit_distance,
+                stop=stop_distance,
             )
             deal_id = _extract_deal_id(response)
             logger.debug(f"open_position (SHORT) response: deal_id={deal_id!r}")
@@ -754,7 +761,7 @@ class RSIBollingerStrategyV2:
                 )
                 logger.info(
                     f"Opened SHORT {deal_id} @ {close:.2f} | "
-                    f"size={size} | TP dist={limit_distance}"
+                    f"size={size} | TP dist={limit_distance} | SL dist={stop_distance}"
                 )
         except Exception as e:
             logger.error(f"Failed to open short position: {e}")

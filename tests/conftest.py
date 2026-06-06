@@ -67,7 +67,7 @@ def make_params_v1():
 
 @pytest.fixture
 def make_params_v2():
-    """Factory fixture: returns callable(**overrides) → SimpleNamespace (V2 12-key schema).
+    """Factory fixture: returns callable(**overrides) → SimpleNamespace (V2 13-key schema).
 
     Returns:
         A factory function that accepts keyword overrides and returns a
@@ -81,7 +81,7 @@ def make_params_v2():
             **overrides: Key/value pairs to override the defaults.
 
         Returns:
-            SimpleNamespace populated with all 12 V2 signal/risk keys.
+            SimpleNamespace populated with all 13 V2 signal/risk keys.
         """
         defaults = {
             "epic": "IX.D.SPTRD.IFMM.IP",
@@ -97,6 +97,7 @@ def make_params_v2():
             "contract_size": 1.0,
             "min_dist_between_entries_ticks": 10,
             "take_profit_ticks": 50.0,
+            "stop_loss_ticks": 100.0,
             "operation_mode": "candle",
             "close_on_bb_cross": True,
         }
