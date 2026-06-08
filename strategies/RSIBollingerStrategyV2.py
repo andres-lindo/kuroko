@@ -1194,6 +1194,7 @@ class RSIBollingerStrategyV2:
                 size=self.params.contract_size,
                 side=side,
                 limit=self.params.take_profit_ticks,
+                stop=self.params.stop_loss_ticks,
             )
             deal_id = _extract_deal_id(response)
             if deal_id != "unknown":
