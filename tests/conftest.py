@@ -99,10 +99,10 @@ def make_params_v2():
             "take_profit_ticks": 50.0,
             "stop_loss_ticks": 100.0,
             "operation_mode": "candle",
-            "close_on_bb_cross": True,
             "close_mode": "fixed",
             "atr_period": 14,
-            "atr_multiplier": 1.5,
+            "atr_multiplier_tp": 1.0,
+            "atr_multiplier_sl": 1.5,
         }
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)

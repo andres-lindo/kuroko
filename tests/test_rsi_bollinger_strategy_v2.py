@@ -3,10 +3,10 @@ infrastructure (candle-frequency utilities, V2 JSON config, V1/V2 param loading,
 requirements pinning).
 
 Covers entry signals (long/short), entry guards (max positions, min distance),
-exit logic (profitable per-position close), grid independence, flat sizing,
-spread-aware profit calculation, broker take-profit on open, candle frequency
-routing from JSON config through to IGStreamingClient resolution, and V1 param
-schema validation.
+exit regression guards (no programmatic close -- broker TP/SL only), grid
+independence, flat sizing, broker take-profit on open, candle frequency routing
+from JSON config through to IGStreamingClient resolution, and V1 param schema
+validation.
 
 All broker interactions are mocked — no live credentials required.
 """
@@ -111,10 +111,10 @@ class TestLoadParams:
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240.0,
             "stop_loss_ticks": 100.0,
-            "close_on_bb_cross": False,
             "close_mode": "fixed",
             "atr_period": 14,
-            "atr_multiplier": 1.5,
+            "atr_multiplier_tp": 1.0,
+            "atr_multiplier_sl": 1.5,
         }
         path = tmp_path / "RSIBollingerStrategyV2.json"
         path.write_text(json.dumps(data))
@@ -356,18 +356,6 @@ class TestGuardrails:
             strat._manage_longs(indicators)
         mock_ig.open_position.assert_not_called()
 
-    def test_manage_longs_exit_not_blocked_by_guardrail(self, make_strategy_v2):
-        """Long exit fires even when _is_long_entry_allowed returns False."""
-        strat, mock_ig, _ = make_strategy_v2()
-        strat._long_positions = [{"deal_id": "X", "entry_price": 80.0, "size": 1.0}]
-        strat._current_spread = 0.0
-        indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=105.0
-        )
-        with patch.object(strat, "_is_long_entry_allowed", return_value=False):
-            strat._manage_longs(indicators)
-        mock_ig.close_position.assert_called_once_with("X", "SELL", 1.0)
-
     # -- integration: _on_tick ------------------------------------------------
 
     def test_on_tick_long_entry_blocked_by_guardrail(
@@ -458,23 +446,15 @@ class TestShortEntry:
 
 
 class TestLongExit:
-    """profitable longs are closed when price crosses above BB upper."""
+    """Regression guards confirming the strategy never calls close_position for longs.
 
-    def test_profitable_long_closed_at_bb_upper_cross(self, make_strategy_v2):
-        """Long with profit > 0 after spread is closed."""
-        strat, mock_ig, _ = make_strategy_v2()
-        # entry=90, close=105, spread=0.0 (not set) → profit = (105-90-0)*0.5 = 7.5 > 0
-        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 0.5}]
-        indicators = _make_indicators(
-            bb_lower=50.0, bb_upper=100.0, rsi=50.0, close=105.0
-        )
-
-        strat._manage_longs(indicators)
-
-        mock_ig.close_position.assert_called_once_with("DEAL1", "SELL", 0.5)
+    Exits are handled exclusively by broker TP/SL orders set at position open.
+    Tests assert close_position.assert_not_called() to prevent accidental
+    reintroduction of programmatic exits.
+    """
 
     def test_long_not_closed_when_underwater_after_spread(self, make_strategy_v2):
-        """Long with profit <= 0 after spread is NOT closed at BB upper."""
+        """Strategy does not call close_position when long profit <= 0 after spread."""
         strat, mock_ig, _ = make_strategy_v2()
         strat._current_spread = 1.0  # spread from latest candle
         # entry=104, close=105, spread=1.0 → profit = (105-104-1)*0.5 = 0 (not > 0)
@@ -489,30 +469,8 @@ class TestLongExit:
 
         mock_ig.close_position.assert_not_called()
 
-    def test_only_profitable_longs_are_closed(self, make_strategy_v2):
-        """Only profitable positions closed; underwater stays open."""
-        strat, mock_ig, _ = make_strategy_v2()
-        strat._current_spread = 1.0  # spread from latest candle
-        # DEAL1: entry=90, profit = (105-90-1)*0.5 = 7.0 > 0 → close
-        # DEAL2: entry=104, profit = (105-104-1)*0.5 = 0 → keep
-        strat._long_positions = [
-            {"deal_id": "DEAL1", "entry_price": 90.0, "size": 0.5},
-            {"deal_id": "DEAL2", "entry_price": 104.0, "size": 0.5},
-        ]
-        indicators = _make_indicators(
-            bb_lower=50.0, bb_upper=100.0, rsi=50.0, close=105.0
-        )
-
-        strat._manage_longs(indicators)
-
-        assert mock_ig.close_position.call_count == 1
-        mock_ig.close_position.assert_called_with("DEAL1", "SELL", 0.5)
-        # DEAL2 must still be in the positions list
-        remaining_ids = [p["deal_id"] for p in strat._long_positions]
-        assert "DEAL2" in remaining_ids
-
     def test_long_spread_subtracted_from_profit(self, make_strategy_v2):
-        """spread is subtracted when computing per-position profit."""
+        """Strategy does not call close_position even when spread wipes out apparent profit."""
         # With spread=5: entry=90, close=94, spread=5 → (94-90-5)*0.5 = -0.5 → NOT closed
         strat, mock_ig, _ = make_strategy_v2()
         strat._current_spread = 5.0  # spread from latest candle
@@ -525,33 +483,6 @@ class TestLongExit:
 
         mock_ig.close_position.assert_not_called()
 
-    def test_long_spread_read_from_candle_not_trading_config(self, make_strategy_v2):
-        """Spread must come from the candle, not trading_config.
-
-        Entry=100, close=105:
-        - Without candle spread update (fallback 0.0): profit = (105-100-0)*0.5 = 2.5 → close
-        - After candle spread update (spread=1.0): profit = (105-100-1)*0.5 = 2.0 → close
-
-        This test verifies that _update_spread_from_candle correctly updates the spread
-        used for profit calculations.
-        """
-        strat, mock_ig, _ = make_strategy_v2()
-        strat._long_positions = [
-            {"deal_id": "DEAL1", "entry_price": 100.0, "size": 0.5}
-        ]
-        # Update strategy's current spread from a candle with spread=1.0
-        strat._update_spread_from_candle(
-            {"bid_close": 104.5, "ofr_close": 105.5, "spread": 1.0}
-        )
-        indicators = _make_indicators(
-            bb_lower=50.0, bb_upper=100.0, rsi=50.0, close=105.0
-        )
-
-        strat._manage_longs(indicators)
-
-        # Should be closed: profit = (105 - 100 - 1) * 0.5 = 2.0 > 0
-        mock_ig.close_position.assert_called_once_with("DEAL1", "SELL", 0.5)
-
 
 # --------------------------------------------------------------------------- #
 # Short exit logic — REQ-10                                                    #
@@ -559,25 +490,15 @@ class TestLongExit:
 
 
 class TestShortExit:
-    """profitable shorts are closed when price crosses below BB lower."""
+    """Regression guards confirming the strategy never calls close_position for shorts.
 
-    def test_profitable_short_closed_at_bb_lower_cross(self, make_strategy_v2):
-        """Short with profit > 0 after spread is closed."""
-        strat, mock_ig, _ = make_strategy_v2()
-        # entry=110, close=95, spread=0.0 (not set) → profit = (110-95-0)*0.5 = 7.5 > 0
-        strat._short_positions = [
-            {"deal_id": "DEAL2", "entry_price": 110.0, "size": 0.5}
-        ]
-        indicators = _make_indicators(
-            bb_lower=100.0, bb_upper=150.0, rsi=50.0, close=95.0
-        )
-
-        strat._manage_shorts(indicators)
-
-        mock_ig.close_position.assert_called_once_with("DEAL2", "BUY", 0.5)
+    Exits are handled exclusively by broker TP/SL orders set at position open.
+    Tests assert close_position.assert_not_called() to prevent accidental
+    reintroduction of programmatic exits.
+    """
 
     def test_short_not_closed_when_underwater(self, make_strategy_v2):
-        """short with profit <= 0 after spread is NOT closed at BB lower."""
+        """Strategy does not call close_position when short profit <= 0 after spread."""
         strat, mock_ig, _ = make_strategy_v2()
         strat._current_spread = 1.0  # spread from latest candle
         # entry=96, close=95, spread=1 → profit = (96-95-1)*0.5 = 0 → NOT closed
@@ -593,7 +514,7 @@ class TestShortExit:
         mock_ig.close_position.assert_not_called()
 
     def test_short_spread_subtracted_from_profit(self, make_strategy_v2):
-        """spread is applied when computing short profit."""
+        """Strategy does not call close_position when spread wipes out apparent short profit."""
         # entry=105, close=100, spread=5 → profit = (105-100-5)*0.5 = 0 → NOT closed
         strat, mock_ig, _ = make_strategy_v2()
         strat._current_spread = 5.0  # spread from latest candle
@@ -607,28 +528,6 @@ class TestShortExit:
         strat._manage_shorts(indicators)
 
         mock_ig.close_position.assert_not_called()
-
-    def test_short_spread_read_from_candle_not_trading_config(self, make_strategy_v2):
-        """Spread must come from the candle, not trading_config.
-
-        After _update_spread_from_candle is called with spread=1.0:
-        entry=110, close=95 → profit = (110 - 95 - 1) * 0.5 = 7.0 > 0 → closed.
-        """
-        strat, mock_ig, _ = make_strategy_v2()
-        strat._short_positions = [
-            {"deal_id": "DEAL2", "entry_price": 110.0, "size": 0.5}
-        ]
-        strat._update_spread_from_candle(
-            {"bid_close": 94.5, "ofr_close": 95.5, "spread": 1.0}
-        )
-        indicators = _make_indicators(
-            bb_lower=100.0, bb_upper=150.0, rsi=50.0, close=95.0
-        )
-
-        strat._manage_shorts(indicators)
-
-        # Should be closed: profit = (110 - 95 - 1) * 0.5 = 7.0 > 0
-        mock_ig.close_position.assert_called_once_with("DEAL2", "BUY", 0.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -650,7 +549,7 @@ class TestGridIndependence:
             {"deal_id": "S1", "entry_price": 120.0, "size": 0.5},
             {"deal_id": "S2", "entry_price": 130.0, "size": 0.5},
         ]
-        # Neutral candle: close=100, BBs=[50, 100, 150], RSI=50 — no entry or exit signals
+        # Neutral candle: close=100, BBs=[50, 100, 150], RSI=50 — no entry signals
         indicators = _make_indicators(
             bb_lower=50.0, bb_upper=150.0, rsi=50.0, close=100.0
         )
@@ -669,9 +568,8 @@ class TestGridIndependence:
         """a short signal condition does NOT prevent a valid long entry."""
         params = make_params_v2(max_long_positions=3, max_short_positions=3)
         strat, mock_ig, _ = make_strategy_v2(params=params)
-        # Set up indicators that trigger BOTH a long entry condition and a short exit condition
+        # Set up indicators that trigger a long entry condition only (no exit conditions exist)
         # Long entry: close=90 < bb_lower=95, rsi=25 < 30
-        # Short exit: close=90 < bb_lower=95 (would close underwater shorts — they stay open)
         strat._short_positions = [
             {"deal_id": "S1", "entry_price": 91.0, "size": 0.5}  # underwater short
         ]
@@ -763,45 +661,6 @@ class TestDynamicSpread:
         strat, _, _ = make_strategy_v2()
         assert strat._current_spread is None
 
-    def test_profit_uses_candle_spread_not_config_spread(self, make_strategy_v2):
-        """End-to-end: profit calculation uses _current_spread set from candle.
-
-        entry=100, close=105, _current_spread=1.0:
-        profit = (105-100-1)*0.5 = 2.0 → closed.
-
-        Without setting _current_spread (fallback=0.0):
-        profit = (105-100-0)*0.5 = 2.5 → also closed.
-
-        Verified via _update_spread_from_candle path.
-        """
-        strat, mock_ig, _ = make_strategy_v2()
-        strat._long_positions = [
-            {"deal_id": "DEAL1", "entry_price": 100.0, "size": 0.5}
-        ]
-        strat._current_spread = 1.0  # simulates a candle having been processed
-        indicators = _make_indicators(
-            bb_lower=50.0, bb_upper=100.0, rsi=50.0, close=105.0
-        )
-
-        strat._manage_longs(indicators)
-
-        # profit = (105 - 100 - 1) * 0.5 = 2.0 > 0 → must close (candle spread used)
-        mock_ig.close_position.assert_called_once_with("DEAL1", "SELL", 0.5)
-
-    def test_spread_falls_back_to_default_when_no_candle_yet(self, make_strategy_v2):
-        """If no candle has been processed yet, spread defaults to 0.0 (no suppression)."""
-        strat, mock_ig, _ = make_strategy_v2()
-        # _current_spread = None initially; strategy must use 0.0 as safe default
-        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 0.5}]
-        indicators = _make_indicators(
-            bb_lower=50.0, bb_upper=100.0, rsi=50.0, close=105.0
-        )
-
-        strat._manage_longs(indicators)
-
-        # profit = (105 - 90 - 0.0) * 0.5 = 7.5 > 0 → must close
-        mock_ig.close_position.assert_called_once_with("DEAL1", "SELL", 0.5)
-
 
 # --------------------------------------------------------------------------- #
 # Single-queue pattern — design: LS → streaming_client queue → strategy run() #
@@ -861,40 +720,7 @@ class TestSingleQueuePattern:
 
 
 class TestPhantomPositionReconciliation:
-    """CRITICAL: failed close must not leave phantom positions in the grid forever."""
-
-    def test_failed_close_marks_position_needs_reconciliation(self, make_strategy_v2):
-        """After a close failure, the position must be flagged needs_reconciliation=True."""
-        strat, mock_ig, _ = make_strategy_v2()
-        mock_ig.close_position.side_effect = Exception("Network error")
-        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 0.5}]
-        indicators = _make_indicators(
-            bb_lower=50.0, bb_upper=100.0, rsi=50.0, close=105.0
-        )
-
-        strat._manage_longs(indicators)
-
-        # Position must stay in grid AND be flagged
-        assert len(strat._long_positions) == 1
-        assert strat._long_positions[0].get("needs_reconciliation") is True
-
-    def test_failed_short_close_marks_position_needs_reconciliation(
-        self, make_strategy_v2
-    ):
-        """After a short close failure, the position must be flagged needs_reconciliation=True."""
-        strat, mock_ig, _ = make_strategy_v2()
-        mock_ig.close_position.side_effect = Exception("Broker timeout")
-        strat._short_positions = [
-            {"deal_id": "DEAL2", "entry_price": 110.0, "size": 0.5}
-        ]
-        indicators = _make_indicators(
-            bb_lower=100.0, bb_upper=150.0, rsi=50.0, close=95.0
-        )
-
-        strat._manage_shorts(indicators)
-
-        assert len(strat._short_positions) == 1
-        assert strat._short_positions[0].get("needs_reconciliation") is True
+    """CRITICAL: reconciliation removes phantom positions from the grid."""
 
     def test_reconcile_removes_positions_absent_from_broker(self, make_strategy_v2):
         """_reconcile_positions must remove local positions that no longer exist at broker.
@@ -1190,13 +1016,14 @@ class TestStrategyStopCallsStreamingStop:
 
 
 class TestEntryExitBoundary:
-    """Verify strict inequality boundaries for entry and exit conditions.
+    """Verify strict inequality boundaries for entry conditions.
 
     Per the spec:
     - Long entry: price STRICTLY < bb_lower (price == bb_lower blocks entry)
-    - Long exit:  price STRICTLY > bb_upper (price == bb_upper blocks exit)
     - Short entry: price STRICTLY > bb_upper (price == bb_upper blocks entry)
-    - Short exit:  price STRICTLY < bb_lower (price == bb_lower blocks exit)
+
+    Also confirms that close_position is never called by the strategy.
+    Exits are handled exclusively by broker TP/SL orders set at position open.
     """
 
     def test_long_entry_blocked_when_price_equals_bb_lower(self, make_strategy_v2):
@@ -1212,7 +1039,7 @@ class TestEntryExitBoundary:
         mock_ig.open_position.assert_not_called()
 
     def test_long_exit_blocked_when_price_equals_bb_upper(self, make_strategy_v2):
-        """Exit condition is STRICT (>); price == bb_upper must NOT trigger a long exit."""
+        """Regression guard: strategy never calls close_position regardless of price position relative to BB bands."""
         strat, mock_ig, _ = make_strategy_v2()
         strat._current_spread = 1.0
         # entry=90, close=100 == bb_upper=100 → exit NOT triggered (not strictly greater than)
@@ -1238,7 +1065,7 @@ class TestEntryExitBoundary:
         mock_ig.open_position.assert_not_called()
 
     def test_short_exit_blocked_when_price_equals_bb_lower(self, make_strategy_v2):
-        """Short exit condition is STRICT (<); price == bb_lower must NOT trigger a short exit."""
+        """Regression guard: strategy never calls close_position regardless of price position relative to BB bands."""
         strat, mock_ig, _ = make_strategy_v2()
         strat._current_spread = 1.0
         # entry=110, close=100 == bb_lower=100 → exit NOT triggered (not strictly less than)
@@ -2082,10 +1909,10 @@ class TestValidateParamsBranches:
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240,  # int value for float field — should be accepted
             "stop_loss_ticks": 100.0,
-            "close_on_bb_cross": False,
             "close_mode": "fixed",
             "atr_period": 14,
-            "atr_multiplier": 1.5,
+            "atr_multiplier_tp": 1.0,
+            "atr_multiplier_sl": 1.5,
         }
         path = tmp_path / "v2.json"
         path.write_text(json.dumps(data))
@@ -2192,10 +2019,10 @@ class TestValidateParamsBranches:
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240.0,
             "stop_loss_ticks": 100.0,
-            "close_on_bb_cross": False,
             "close_mode": "fixed",
             "atr_period": 14,
-            "atr_multiplier": 1.5,
+            "atr_multiplier_tp": 1.0,
+            "atr_multiplier_sl": 1.5,
             "test_flag": "not_a_bool",  # string for a bool-typed key → must be rejected
         }
         path = tmp_path / "v2.json"
@@ -2227,10 +2054,10 @@ _HOT_RELOAD_BASE_PARAMS = {
     "min_dist_between_entries_ticks": 10.0,
     "take_profit_ticks": 50.0,
     "stop_loss_ticks": 100.0,
-    "close_on_bb_cross": True,
     "close_mode": "fixed",
     "atr_period": 14,
-    "atr_multiplier": 1.5,
+    "atr_multiplier_tp": 1.0,
+    "atr_multiplier_sl": 1.5,
 }
 
 
@@ -2569,10 +2396,10 @@ class TestHotReloadRoundTrip:
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240.0,
             "stop_loss_ticks": 100.0,
-            "close_on_bb_cross": False,
             "close_mode": "fixed",
             "atr_period": 14,
-            "atr_multiplier": 1.5,
+            "atr_multiplier_tp": 1.0,
+            "atr_multiplier_sl": 1.5,
             "test_flag": True,  # valid bool — must pass
         }
         path = tmp_path / "v2.json"
@@ -3441,46 +3268,17 @@ class TestTickEntryShort:
 
 
 class TestTickExitLong:
-    """Long positions closed when bid > bb_upper and profit > 0 in tick mode [REQ-6]."""
+    """Regression guards confirming tick-mode strategy never calls close_position for longs.
 
-    def test_longs_closed_when_bid_above_bb_upper_and_profit_positive(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """All longs closed when bid > bb_upper and live spread profit > 0."""
-        params = make_params_v2(operation_mode="tick")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
-        )
-        # Long entered at 90; bid=110 > bb_upper=100; spread=1.0 → profit=(110-90-1)*0.5=9.5>0
-        strat._long_positions = [{"deal_id": "L1", "entry_price": 90.0, "size": 0.5}]
-        tick = {"bid": 110.0, "ofr": 111.0, "utm": 0}
-
-        strat._on_tick(tick)
-
-        mock_ig.close_position.assert_called_once_with("L1", "SELL", 0.5)
-
-    def test_long_exit_suppressed_when_profit_not_positive(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """Long not closed when bid > bb_upper but profit <= 0 (spread too high)."""
-        params = make_params_v2(operation_mode="tick")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
-        )
-        # Long at 110; bid=105 > bb_upper=100; spread=10 → profit=(105-110-10)*0.5 < 0
-        strat._long_positions = [{"deal_id": "L1", "entry_price": 110.0, "size": 0.5}]
-        tick = {"bid": 105.0, "ofr": 115.0, "utm": 0}  # ofr-bid spread=10
-
-        strat._on_tick(tick)
-
-        mock_ig.close_position.assert_not_called()
+    Exits are handled exclusively by broker TP/SL orders set at position open.
+    Tests assert close_position.assert_not_called() to prevent accidental
+    reintroduction of programmatic exits.
+    """
 
     def test_long_exit_suppressed_when_entry_spread_wider_than_exit_spread(
         self, make_strategy_v2, make_params_v2
     ):
-        """Long not closed when exit-tick spread understates the entry cost.
+        """Strategy does not call close_position when exit-tick spread understates the entry cost.
 
         Regression test: entry was opened when spread was wide (3.0).
         Exit tick has a tight spread (0.5). Using exit spread in the profit
@@ -3488,7 +3286,7 @@ class TestTickExitLong:
         actual broker P&L is negative.
 
         With the fix, the entry_spread stored at open time is used for the
-        LONG profit check instead of the exit tick's spread.
+        V2 has no profit check; regression guard confirms close_position is never called.
         """
         params = make_params_v2(operation_mode="tick")
         strat, mock_ig, _ = make_strategy_v2(params=params)
@@ -3501,8 +3299,8 @@ class TestTickExitLong:
         }
         # Simulate: LONG opened during wide-spread tick (entry spread = 3.0)
         # entry_price=90, entry_spread=3.0 → actual fill at ask=93
-        # Exit tick: bid=91 > bb_upper=100? NO — but let's set up so the
-        # exit condition fires with a tight spread.
+        # Regression guard: no exit condition exists in V2; close_position is never called.
+        # Setup below confirms close_position is not called even when bid > bb_upper.
         # bb_upper=100, bid=101 > bb_upper → exit fires.
         # spread_exit=0.5 → old profit=(101-90-0.5)*0.5=5.25 > 0 → WRONG close
         # spread_entry=3.0 → new profit=(101-90-3.0)*0.5=4.0 > 0 → still closes (happy path)
@@ -3520,31 +3318,6 @@ class TestTickExitLong:
         strat._on_tick(tick)
 
         mock_ig.close_position.assert_not_called()
-
-    def test_long_exit_fires_when_move_covers_entry_spread(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """Long closed when price moved enough to cover the entry spread cost.
-
-        When price has moved sufficiently that profit is positive even after
-        accounting for the wide entry spread, the position should close.
-        """
-        params = make_params_v2(operation_mode="tick")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
-        )
-        # entry_price=90, entry_spread=3.0 → actual fill at ask=93
-        # bid_exit=110 > bb_upper=100, spread_exit=0.5
-        # profit=(110-90-3.0)*0.5=17*0.5=8.5>0 → CORRECT close
-        strat._long_positions = [
-            {"deal_id": "L1", "entry_price": 90.0, "entry_spread": 3.0, "size": 0.5}
-        ]
-        tick = {"bid": 110.0, "ofr": 110.5, "utm": 0}
-
-        strat._on_tick(tick)
-
-        mock_ig.close_position.assert_called_once_with("L1", "SELL", 0.5)
 
     def test_entry_spread_stored_in_long_position_on_tick_open(
         self, make_strategy_v2, make_params_v2
@@ -3571,160 +3344,6 @@ class TestTickExitLong:
         assert len(strat._long_positions) == 1
         pos = strat._long_positions[0]
         assert pos["entry_spread"] == 3.0
-
-
-# =========================================================================== #
-# Tick mode — exit short [REQ-7]                                                #
-# =========================================================================== #
-
-
-class TestTickExitShort:
-    """Short positions closed when bid < bb_lower and profit > 0 in tick mode [REQ-7]."""
-
-    def test_shorts_closed_when_bid_below_bb_lower_and_profit_positive(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """All shorts closed when bid < bb_lower and live spread profit > 0."""
-        params = make_params_v2(operation_mode="tick")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
-        )
-        # Short entered at 110; bid=90 < bb_lower=100; spread=1.0 → profit=(110-90-1)*0.5=9.5>0
-        strat._short_positions = [{"deal_id": "S1", "entry_price": 110.0, "size": 0.5}]
-        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
-
-        strat._on_tick(tick)
-
-        mock_ig.close_position.assert_called_once_with("S1", "BUY", 0.5)
-
-    def test_short_exit_suppressed_when_profit_not_positive(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """Short not closed when bid < bb_lower but profit <= 0."""
-        params = make_params_v2(operation_mode="tick")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
-        )
-        # Short at 90; bid=95 < bb_lower=100; spread=10 → profit=(90-95-10)*0.5 < 0
-        strat._short_positions = [{"deal_id": "S1", "entry_price": 90.0, "size": 0.5}]
-        tick = {"bid": 95.0, "ofr": 105.0, "utm": 0}  # ofr-bid=10
-
-        strat._on_tick(tick)
-
-        mock_ig.close_position.assert_not_called()
-
-
-# =========================================================================== #
-# Tick mode — close in-flight guards [REQ-10]                                  #
-# =========================================================================== #
-
-
-class TestTickCloseInFlightGuard:
-    """Close in-flight flags prevent duplicate REST close calls on back-to-back ticks [REQ-10]."""
-
-    def test_long_close_skipped_when_long_close_in_flight(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """When _tick_long_close_in_flight is True, long close is NOT attempted."""
-        params = make_params_v2(operation_mode="tick")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
-        )
-        # Long with positive profit when bid > bb_upper
-        strat._long_positions = [{"deal_id": "L1", "entry_price": 90.0, "size": 0.5}]
-        strat._tick_long_close_in_flight = True
-        tick = {"bid": 110.0, "ofr": 111.0, "utm": 0}  # bid > bb_upper=100
-
-        strat._on_tick(tick)
-
-        mock_ig.close_position.assert_not_called()
-
-    def test_short_close_skipped_when_short_close_in_flight(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """When _tick_short_close_in_flight is True, short close is NOT attempted."""
-        params = make_params_v2(operation_mode="tick")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
-        )
-        # Short with positive profit when bid < bb_lower
-        strat._short_positions = [{"deal_id": "S1", "entry_price": 110.0, "size": 0.5}]
-        strat._tick_short_close_in_flight = True
-        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}  # bid < bb_lower=100
-
-        strat._on_tick(tick)
-
-        mock_ig.close_position.assert_not_called()
-
-    def test_long_close_in_flight_flag_reset_after_success(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """_tick_long_close_in_flight is False after a successful close REST call."""
-        params = make_params_v2(operation_mode="tick")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
-        )
-        strat._long_positions = [{"deal_id": "L1", "entry_price": 90.0, "size": 0.5}]
-        tick = {"bid": 110.0, "ofr": 111.0, "utm": 0}
-
-        strat._on_tick(tick)
-
-        assert strat._tick_long_close_in_flight is False
-
-    def test_short_close_in_flight_flag_reset_after_success(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """_tick_short_close_in_flight is False after a successful close REST call."""
-        params = make_params_v2(operation_mode="tick")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
-        )
-        strat._short_positions = [{"deal_id": "S1", "entry_price": 110.0, "size": 0.5}]
-        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
-
-        strat._on_tick(tick)
-
-        assert strat._tick_short_close_in_flight is False
-
-    def test_long_close_in_flight_flag_reset_on_exception(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """_tick_long_close_in_flight is False even when close_position raises — finally fires."""
-        params = make_params_v2(operation_mode="tick")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
-        )
-        strat._long_positions = [{"deal_id": "L1", "entry_price": 90.0, "size": 0.5}]
-        mock_ig.close_position.side_effect = RuntimeError("close REST error")
-        tick = {"bid": 110.0, "ofr": 111.0, "utm": 0}
-
-        strat._on_tick(tick)
-
-        assert strat._tick_long_close_in_flight is False
-
-    def test_short_close_in_flight_flag_reset_on_exception(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """_tick_short_close_in_flight is False even when close_position raises — finally fires."""
-        params = make_params_v2(operation_mode="tick")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
-        )
-        strat._short_positions = [{"deal_id": "S1", "entry_price": 110.0, "size": 0.5}]
-        mock_ig.close_position.side_effect = RuntimeError("close REST error")
-        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
-
-        strat._on_tick(tick)
-
-        assert strat._tick_short_close_in_flight is False
 
 
 # --------------------------------------------------------------------------- #
@@ -4578,241 +4197,12 @@ class TestAccountStatusLogging:
 
 
 # =========================================================================== #
-# close_on_bb_cross feature flag (REQ-close-on-bb-cross)                      #
-# =========================================================================== #
-
-
-class TestCloseonBBCross:
-    """close_on_bb_cross=False disables BB-cross exits in candle and tick modes."""
-
-    # ---------------------------------------------------------------------- #
-    # Candle mode — long exit                                                 #
-    # ---------------------------------------------------------------------- #
-
-    def test_long_exit_fires_when_flag_true(self, make_strategy_v2, make_params_v2):
-        """With close_on_bb_cross=True, a profitable long is closed at BB upper."""
-        params = make_params_v2(close_on_bb_cross=True)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0}]
-        indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=105.0
-        )
-
-        strat._manage_longs(indicators)
-
-        mock_ig.close_position.assert_called_once_with("DEAL1", "SELL", 1.0)
-
-    def test_long_exit_blocked_when_flag_false(
-        self, make_strategy_v2, make_params_v2, caplog
-    ):
-        """With close_on_bb_cross=False, BB cross is detected but exit is skipped."""
-        import logging
-
-        params = make_params_v2(close_on_bb_cross=False)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0}]
-        indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=105.0
-        )
-
-        with caplog.at_level(logging.DEBUG, logger="strategies.RSIBollingerStrategyV2"):
-            strat._manage_longs(indicators)
-
-        mock_ig.close_position.assert_not_called()
-        assert any(
-            "BB cross exit skipped" in r.message for r in caplog.records
-        ), "Expected DEBUG log 'BB cross exit skipped (close_on_bb_cross=False)'"
-
-    # ---------------------------------------------------------------------- #
-    # Candle mode — short exit                                                #
-    # ---------------------------------------------------------------------- #
-
-    def test_short_exit_fires_when_flag_true(self, make_strategy_v2, make_params_v2):
-        """With close_on_bb_cross=True, a profitable short is closed at BB lower."""
-        params = make_params_v2(close_on_bb_cross=True)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._short_positions = [
-            {"deal_id": "DEAL2", "entry_price": 110.0, "size": 1.0}
-        ]
-        indicators = _make_indicators(
-            bb_upper=150.0, bb_lower=100.0, rsi=50.0, close=95.0
-        )
-
-        strat._manage_shorts(indicators)
-
-        mock_ig.close_position.assert_called_once_with("DEAL2", "BUY", 1.0)
-
-    def test_short_exit_blocked_when_flag_false(
-        self, make_strategy_v2, make_params_v2, caplog
-    ):
-        """With close_on_bb_cross=False, BB cross is detected but exit is skipped."""
-        import logging
-
-        params = make_params_v2(close_on_bb_cross=False)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._short_positions = [
-            {"deal_id": "DEAL2", "entry_price": 110.0, "size": 1.0}
-        ]
-        indicators = _make_indicators(
-            bb_upper=150.0, bb_lower=100.0, rsi=50.0, close=95.0
-        )
-
-        with caplog.at_level(logging.DEBUG, logger="strategies.RSIBollingerStrategyV2"):
-            strat._manage_shorts(indicators)
-
-        mock_ig.close_position.assert_not_called()
-        assert any(
-            "BB cross exit skipped" in r.message for r in caplog.records
-        ), "Expected DEBUG log 'BB cross exit skipped (close_on_bb_cross=False)'"
-
-    # ---------------------------------------------------------------------- #
-    # Tick mode — long exit                                                   #
-    # ---------------------------------------------------------------------- #
-
-    def test_tick_long_exit_fires_when_flag_true(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """With close_on_bb_cross=True, tick long exit closes profitable positions."""
-        params = make_params_v2(operation_mode="tick", close_on_bb_cross=True)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
-        )
-        strat._long_positions = [
-            {"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0, "entry_spread": 0.0}
-        ]
-        # bid > bb_upper → exit condition
-        tick = {"bid": 105.0, "ofr": 106.0, "utm": 0}
-
-        mock_ig.close_position.return_value = None
-        strat._on_tick(tick)
-
-        mock_ig.close_position.assert_called_once_with("DEAL1", "SELL", 1.0)
-
-    def test_tick_long_exit_blocked_when_flag_false(
-        self, make_strategy_v2, make_params_v2, caplog
-    ):
-        """With close_on_bb_cross=False, tick long exit is skipped with DEBUG log."""
-        import logging
-
-        params = make_params_v2(operation_mode="tick", close_on_bb_cross=False)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=100.0
-        )
-        strat._long_positions = [
-            {"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0, "entry_spread": 0.0}
-        ]
-        tick = {"bid": 105.0, "ofr": 106.0, "utm": 0}
-
-        with caplog.at_level(logging.DEBUG, logger="strategies.RSIBollingerStrategyV2"):
-            strat._on_tick(tick)
-
-        mock_ig.close_position.assert_not_called()
-        assert any(
-            "BB cross exit skipped" in r.message for r in caplog.records
-        ), "Expected DEBUG log 'BB cross exit skipped (close_on_bb_cross=False)'"
-
-    # ---------------------------------------------------------------------- #
-    # Tick mode — short exit                                                  #
-    # ---------------------------------------------------------------------- #
-
-    def test_tick_short_exit_fires_when_flag_true(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """With close_on_bb_cross=True, tick short exit closes profitable positions."""
-        params = make_params_v2(operation_mode="tick", close_on_bb_cross=True)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
-        )
-        strat._short_positions = [
-            {"deal_id": "DEAL2", "entry_price": 110.0, "size": 1.0}
-        ]
-        # bid < bb_lower → exit condition
-        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
-
-        mock_ig.close_position.return_value = None
-        strat._on_tick(tick)
-
-        mock_ig.close_position.assert_called_once_with("DEAL2", "BUY", 1.0)
-
-    def test_tick_short_exit_blocked_when_flag_false(
-        self, make_strategy_v2, make_params_v2, caplog
-    ):
-        """With close_on_bb_cross=False, tick short exit is skipped with DEBUG log."""
-        import logging
-
-        params = make_params_v2(operation_mode="tick", close_on_bb_cross=False)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._cached_indicators = _make_indicators(
-            bb_upper=200.0, bb_lower=100.0, rsi=50.0, close=100.0
-        )
-        strat._short_positions = [
-            {"deal_id": "DEAL2", "entry_price": 110.0, "size": 1.0}
-        ]
-        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
-
-        with caplog.at_level(logging.DEBUG, logger="strategies.RSIBollingerStrategyV2"):
-            strat._on_tick(tick)
-
-        mock_ig.close_position.assert_not_called()
-        assert any(
-            "BB cross exit skipped" in r.message for r in caplog.records
-        ), "Expected DEBUG log 'BB cross exit skipped (close_on_bb_cross=False)'"
-
-    # ---------------------------------------------------------------------- #
-    # Hot-reload: close_on_bb_cross is hot-safe                               #
-    # ---------------------------------------------------------------------- #
-
-    def test_hot_reload_enables_exits_when_flag_changes_false_to_true(
-        self, make_strategy_v2, make_params_v2, tmp_path
-    ):
-        """Hot-reload from close_on_bb_cross=False to True causes exits to fire."""
-        import time
-
-        # Write initial params JSON with close_on_bb_cross=False
-        base = dict(_HOT_RELOAD_BASE_PARAMS)
-        base["close_on_bb_cross"] = False
-        params_file = tmp_path / "v2.json"
-        params_file.write_text(json.dumps(base), encoding="utf-8")
-
-        params = make_params_v2(close_on_bb_cross=False, operation_mode="candle")
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        strat._params_path = str(params_file)
-        strat._params_mtime = params_file.stat().st_mtime
-
-        # Confirm exits are blocked before reload
-        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0}]
-        indicators = _make_indicators(
-            bb_upper=100.0, bb_lower=0.0, rsi=50.0, close=105.0
-        )
-        strat._manage_longs(indicators)
-        mock_ig.close_position.assert_not_called()
-
-        # Update JSON to enable the flag and force mtime change
-        base["close_on_bb_cross"] = True
-        params_file.write_text(json.dumps(base), encoding="utf-8")
-        new_mtime = strat._params_mtime + 1
-        os.utime(str(params_file), (new_mtime, new_mtime))
-
-        strat._reload_params_if_changed()
-
-        assert strat.params.close_on_bb_cross is True
-
-        # Now exits should fire
-        strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0}]
-        strat._manage_longs(indicators)
-        mock_ig.close_position.assert_called_once_with("DEAL1", "SELL", 1.0)
-
-
-# =========================================================================== #
 # Dynamic close mode (close-mode change)                                       #
 # =========================================================================== #
 
 
 class TestCloseModeSchema:
-    """close_mode, atr_period, atr_multiplier must be in _PARAMS_SCHEMA (REQ-9)."""
+    """close_mode, atr_period, atr_multiplier_tp, atr_multiplier_sl must be in _PARAMS_SCHEMA (REQ-9)."""
 
     def test_close_mode_in_params_schema(self):
         """_PARAMS_SCHEMA must include close_mode."""
@@ -4822,11 +4212,17 @@ class TestCloseModeSchema:
         """_PARAMS_SCHEMA must include atr_period."""
         assert "atr_period" in _PARAMS_SCHEMA, "atr_period missing from _PARAMS_SCHEMA"
 
-    def test_atr_multiplier_in_params_schema(self):
-        """_PARAMS_SCHEMA must include atr_multiplier."""
+    def test_atr_multiplier_tp_in_params_schema(self):
+        """_PARAMS_SCHEMA must include atr_multiplier_tp."""
         assert (
-            "atr_multiplier" in _PARAMS_SCHEMA
-        ), "atr_multiplier missing from _PARAMS_SCHEMA"
+            "atr_multiplier_tp" in _PARAMS_SCHEMA
+        ), "atr_multiplier_tp missing from _PARAMS_SCHEMA"
+
+    def test_atr_multiplier_sl_in_params_schema(self):
+        """_PARAMS_SCHEMA must include atr_multiplier_sl."""
+        assert (
+            "atr_multiplier_sl" in _PARAMS_SCHEMA
+        ), "atr_multiplier_sl missing from _PARAMS_SCHEMA"
 
     def test_close_mode_schema_type_is_str(self):
         """close_mode schema type must be str."""
@@ -4836,9 +4232,13 @@ class TestCloseModeSchema:
         """atr_period schema type must be int."""
         assert _PARAMS_SCHEMA.get("atr_period") is int
 
-    def test_atr_multiplier_schema_type_is_float(self):
-        """atr_multiplier schema type must be float."""
-        assert _PARAMS_SCHEMA.get("atr_multiplier") is float
+    def test_atr_multiplier_tp_schema_type_is_float(self):
+        """atr_multiplier_tp schema type must be float."""
+        assert _PARAMS_SCHEMA.get("atr_multiplier_tp") is float
+
+    def test_atr_multiplier_sl_schema_type_is_float(self):
+        """atr_multiplier_sl schema type must be float."""
+        assert _PARAMS_SCHEMA.get("atr_multiplier_sl") is float
 
     def test_invalid_close_mode_value_raises_value_error(self, tmp_path):
         """close_mode='trailing' must be rejected — only 'fixed' and 'dynamic' are valid (REQ-9)."""
@@ -4898,13 +4298,18 @@ class TestGetCloseParamsDynamic:
     def test_dynamic_mode_returns_rounded_atr_multiplied_distance(
         self, make_strategy_v2, make_params_v2
     ):
-        """Dynamic mode: returns (round(atr * multiplier), round(atr * multiplier))."""
-        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        """Dynamic mode: TP and SL distances are independent — each uses its own multiplier."""
+        params = make_params_v2(
+            close_mode="dynamic",
+            atr_period=14,
+            atr_multiplier_tp=1.0,
+            atr_multiplier_sl=2.0,
+        )
         strat, _, _ = make_strategy_v2(params=params)
-        # ATR=20.0, multiplier=1.5 → dist = round(30.0) = 30
+        # ATR=20.0, tp_mult=1.0 → limit=20; sl_mult=2.0 → stop=40
         result = strat._get_close_params({"atr": 20.0})
 
-        assert result == (30, 30)
+        assert result == (20, 40)
 
     def test_dynamic_mode_zero_atr_returns_none(
         self, make_strategy_v2, make_params_v2, caplog
@@ -4912,7 +4317,12 @@ class TestGetCloseParamsDynamic:
         """Dynamic mode: ATR=0 → returns None and logs ERROR (REQ-4)."""
         import logging
 
-        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        params = make_params_v2(
+            close_mode="dynamic",
+            atr_period=14,
+            atr_multiplier_tp=1.0,
+            atr_multiplier_sl=1.5,
+        )
         strat, _, _ = make_strategy_v2(params=params)
 
         with caplog.at_level(logging.ERROR):
@@ -4927,7 +4337,12 @@ class TestGetCloseParamsDynamic:
         """Dynamic mode: ATR=NaN → treated as <= 0, returns None and logs ERROR (REQ-4)."""
         import logging
 
-        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        params = make_params_v2(
+            close_mode="dynamic",
+            atr_period=14,
+            atr_multiplier_tp=1.0,
+            atr_multiplier_sl=1.5,
+        )
         strat, _, _ = make_strategy_v2(params=params)
 
         with caplog.at_level(logging.ERROR):
@@ -4942,7 +4357,12 @@ class TestGetCloseParamsDynamic:
         """Dynamic mode: missing 'atr' key defaults to 0.0 → returns None (REQ-4)."""
         import logging
 
-        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        params = make_params_v2(
+            close_mode="dynamic",
+            atr_period=14,
+            atr_multiplier_tp=1.0,
+            atr_multiplier_sl=1.5,
+        )
         strat, _, _ = make_strategy_v2(params=params)
 
         with caplog.at_level(logging.ERROR):
@@ -4956,14 +4376,19 @@ class TestGetCloseParamsDynamic:
         """Dynamic mode: dist < 5 logs WARNING but still returns the tuple (REQ-8)."""
         import logging
 
-        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=0.1)
+        params = make_params_v2(
+            close_mode="dynamic",
+            atr_period=14,
+            atr_multiplier_tp=1.0,
+            atr_multiplier_sl=0.1,
+        )
         strat, _, _ = make_strategy_v2(params=params)
-        # ATR=20.0, multiplier=0.1 → dist = round(2.0) = 2 → WARNING
+        # ATR=20.0, sl_mult=0.1 → stop_dist = round(2.0) = 2 → WARNING
         with caplog.at_level(logging.WARNING):
             result = strat._get_close_params({"atr": 20.0})
 
         assert result is not None
-        assert result == (2, 2)
+        assert result == (20, 2)
         assert any(r.levelno == logging.WARNING for r in caplog.records)
 
 
@@ -4999,14 +4424,19 @@ class TestManageLongsDynamicMode:
     def test_dynamic_mode_long_entry_uses_atr_distance(
         self, make_strategy_v2, make_params_v2
     ):
-        """Dynamic mode: open_position called with limit=dist, stop=dist (ATR*multiplier)."""
-        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        """Dynamic mode: open_position called with limit=tp_dist, stop=sl_dist (independent multipliers)."""
+        params = make_params_v2(
+            close_mode="dynamic",
+            atr_period=14,
+            atr_multiplier_tp=1.0,
+            atr_multiplier_sl=2.0,
+        )
         strat, mock_ig, _ = make_strategy_v2(params=params)
         mock_ig.open_position.return_value = {
             "dealStatus": "ACCEPTED",
             "dealId": "DEAL_DYN",
         }
-        # ATR=20.0, multiplier=1.5 → dist=30
+        # ATR=20.0, tp_mult=1.0 → limit=20; sl_mult=2.0 → stop=40
         indicators = _make_indicators(
             bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0, atr=20.0
         )
@@ -5014,14 +4444,19 @@ class TestManageLongsDynamicMode:
         strat._manage_longs(indicators)
 
         call_kwargs = mock_ig.open_position.call_args.kwargs
-        assert call_kwargs["limit"] == 30
-        assert call_kwargs["stop"] == 30
+        assert call_kwargs["limit"] == 20
+        assert call_kwargs["stop"] == 40
 
     def test_dynamic_mode_zero_atr_skips_long_entry(
         self, make_strategy_v2, make_params_v2
     ):
         """Dynamic mode: ATR=0 → open_position NOT called (REQ-4)."""
-        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        params = make_params_v2(
+            close_mode="dynamic",
+            atr_period=14,
+            atr_multiplier_tp=1.0,
+            atr_multiplier_sl=1.5,
+        )
         strat, mock_ig, _ = make_strategy_v2(params=params)
         indicators = _make_indicators(
             bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0, atr=0.0
@@ -5038,14 +4473,19 @@ class TestManageShortsDynamicMode:
     def test_dynamic_mode_short_entry_uses_atr_distance(
         self, make_strategy_v2, make_params_v2
     ):
-        """Dynamic mode: open_position called with limit=dist, stop=dist for shorts."""
-        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        """Dynamic mode: open_position called with limit=tp_dist, stop=sl_dist for shorts (independent multipliers)."""
+        params = make_params_v2(
+            close_mode="dynamic",
+            atr_period=14,
+            atr_multiplier_tp=1.0,
+            atr_multiplier_sl=2.0,
+        )
         strat, mock_ig, _ = make_strategy_v2(params=params)
         mock_ig.open_position.return_value = {
             "dealStatus": "ACCEPTED",
             "dealId": "DEAL_SHORT_DYN",
         }
-        # ATR=20.0, multiplier=1.5 → dist=30
+        # ATR=20.0, tp_mult=1.0 → limit=20; sl_mult=2.0 → stop=40
         indicators = _make_indicators(
             bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0, atr=20.0
         )
@@ -5053,14 +4493,19 @@ class TestManageShortsDynamicMode:
         strat._manage_shorts(indicators)
 
         call_kwargs = mock_ig.open_position.call_args.kwargs
-        assert call_kwargs["limit"] == 30
-        assert call_kwargs["stop"] == 30
+        assert call_kwargs["limit"] == 20
+        assert call_kwargs["stop"] == 40
 
     def test_dynamic_mode_zero_atr_skips_short_entry(
         self, make_strategy_v2, make_params_v2
     ):
         """Dynamic mode: ATR=0 → short open_position NOT called (REQ-4)."""
-        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        params = make_params_v2(
+            close_mode="dynamic",
+            atr_period=14,
+            atr_multiplier_tp=1.0,
+            atr_multiplier_sl=1.5,
+        )
         strat, mock_ig, _ = make_strategy_v2(params=params)
         indicators = _make_indicators(
             bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0, atr=0.0
@@ -5075,12 +4520,13 @@ class TestTickTryOpenDynamicMode:
     """_tick_try_open in dynamic mode reads ATR from _cached_indicators (REQ-3)."""
 
     def test_tick_mode_dynamic_uses_cached_atr(self, make_strategy_v2, make_params_v2):
-        """Tick mode + dynamic: open_position called with limit=30, stop=30 when ATR=20."""
+        """Tick mode + dynamic: open_position called with independent TP/SL distances from ATR."""
         params = make_params_v2(
             operation_mode="tick",
             close_mode="dynamic",
             atr_period=14,
-            atr_multiplier=1.5,
+            atr_multiplier_tp=1.0,
+            atr_multiplier_sl=2.0,
         )
         strat, mock_ig, _ = make_strategy_v2(params=params)
         mock_ig.open_position.return_value = {
@@ -5094,8 +4540,9 @@ class TestTickTryOpenDynamicMode:
         strat._tick_try_open("BUY", bid=95.0, spread=1.0)
 
         call_kwargs = mock_ig.open_position.call_args.kwargs
-        assert call_kwargs["limit"] == 30
-        assert call_kwargs["stop"] == 30
+        # ATR=20, tp_mult=1.0 → limit=20; sl_mult=2.0 → stop=40
+        assert call_kwargs["limit"] == 20
+        assert call_kwargs["stop"] == 40
 
     def test_tick_mode_dynamic_zero_atr_skips_open(
         self, make_strategy_v2, make_params_v2
@@ -5105,7 +4552,8 @@ class TestTickTryOpenDynamicMode:
             operation_mode="tick",
             close_mode="dynamic",
             atr_period=14,
-            atr_multiplier=1.5,
+            atr_multiplier_tp=1.0,
+            atr_multiplier_sl=1.5,
         )
         strat, mock_ig, _ = make_strategy_v2(params=params)
         strat._cached_indicators = _make_indicators(

@@ -46,10 +46,10 @@ _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
     "min_dist_between_entries_ticks": float,
     "take_profit_ticks": float,
     "stop_loss_ticks": (int, float),
-    "close_on_bb_cross": bool,
     "close_mode": str,
     "atr_period": int,
-    "atr_multiplier": float,
+    "atr_multiplier_tp": float,
+    "atr_multiplier_sl": float,
 }
 
 
@@ -169,8 +169,8 @@ class RSIBollingerStrategyV2:
 
     Consumes closed 5-minute candles from a queue (delivered by IGStreamingClient).
     Maintains independent long and short position grids. Entry signals are
-    BB + RSI crossovers; exits are opposite-band crossovers with per-position
-    spread-aware profit check. All positions use flat contract_size.
+    BB + RSI crossovers; exits are handled exclusively by broker TP/SL orders
+    set at position open. All positions use flat contract_size.
 
     Attributes:
         params: Configuration object loaded from strategies/RSIBollingerStrategyV2.json.
@@ -191,9 +191,9 @@ class RSIBollingerStrategyV2:
             "stop_loss_ticks",
             "contract_size",
             "bb_std",
-            "close_on_bb_cross",
             "close_mode",
-            "atr_multiplier",
+            "atr_multiplier_tp",
+            "atr_multiplier_sl",
         }
     )
 
@@ -270,7 +270,7 @@ class RSIBollingerStrategyV2:
         )
 
         # Spread is calculated dynamically from each candle's OFR_CLOSE - BID_CLOSE.
-        # None until the first candle is processed; profit checks use 0.0 as fallback.
+        # Stored for logging/debugging; None until the first candle is processed.
         self._current_spread: float | None = None
 
         # Rolling window of closed candles — minimum length for indicator calculation
@@ -308,8 +308,6 @@ class RSIBollingerStrategyV2:
         # finally block — so it is always False after _on_tick returns.
         self._tick_long_in_flight: bool = False
         self._tick_short_in_flight: bool = False
-        self._tick_long_close_in_flight: bool = False
-        self._tick_short_close_in_flight: bool = False
 
         # Timestamp of the last REST candle loaded during warm-up.
         # Used by _on_candle to discard overlapping streaming candles.
@@ -433,12 +431,13 @@ class RSIBollingerStrategyV2:
                     f"ATR unavailable in dynamic mode (atr={atr!r}) — skipping open"
                 )
                 return None
-            dist = round(self.params.atr_multiplier * atr)
-            if dist < 5:
+            limit_dist = round(self.params.atr_multiplier_tp * atr)
+            stop_dist = round(self.params.atr_multiplier_sl * atr)
+            if stop_dist < 5:
                 logger.warning(
-                    f"ATR-derived distance {dist} is below min spread guard of 5 points"
+                    f"ATR-derived stop distance {stop_dist} is below min spread guard of 5 points"
                 )
-            return (dist, dist)
+            return (limit_dist, stop_dist)
         # Fixed mode — pass through configured ticks
         return (self.params.take_profit_ticks, self.params.stop_loss_ticks)
 
@@ -449,9 +448,9 @@ class RSIBollingerStrategyV2:
     def _update_spread_from_candle(self, candle: dict) -> None:
         """Update the current spread from a candle's spread field.
 
-        The candle's ``spread`` key (OFR_CLOSE - BID_CLOSE) represents the
-        live market spread at candle close. Calling this before evaluating
-        exit conditions ensures profit calculations use the most recent spread.
+        Records the bid/ask spread (OFR_CLOSE - BID_CLOSE) from the candle
+        for debug logging. Not used for broker-level exit decisions — exits
+        are handled exclusively by broker TP/SL orders.
 
         Args:
             candle: OHLC candle dict delivered by IGStreamingClient. Must
@@ -568,14 +567,14 @@ class RSIBollingerStrategyV2:
     # ---------------------------------------------------------------------- #
 
     def _manage_longs(self, indicators: dict) -> None:
-        """Evaluate long exits then long entries using the latest indicators.
+        """Evaluate long entry conditions using the latest indicators.
 
-        Exit condition: price STRICTLY > BB_upper AND profit after spread > 0.
-            (price == BB_upper does NOT trigger exit)
         Entry condition: price STRICTLY < BB_lower AND RSI STRICTLY < rsi_oversold
                          AND longs < max_long_positions
                          AND distance from last entry >= min_dist_between_entries_ticks.
             (price == BB_lower does NOT trigger entry)
+
+        Exits are handled exclusively by broker TP/SL orders set at position open.
 
         Args:
             indicators: Dict with bb_upper, bb_lower, rsi, close from
@@ -586,61 +585,13 @@ class RSIBollingerStrategyV2:
         bb_lower = indicators["bb_lower"]
         rsi = indicators["rsi"]
 
-        # --- EXITS ---
-        # Exit condition: price STRICTLY > bb_upper AND profit after spread > 0.
         spread = self._current_spread if self._current_spread is not None else 0.0
         logger.debug(
             f"_manage_longs: close={close:.2f} bb_lower={bb_lower:.2f} "
             f"bb_upper={bb_upper:.2f} rsi={rsi:.2f} "
             f"spread={spread:.4f} open_longs={len(self._long_positions)}"
         )
-        if not self.params.close_on_bb_cross:
-            if close > bb_upper and self._long_positions:
-                logger.debug("BB cross exit skipped (close_on_bb_cross=False)")
-        else:
-            if close > bb_upper and self._long_positions:
-                logger.debug(
-                    f"Long exit condition met: close={close:.2f} > bb_upper={bb_upper:.2f} "
-                    f"evaluating {len(self._long_positions)} position(s)"
-                )
-                to_close = []  # list of (pos, profit) tuples — profit computed once
-                to_keep = []
-                for pos in self._long_positions:
-                    profit = _long_profit(
-                        close, pos["entry_price"], spread, pos["size"]
-                    )
-                    logger.debug(
-                        f"Long exit eval: deal_id={pos['deal_id']} "
-                        f"entry={pos['entry_price']:.2f} close={close:.2f} "
-                        f"spread={spread:.4f} size={pos['size']} profit={profit:.2f}"
-                    )
-                    if profit > 0:
-                        to_close.append((pos, profit))
-                    else:
-                        logger.debug(
-                            f"Long {pos['deal_id']} not profitable after spread — keeping"
-                        )
-                        to_keep.append(pos)
 
-                for pos, profit in to_close:
-                    closed_ok = False
-                    try:
-                        self.ig.close_position(pos["deal_id"], "SELL", pos["size"])
-                        closed_ok = True
-                    except Exception as e:
-                        logger.error(f"Failed to close long {pos['deal_id']}: {e}")
-                        pos["needs_reconciliation"] = True
-                        to_keep.append(pos)
-
-                    if closed_ok:
-                        logger.info(
-                            f"Closed LONG {pos['deal_id']} @ {close:.2f} "
-                            f"(entry={pos['entry_price']:.2f}, profit={profit:.2f})"
-                        )
-
-                self._long_positions = to_keep
-
-        # --- ENTRIES ---
         if not self._is_long_entry_allowed():
             logger.info("[GUARD] Long entry skipped — Friday after 14:00 NY")
             return
@@ -677,7 +628,8 @@ class RSIBollingerStrategyV2:
         size = self.params.contract_size
         logger.debug(
             f"Long entry signal: close={close:.2f} bb_lower={bb_lower:.2f} "
-            f"rsi={rsi:.2f} size={size} tp_dist={limit_distance} sl_dist={stop_distance} "
+            f"rsi={rsi:.2f} ATR={indicators['atr']:.2f} "
+            f"limit={limit_distance} stop={stop_distance} size={size} "
             f"grid_level={len(self._long_positions) + 1}/{self.params.max_long_positions}"
         )
 
@@ -706,7 +658,7 @@ class RSIBollingerStrategyV2:
                 )
                 logger.info(
                     f"Opened LONG {deal_id} @ {close:.2f} | "
-                    f"size={size} | TP dist={limit_distance} | SL dist={stop_distance}"
+                    f"size={size} | ATR={indicators['atr']:.2f} | TP dist={limit_distance} | SL dist={stop_distance}"
                 )
         except Exception as e:
             logger.error(f"Failed to open long position: {e}")
@@ -716,14 +668,14 @@ class RSIBollingerStrategyV2:
     # ---------------------------------------------------------------------- #
 
     def _manage_shorts(self, indicators: dict) -> None:
-        """Evaluate short exits then short entries using the latest indicators.
+        """Evaluate short entry conditions using the latest indicators.
 
-        Exit condition: price STRICTLY < BB_lower AND profit after spread > 0.
-            (price == BB_lower does NOT trigger exit)
         Entry condition: price STRICTLY > BB_upper AND RSI STRICTLY > rsi_overbought
                          AND shorts < max_short_positions
                          AND distance from last entry >= min_dist_between_entries_ticks.
             (price == BB_upper does NOT trigger entry)
+
+        Exits are handled exclusively by broker TP/SL orders set at position open.
 
         Args:
             indicators: Dict with bb_upper, bb_lower, rsi, close from
@@ -734,61 +686,13 @@ class RSIBollingerStrategyV2:
         bb_lower = indicators["bb_lower"]
         rsi = indicators["rsi"]
 
-        # --- EXITS ---
-        # Exit condition: price STRICTLY < bb_lower AND profit after spread > 0.
         spread = self._current_spread if self._current_spread is not None else 0.0
         logger.debug(
             f"_manage_shorts: close={close:.2f} bb_lower={bb_lower:.2f} "
             f"bb_upper={bb_upper:.2f} rsi={rsi:.2f} "
             f"spread={spread:.4f} open_shorts={len(self._short_positions)}"
         )
-        if not self.params.close_on_bb_cross:
-            if close < bb_lower and self._short_positions:
-                logger.debug("BB cross exit skipped (close_on_bb_cross=False)")
-        else:
-            if close < bb_lower and self._short_positions:
-                logger.debug(
-                    f"Short exit condition met: close={close:.2f} < bb_lower={bb_lower:.2f} "
-                    f"evaluating {len(self._short_positions)} position(s)"
-                )
-                to_close = []  # list of (pos, profit) tuples — profit computed once
-                to_keep = []
-                for pos in self._short_positions:
-                    profit = _short_profit(
-                        close, pos["entry_price"], spread, pos["size"]
-                    )
-                    logger.debug(
-                        f"Short exit eval: deal_id={pos['deal_id']} "
-                        f"entry={pos['entry_price']:.2f} close={close:.2f} "
-                        f"spread={spread:.4f} size={pos['size']} profit={profit:.2f}"
-                    )
-                    if profit > 0:
-                        to_close.append((pos, profit))
-                    else:
-                        logger.debug(
-                            f"Short {pos['deal_id']} not profitable after spread — keeping"
-                        )
-                        to_keep.append(pos)
 
-                for pos, profit in to_close:
-                    closed_ok = False
-                    try:
-                        self.ig.close_position(pos["deal_id"], "BUY", pos["size"])
-                        closed_ok = True
-                    except Exception as e:
-                        logger.error(f"Failed to close short {pos['deal_id']}: {e}")
-                        pos["needs_reconciliation"] = True
-                        to_keep.append(pos)
-
-                    if closed_ok:
-                        logger.info(
-                            f"Closed SHORT {pos['deal_id']} @ {close:.2f} "
-                            f"(entry={pos['entry_price']:.2f}, profit={profit:.2f})"
-                        )
-
-                self._short_positions = to_keep
-
-        # --- ENTRIES ---
         if close <= bb_upper or rsi <= self.params.rsi_overbought:
             logger.debug(
                 f"Short entry skipped — signal not met: "
@@ -822,7 +726,8 @@ class RSIBollingerStrategyV2:
         size = self.params.contract_size
         logger.debug(
             f"Short entry signal: close={close:.2f} bb_upper={bb_upper:.2f} "
-            f"rsi={rsi:.2f} size={size} tp_dist={limit_distance} sl_dist={stop_distance} "
+            f"rsi={rsi:.2f} ATR={indicators['atr']:.2f} "
+            f"limit={limit_distance} stop={stop_distance} size={size} "
             f"grid_level={len(self._short_positions) + 1}/{self.params.max_short_positions}"
         )
 
@@ -851,7 +756,7 @@ class RSIBollingerStrategyV2:
                 )
                 logger.info(
                     f"Opened SHORT {deal_id} @ {close:.2f} | "
-                    f"size={size} | TP dist={limit_distance} | SL dist={stop_distance}"
+                    f"size={size} | ATR={indicators['atr']:.2f} | TP dist={limit_distance} | SL dist={stop_distance}"
                 )
         except Exception as e:
             logger.error(f"Failed to open short position: {e}")
@@ -863,22 +768,24 @@ class RSIBollingerStrategyV2:
     def _reconcile_positions(self) -> None:
         """Reconcile local position grids against the broker's open positions.
 
-        Called before entry evaluation whenever any local position is flagged
-        ``needs_reconciliation=True`` (set after a failed close_position call).
-        Fetches the current open positions from the broker and performs two
-        passes:
+        Runs unconditionally on every candle close. Detects positions closed by
+        the broker (via TP/SL) and removes them from local grids. Also seeds any
+        broker position (filtered by ``self.epic``) whose ``dealId`` is absent
+        from both local grids — bidirectional sync.
+
+        Performs two passes:
 
         1. **Removal pass** — removes local positions no longer present at the
-           broker (phantom positions closed by TP or manually). Clears the
+           broker (phantom positions closed by TP/SL or manually). Clears the
            ``needs_reconciliation`` flag on positions that are still open.
         2. **Seed pass** — appends any broker position (filtered by
            ``self.epic``) whose ``dealId`` is absent from both local grids.
            This ensures positions opened after startup are not invisible to the
            strategy. Uses the same dict format as ``_seed_positions_from_broker``.
 
-        Designed to be simple — one broker API call per reconciliation trigger,
-        no retries, no partial state. If the broker call itself fails, the
-        positions remain flagged and reconciliation is retried on the next candle.
+        Designed to be simple — one broker API call per candle, no retries, no
+        partial state. If the broker call itself fails, reconciliation is skipped
+        for that candle and retried on the next.
         """
         logger.debug(
             f"Reconciliation triggered: "
@@ -1073,8 +980,7 @@ class RSIBollingerStrategyV2:
 
         Called from the worker thread after dequeuing a candle from the
         streaming client's delivery mechanism. The candle's spread field
-        (OFR_CLOSE - BID_CLOSE) is recorded first so that exit profit checks
-        always use the most recent live spread.
+        (OFR_CLOSE - BID_CLOSE) is recorded for debug logging.
 
         Malformed candles (missing required keys) are logged and skipped
         explicitly rather than propagating a KeyError.
@@ -1129,7 +1035,7 @@ class RSIBollingerStrategyV2:
         )
 
         # In tick mode, cache the indicators so _on_tick can evaluate signals
-        # from live bid/ofr prices, then return early — tick handler owns entries/exits.
+        # from live bid/ofr prices, then return early — tick handler owns entries.
         if self._operation_mode == "tick":
             self._cached_indicators = indicators
             self.log_account_status()
@@ -1261,16 +1167,15 @@ class RSIBollingerStrategyV2:
         finally block — guaranteeing the flag is always False after this
         method returns, even when the REST call raises.
 
-        For LONG (BUY) positions, ``spread`` is stored as ``entry_spread`` in
-        the position dict so that profit checks at exit time use the spread that
-        was active at open (i.e. the actual ask cost), not the potentially
-        narrower spread at the exit tick.
+        Opens a position via the broker and records ``entry_spread`` (for
+        LONG/BUY positions) for informational purposes only — it is not
+        used for exit decisions (exits are handled by broker TP/SL orders).
 
         Args:
             side: Trade direction — 'BUY' (long) or 'SELL' (short).
             bid: Current bid price used as the entry reference price.
-            spread: Live spread (ofr - bid) at the open tick. Stored for LONG
-                profit checks to avoid premature exits when spread narrows.
+            spread: Live spread (ofr - bid) at the open tick. Recorded for
+                informational logging.
         """
         if side == "BUY":
             self._tick_long_in_flight = True
@@ -1306,11 +1211,14 @@ class RSIBollingerStrategyV2:
                     "size": self.params.contract_size,
                 }
                 if side == "BUY":
-                    # Store spread at open so LONG profit check uses the actual
-                    # ask cost (bid + spread_at_open), not the exit tick spread.
+                    # Record spread at open for informational logging.
                     pos["entry_spread"] = spread
                 positions.append(pos)
-                logger.info(f"Tick: opened {side} {deal_id} @ bid={bid:.2f}")
+                logger.info(
+                    f"Tick: opened {side} {deal_id} @ bid={bid:.2f} "
+                    f"ATR={self._cached_indicators.get('atr', 0.0):.2f} "
+                    f"limit={limit} stop={stop}"
+                )
         except Exception as e:
             logger.error(f"Tick: failed to open {side}: {e}")
         finally:
@@ -1319,71 +1227,12 @@ class RSIBollingerStrategyV2:
             else:
                 self._tick_short_in_flight = False
 
-    def _tick_close_positions(
-        self,
-        positions: list,
-        close_side: str,
-        bid: float,
-        spread: float,
-        direction: str,
-    ) -> list:
-        """Close profitable positions and return those that should remain open.
-
-        For LONG positions, profit is calculated using the spread stored at
-        entry time (``pos["entry_spread"]``) rather than the current exit-tick
-        spread. This prevents premature closes when the spread narrows between
-        open and close — a common pattern in mean-reversion where entries fire
-        during volatile (wide-spread) spikes and exits fire during calmer
-        (tight-spread) recovery periods.
-
-        For SHORT positions, the exit-tick spread is correct because we pay
-        the ask price when buying back to close a short.
-
-        Args:
-            positions: Current position list (longs or shorts).
-            close_side: REST close direction — 'SELL' for longs, 'BUY' for shorts.
-            bid: Current bid price.
-            spread: Live spread (ofr - bid) from the tick. Used for SHORT profit
-                checks; LONGs use their stored ``entry_spread`` instead.
-            direction: 'long' or 'short' — used for profit calculation and logging.
-
-        Returns:
-            List of positions that were not closed (kept open).
-        """
-        profit_fn = _long_profit if direction == "long" else _short_profit
-        to_close = []
-        to_keep = []
-        for pos in positions:
-            if direction == "long":
-                # Use the spread captured at entry so the profit check reflects
-                # the actual ask cost paid at open, not the current exit spread.
-                effective_spread = pos.get("entry_spread", spread)
-            else:
-                effective_spread = spread
-            profit = profit_fn(bid, pos["entry_price"], effective_spread, pos["size"])
-            if profit > 0:
-                to_close.append(pos)
-            else:
-                to_keep.append(pos)
-        for pos in to_close:
-            try:
-                self.ig.close_position(pos["deal_id"], close_side, pos["size"])
-                logger.info(
-                    f"Tick: closed {direction.upper()} {pos['deal_id']} @ bid={bid:.2f}"
-                )
-            except Exception as e:
-                logger.error(f"Tick: failed to close {direction} {pos['deal_id']}: {e}")
-                pos["needs_reconciliation"] = True
-                to_keep.append(pos)
-        return to_keep
-
     def _on_tick(self, tick: dict) -> None:
-        """Evaluate entry and exit signals from a live tick in tick mode.
+        """Evaluate entry signals from a live tick in tick mode.
 
         Called from the worker thread via the dispatcher. Reads cached indicators
         (set by the last _on_candle call) and compares live bid/ofr prices to the
-        Bollinger Band levels. Delegates REST calls to _tick_try_open() and exit
-        logic to _tick_close_positions() so this method stays under 50 lines.
+        Bollinger Band levels. Delegates REST open calls to _tick_try_open().
 
         Warmup gate: silently returns when _cached_indicators is None (no candle
         has been processed yet).
@@ -1419,66 +1268,6 @@ class RSIBollingerStrategyV2:
             len(self._long_positions),
             len(self._short_positions),
         )
-
-        # --- Long exit ---
-        if not self.params.close_on_bb_cross:
-            if bid > bb_upper and self._long_positions:
-                logger.debug("BB cross exit skipped (close_on_bb_cross=False)")
-        else:
-            if (
-                not self._tick_long_close_in_flight
-                and bid > bb_upper
-                and self._long_positions
-            ):
-                logger.debug(
-                    "tick long_exit: triggered bid=%.5f > bb_upper=%.5f positions=%d",
-                    bid,
-                    bb_upper,
-                    len(self._long_positions),
-                )
-                self._tick_long_close_in_flight = True
-                try:
-                    self._long_positions = self._tick_close_positions(
-                        self._long_positions, "SELL", bid, spread, "long"
-                    )
-                finally:
-                    self._tick_long_close_in_flight = False
-            elif (
-                self._tick_long_close_in_flight
-                and bid > bb_upper
-                and self._long_positions
-            ):
-                logger.debug("tick long_exit: skipped (in_flight) bid=%.5f", bid)
-
-        # --- Short exit ---
-        if not self.params.close_on_bb_cross:
-            if bid < bb_lower and self._short_positions:
-                logger.debug("BB cross exit skipped (close_on_bb_cross=False)")
-        else:
-            if (
-                not self._tick_short_close_in_flight
-                and bid < bb_lower
-                and self._short_positions
-            ):
-                logger.debug(
-                    "tick short_exit: triggered bid=%.5f < bb_lower=%.5f positions=%d",
-                    bid,
-                    bb_lower,
-                    len(self._short_positions),
-                )
-                self._tick_short_close_in_flight = True
-                try:
-                    self._short_positions = self._tick_close_positions(
-                        self._short_positions, "BUY", bid, spread, "short"
-                    )
-                finally:
-                    self._tick_short_close_in_flight = False
-            elif (
-                self._tick_short_close_in_flight
-                and bid < bb_lower
-                and self._short_positions
-            ):
-                logger.debug("tick short_exit: skipped (in_flight) bid=%.5f", bid)
 
         # --- Long entry ---
         if not self._is_long_entry_allowed():
@@ -1550,8 +1339,7 @@ class RSIBollingerStrategyV2:
         and populates _long_positions / _short_positions.
 
         On failure, logs WARNING and returns — grids remain empty (same
-        as current behavior). No entry_spread is set on seeded positions;
-        _tick_close_positions uses its existing fallback.
+        as current behavior). No entry_spread is set on seeded positions.
         """
         try:
             positions = self.ig.get_open_positions()
@@ -1595,12 +1383,6 @@ class RSIBollingerStrategyV2:
                     if direction == "BUY":
                         self._long_positions.append(pos)
                         longs_seeded += 1
-                        logger.warning(
-                            f"Seeded LONG {pos['deal_id']} has no entry_spread "
-                            f"(position restored from broker state after restart). "
-                            f"_tick_close_positions will use live tick spread as "
-                            f"fallback for profit checks."
-                        )
                     elif direction == "SELL":
                         self._short_positions.append(pos)
                         shorts_seeded += 1
@@ -1696,38 +1478,6 @@ def _avg_entry(positions: list[dict]) -> str:
         return "N/A"
     weighted_sum = sum(p["size"] * p["entry_price"] for p in positions)
     return f"{weighted_sum / total_size:.2f}"
-
-
-def _long_profit(close: float, entry_price: float, spread: float, size: float) -> float:
-    """Compute unrealised profit for a long position after spread.
-
-    Args:
-        close: Current close price.
-        entry_price: Price at which the long was opened.
-        spread: Instrument bid/ask spread in points.
-        size: Position size in contracts.
-
-    Returns:
-        Unrealised profit. Positive means profitable.
-    """
-    return (close - entry_price - spread) * size
-
-
-def _short_profit(
-    close: float, entry_price: float, spread: float, size: float
-) -> float:
-    """Compute unrealised profit for a short position after spread.
-
-    Args:
-        close: Current close price.
-        entry_price: Price at which the short was opened.
-        spread: Instrument bid/ask spread in points.
-        size: Position size in contracts.
-
-    Returns:
-        Unrealised profit. Positive means profitable.
-    """
-    return (entry_price - close - spread) * size
 
 
 def _distance_ok(close: float, last_entry: float, min_ticks: float) -> bool:

@@ -68,7 +68,7 @@ V1 strategy. Contains all trading logic. Uses REST polling at the interval confi
 
 #### `RSIBollingerStrategyV2` (`strategies/RSIBollingerStrategyV2.py`)
 
-V2 strategy. Event-driven bidirectional mean-reversion. Receives closed OHLC candles via `IGStreamingClient`. Maintains independent long and short position grids. No martingale, no ATR, no stop-loss. See [RSIBollingerStrategyV2 documentation](strategies/RSIBollingerStrategyV2.md) for full reference.
+V2 strategy. Event-driven bidirectional mean-reversion. Receives closed OHLC candles via `IGStreamingClient`. Maintains independent long and short position grids. No martingale, no drawdown freeze. See [RSIBollingerStrategyV2 documentation](strategies/RSIBollingerStrategyV2.md) for full reference.
 
 **Startup sequence.** Before streaming begins, `run()` calls two methods in order:
 
@@ -77,12 +77,12 @@ V2 strategy. Event-driven bidirectional mean-reversion. Receives closed OHLC can
 
 **Operation mode.** Controlled by `operation_mode` in the strategy JSON:
 
-- `"candle"` — entry and exit signals are evaluated on each closed candle via `_manage_longs()` / `_manage_shorts()`.
-- `"tick"` — indicators are cached on each candle close; entry and exit signals fire on every live tick via `_on_tick()`, enabling sub-candle precision. The current production config uses tick mode.
+- `"candle"` — entry signals are evaluated on each closed candle via `_manage_longs()` / `_manage_shorts()`.
+- `"tick"` — indicators are cached on each candle close; entry signals fire on every live tick via `_on_tick()`, enabling sub-candle precision. The current production config uses tick mode.
 
-**Exit mechanisms.** V2 uses two exit paths: (1) a broker-side take-profit limit order placed at open (`take_profit_ticks` above/below the entry price); and (2) a signal-driven exit evaluated on each candle or tick — when price crosses the opposite Bollinger Band and the position is profitable after spread, the position is closed via REST.
+**Exit mechanisms.** V2 uses a single exit path: broker-side TP/SL orders placed at open. A take-profit limit order is placed `take_profit_ticks` above/below the entry price; a stop-loss order is placed `stop_loss_ticks` away (fixed mode) or at an ATR-derived distance (dynamic mode). The strategy never calls `close_position()` itself.
 
-**Runtime reconciliation.** When a `close_position()` REST call fails, the position is flagged `needs_reconciliation=True`. Before the next candle or tick is processed, `_reconcile_positions()` fetches broker positions and removes any phantom local entries. This is distinct from startup seeding — it fires during normal operation after failed closes.
+**Runtime reconciliation.** `_reconcile_positions()` runs unconditionally on every candle close. It compares local grids against broker state, removes positions closed by broker TP/SL (no longer present at the broker), and seeds any broker positions absent from local grids (bidirectional sync). This is distinct from startup seeding — it fires continuously during normal operation.
 
 #### `IGStreamingClient` (`ig_streaming_client.py`)
 
@@ -136,7 +136,7 @@ while True:
 
 Each individual `close_position()` call is wrapped in its own retry loop: 3 attempts with 1s/2s backoff. A failure on one position does not block the remaining closes. Failed deal IDs are accumulated and reported in a single WARNING after all positions are processed.
 
-> This layer applies to V1 only. V2 handles close failures inline within `_manage_longs()` / `_manage_shorts()` and flags failures with `needs_reconciliation=True` rather than retrying immediately.
+> This layer applies to V1 only. V2 does not call `close_position()` — exits are handled exclusively by broker TP/SL orders set at position open.
 
 **Layer 6 — Startup config (`strategies/<StrategyName>.json`)**
 

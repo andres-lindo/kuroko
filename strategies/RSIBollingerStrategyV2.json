@@ -19,9 +19,8 @@
   "take_profit_ticks": 15,
   "stop_loss_ticks": 15,
 
-  "close_on_bb_cross": false,
-
-  "close_mode": "fixed",
+  "close_mode": "dynamic",
   "atr_period": 14,
-  "atr_multiplier": 1.5
+  "atr_multiplier_tp": 1.0,
+  "atr_multiplier_sl": 1.5
 }
