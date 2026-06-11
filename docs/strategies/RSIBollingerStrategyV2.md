@@ -19,8 +19,8 @@ differences from V1:
    price data.
 2. **Bidirectional grids** — long and short grids are independent. Both can
    hold open positions at the same time.
-3. **Simplified risk model** — no martingale sizing, no ATR, no drawdown
-   freeze. Broker-level take-profit and stop-loss are set at open; per-position
+3. **Simplified risk model** — no martingale sizing, no drawdown freeze.
+   Broker-level take-profit and stop-loss are set at open; per-position
    spread-aware profit is the guard for mean-reversion exits.
 
 V2 also supports an optional **tick mode** (`operation_mode: "tick"`) where
@@ -46,7 +46,7 @@ Indicators are computed and cached (`_cached_indicators`) on every candle close.
 Entry and exit signals are then evaluated on each live tick by `_on_tick()`, using
 the cached indicators together with the live `bid` and `ofr` prices from the tick.
 
-**Warmup gate**: `_on_tick` silently discards ticks until `_cached_indicators` is set — which happens on the first streaming candle that produces valid indicators (requires `max(bb_period, rsi_period) + 1` entries in the candle window). After a successful warmup this is the first streaming candle. After a cold-start (warmup failure), this requires `max(bb_period, rsi_period)` additional streaming candles — 20 with default params. No WARNING is logged during this period.
+**Warmup gate**: `_on_tick` silently discards ticks until `_cached_indicators` is set — which happens on the first streaming candle that produces valid indicators (requires `max(bb_period, rsi_period, atr_period) + 1` entries in the candle window). After a successful warmup this is the first streaming candle. After a cold-start (warmup failure), this requires `max(bb_period, rsi_period, atr_period)` additional streaming candles. No WARNING is logged during this period.
 
 **In-flight guards**: Four flags prevent duplicate REST calls in tick mode — two for open calls (`_tick_long_in_flight`, `_tick_short_in_flight`, managed inside `_tick_try_open`) and two for close calls (`_tick_long_close_in_flight`, `_tick_short_close_in_flight`, managed inside `_on_tick`'s own `finally` block). Each flag is set immediately before the REST call and reset in a `finally` block so it is always `False` after the handler returns, even if the call raises.
 
@@ -89,10 +89,11 @@ Lightstreamer
 
 `run()` executes the following sequence on startup:
 
-1. **`_warmup()`** — fetches `max(bb_period, rsi_period) + 1` historical candles
-   from the REST API via `IGClient.get_candles()` and appends each row's `Close`
-   price directly to `_candle_window`. This pre-fills the window so that indicators
-   are valid on the very first live streaming candle.
+1. **`_warmup()`** — fetches `max(bb_period, rsi_period, atr_period) + 1` historical
+   candles from the REST API via `IGClient.get_candles()` and appends each row's
+   `Close`, `High`, and `Low` prices directly to `_candle_window`, `_high_window`,
+   and `_low_window`. This pre-fills the windows so that all indicators (BB, RSI,
+   ATR) are valid on the very first live streaming candle.
 2. **`_seed_positions_from_broker()`** — fetches all open positions from the broker
    via `IGClient.get_open_positions()`, filters by `self.epic`, and populates
    `_long_positions` / `_short_positions` so that the strategy correctly tracks
@@ -105,13 +106,14 @@ Lightstreamer
 ### Warm-up details
 
 `_warmup()` calls `IGClient.get_candles(epic, candle_frequency, num_candles)`,
-where `num_candles = max(bb_period, rsi_period) + 1`. The returned DataFrame has
-capitalized OHLC columns (`Open`, `High`, `Low`, `Close`) and a `DatetimeIndex`.
+where `num_candles = max(bb_period, rsi_period, atr_period) + 1`. The returned
+DataFrame has capitalized OHLC columns (`Open`, `High`, `Low`, `Close`) and a
+`DatetimeIndex`.
 
-Each row's `Close` price is appended directly to `_candle_window` as a float.
-No conversion to a candle dict is performed and `_on_candle()` is not called
-during warm-up, so trading logic cannot fire on REST data regardless of window
-fill level.
+Each row's `Close`, `High`, and `Low` prices are appended directly to
+`_candle_window`, `_high_window`, and `_low_window` as floats. No conversion
+to a candle dict is performed and `_on_candle()` is not called during warm-up,
+so trading logic cannot fire on REST data regardless of window fill level.
 
 ### `_last_warmup_ts` — deduplication guard
 
@@ -183,8 +185,8 @@ from the Lightstreamer adapter — not mid-market prices. `bid_close` and
 on bid prices throughout.
 
 The strategy discards candle data until the rolling window holds at least
-`max(bb_period, rsi_period) + 1` completed candles, ensuring indicators are
-computed from a full dataset.
+`max(bb_period, rsi_period, atr_period) + 1` completed candles, ensuring
+indicators are computed from a full dataset.
 
 ---
 
@@ -286,8 +288,8 @@ to `0.0` — a conservative fallback that never suppresses a profitable exit.
 | Max positions per grid | `max_long_positions` for longs; `max_short_positions` for shorts |
 | Minimum entry distance | New entry rejected if `abs(close - last_entry) < min_dist_between_entries_ticks` |
 | Position sizing | Flat `contract_size` for every entry — no martingale, no scaling |
-| Broker take-profit | Set at `entry_price + take_profit_ticks` (long) or `entry_price - take_profit_ticks` (short) at open |
-| Broker stop-loss | Set at `entry_price - stop_loss_ticks` (long) or `entry_price + stop_loss_ticks` (short) at open |
+| Broker take-profit | Distance set by `_get_close_params()`: `take_profit_ticks` in fixed mode, `round(atr_multiplier * ATR)` in dynamic mode |
+| Broker stop-loss | Distance set by `_get_close_params()`: `stop_loss_ticks` in fixed mode, same ATR-derived distance as TP in dynamic mode |
 
 ---
 
@@ -299,12 +301,70 @@ Risk is bounded by:
   limit on exposure in each direction.
 - **Broker-level take-profit** — set as a limit order at open; the broker
   closes the position automatically if the target is reached.
-- **Broker-level stop-loss** — set at open via `stop_loss_ticks`; the broker
-  closes the position automatically if the loss threshold is hit.
+- **Broker-level stop-loss** — set at open via `stop_loss_ticks` (fixed mode)
+  or ATR-derived distance (dynamic mode); the broker closes the position
+  automatically if the loss threshold is hit.
 - **Entry distance guard** — prevents adding to a losing grid faster than
   `min_dist_between_entries_ticks` ticks.
 
-There is no drawdown freeze, no ATR rule, and no margin check in V2.
+There is no drawdown freeze and no margin check in V2.
+
+---
+
+## Dynamic Close Mode
+
+`close_mode` controls how TP/SL distances are resolved at position open. It is set in the strategy JSON and can be changed at runtime via hot-reload.
+
+### Fixed mode (`close_mode: "fixed"`, default)
+
+TP and SL distances are taken directly from `take_profit_ticks` and
+`stop_loss_ticks`. Behavior is identical to the original V2 implementation —
+no change to existing setups.
+
+### Dynamic mode (`close_mode: "dynamic"`)
+
+Both TP and SL distances are derived from the current ATR value:
+
+```
+dist = round(atr_multiplier * ATR[-1])
+open_position(limit=dist, stop=dist)
+```
+
+ATR is computed on every candle (regardless of `close_mode`) using:
+- `ta.ATR(highs, lows, closes, timeperiod=atr_period)` from TA-Lib
+- High/low data comes from `_high_window` / `_low_window` — parallel deques
+  maintained alongside `_candle_window`
+
+**In tick mode**, `_tick_try_open` reads ATR from `_cached_indicators` (set by
+the last `_on_candle` call). No extra REST call is made.
+
+### Guard behavior
+
+| Condition | Behavior |
+|-----------|----------|
+| `close_mode = "dynamic"` and ATR > 0 | `dist = round(atr_multiplier * ATR)` — used as both limit and stop |
+| `close_mode = "dynamic"` and ATR ≤ 0 or NaN | Log ERROR `"ATR unavailable in dynamic mode"` — **skip open** (`open_position` not called) |
+| `close_mode = "dynamic"` and `dist < 5` | Log WARNING `"ATR-derived distance N is below min spread guard of 5 points"` — **still opens** the position |
+| `close_mode = "fixed"` | Always uses `take_profit_ticks` / `stop_loss_ticks`; ATR is computed but not used |
+
+### Hot-reload behavior
+
+`close_mode` and `atr_multiplier` are **hot-safe** — they can be changed at
+runtime without restarting the bot. The new values take effect on the next
+closed candle.
+
+`atr_period` is **restart-required** — changing it requires a bot restart
+because the ATR indicator window must be re-computed from scratch.
+
+### Switching from fixed to dynamic
+
+1. Edit `strategies/RSIBollingerStrategyV2.json`: set `"close_mode": "dynamic"`.
+2. Optionally tune `atr_multiplier` (default `1.5`).
+3. Save the file — the change takes effect on the next candle close (no restart needed).
+
+To revert: set `"close_mode"` back to `"fixed"`.
+
+---
 
 ---
 
@@ -441,9 +501,12 @@ loaded at startup into a `types.SimpleNamespace` via `load_params()`.
 | `max_short_positions` | int | `10` | Maximum number of simultaneously open short positions |
 | `contract_size` | float | `3.0` | Position size in contracts — uniform for every entry |
 | `min_dist_between_entries_ticks` | float | `10` | Minimum price distance between consecutive entries in the same grid (ticks) |
-| `take_profit_ticks` | float | `8` | Broker take-profit distance from entry price (ticks) |
-| `stop_loss_ticks` | float | `16` | Broker stop-loss distance from entry price (ticks) |
+| `take_profit_ticks` | float | `8` | Broker take-profit distance from entry price (ticks). Used only when `close_mode` is `"fixed"`. |
+| `stop_loss_ticks` | float | `16` | Broker stop-loss distance from entry price (ticks). Used only when `close_mode` is `"fixed"`. |
 | `close_on_bb_cross` | bool | `false` | When `true`, the bot closes positions when the opposite Bollinger Band is crossed and `profit > 0` (long: `close > bb_upper`; short: `close < bb_lower`). When `false` (default), BB-cross exits are skipped and positions are left to the broker TP. Can be changed at runtime via hot-reload. |
+| `close_mode` | string | `"fixed"` | Controls how TP/SL distances are determined. `"fixed"`: use `take_profit_ticks` and `stop_loss_ticks` directly. `"dynamic"`: derive both distances from ATR (see Dynamic Close Mode below). Only `"fixed"` and `"dynamic"` are valid — any other value fails schema validation at startup. Can be changed at runtime via hot-reload. |
+| `atr_period` | int | `14` | ATR lookback period. Used in both `"fixed"` and `"dynamic"` modes (computed unconditionally for hot-switch readiness). Requires restart to change. |
+| `atr_multiplier` | float | `1.5` | Multiplier applied to ATR when `close_mode` is `"dynamic"`. `dist = round(atr_multiplier * atr)`. Can be changed at runtime via hot-reload. |
 
 Infrastructure parameters (`leverage`, `initial_cash_balance`,
 `demo_starting_balance`) come from `config.json["trading"]`. `epic` is stored
@@ -456,6 +519,8 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
 > **Note**: `spread` is no longer a static config parameter. The strategy reads
 > spread dynamically from each candle's `OFR_CLOSE - BID_CLOSE` value delivered
 > by `IGStreamingClient`. No spread key is needed in `config.json`.
+
+> **Note on defaults**: The "Default" column shows reference values from the original implementation. The committed `RSIBollingerStrategyV2.json` may differ — it reflects current live-tuned values.
 
 ---
 
@@ -485,7 +550,11 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
   "take_profit_ticks": 8,
   "stop_loss_ticks": 16,
 
-  "close_on_bb_cross": false
+  "close_on_bb_cross": false,
+
+  "close_mode": "fixed",
+  "atr_period": 14,
+  "atr_multiplier": 1.5
 }
 ```
 
@@ -531,11 +600,13 @@ The strategy can apply changes to `strategies/RSIBollingerStrategyV2.json` at ru
 | `max_long_positions` | Maximum simultaneous long positions |
 | `max_short_positions` | Maximum simultaneous short positions |
 | `min_dist_between_entries_ticks` | Minimum price distance between grid entries |
-| `take_profit_ticks` | Broker take-profit distance (also per-position exit threshold) |
-| `stop_loss_ticks` | Broker stop-loss distance from entry price |
+| `take_profit_ticks` | Broker take-profit distance (used in fixed mode) |
+| `stop_loss_ticks` | Broker stop-loss distance (used in fixed mode) |
 | `contract_size` | Position size for new entries |
 | `bb_std` | Bollinger Band standard deviation multiplier |
 | `close_on_bb_cross` | Enable/disable BB-cross exits without restart |
+| `close_mode` | Switch between `"fixed"` and `"dynamic"` TP/SL without restart |
+| `atr_multiplier` | ATR multiplier for dynamic mode distance calculation |
 
 ### Restart-required parameters (change is logged but NOT applied)
 
@@ -543,6 +614,7 @@ The strategy can apply changes to `strategies/RSIBollingerStrategyV2.json` at ru
 |-----------|--------|
 | `bb_period` | Changes the indicator calculation window — existing candle buffer would produce inconsistent results |
 | `rsi_period` | Same reason as `bb_period` |
+| `atr_period` | Same reason as `bb_period` — ATR window would be inconsistent |
 | `epic` | The streaming subscription is bound to the epic at startup |
 | `candle_frequency` | The streaming resolution is set when `IGStreamingClient` is created |
 | `api_mode` | Determines which execution path is used; wired at startup |
@@ -574,7 +646,7 @@ Hot-reload is enabled by default in `kuroko.py` (via `params_path=strategy_path`
 | Candle resolution | Configurable via `candle_frequency` (default 15 min) | Configurable via `candle_frequency` |
 | Directions | Long only (short entry is defined but rarely triggered in V1) | Bidirectional — independent long and short grids |
 | Position sizing | Martingale: each grid level multiplies base size by `martingale_multiplier` | Flat: every entry uses `contract_size` |
-| Stop-loss | ATR-based dynamic stop (`atr_sl_multiplier * ATR`) | None |
+| Stop-loss | ATR-based dynamic stop (`atr_sl_multiplier * ATR`) | Broker stop-loss set at open: `stop_loss_ticks` (fixed mode) or ATR-derived distance (dynamic mode) |
 | Take-profit | Basket TP (close all positions when avg entry + TP ticks is reached) | Per-position broker TP (set as limit order at open) |
 | Exit signal | Weighted average basket crossover | Per-position spread-aware profit check at opposite BB band |
 | Drawdown protection | Max drawdown freeze at 75% threshold | None |

@@ -61,13 +61,13 @@ def make_params_v1():
 
 
 # --------------------------------------------------------------------------- #
-# V2 param factory (RSIBollingerStrategyV2 — 12-key schema)                   #
+# V2 param factory (RSIBollingerStrategyV2)                                    #
 # --------------------------------------------------------------------------- #
 
 
 @pytest.fixture
 def make_params_v2():
-    """Factory fixture: returns callable(**overrides) → SimpleNamespace (V2 13-key schema).
+    """Factory fixture: returns callable(**overrides) → SimpleNamespace (V2 schema).
 
     Returns:
         A factory function that accepts keyword overrides and returns a
@@ -81,7 +81,7 @@ def make_params_v2():
             **overrides: Key/value pairs to override the defaults.
 
         Returns:
-            SimpleNamespace populated with all 13 V2 signal/risk keys.
+            SimpleNamespace populated with all V2 signal/risk keys.
         """
         defaults = {
             "epic": "IX.D.SPTRD.IFMM.IP",
@@ -100,6 +100,9 @@ def make_params_v2():
             "stop_loss_ticks": 100.0,
             "operation_mode": "candle",
             "close_on_bb_cross": True,
+            "close_mode": "fixed",
+            "atr_period": 14,
+            "atr_multiplier": 1.5,
         }
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)

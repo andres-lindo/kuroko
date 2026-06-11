@@ -4,7 +4,8 @@ Implements independent long/short position grids using Bollinger Bands (BB) and
 RSI signals. Candles are delivered via a queue from IGStreamingClient. All trading
 logic runs on a single worker thread; REST calls are serialized through IGClient.
 
-No martingale, no ATR. All positions use flat contract_size with configurable TP and SL distances.
+No martingale. All positions use flat contract_size. TP/SL distances are either
+fixed (configured ticks) or dynamic (ATR-derived), controlled by close_mode.
 """
 
 import json
@@ -46,6 +47,9 @@ _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
     "take_profit_ticks": float,
     "stop_loss_ticks": (int, float),
     "close_on_bb_cross": bool,
+    "close_mode": str,
+    "atr_period": int,
+    "atr_multiplier": float,
 }
 
 
@@ -100,6 +104,13 @@ def _validate_params(data: dict, path: str, *, fatal: bool = True) -> None:
             errors.append(
                 f"  '{key}': expected {expected.__name__}, got {type(value).__name__} ({value!r})"
             )
+
+    # Enum validation: close_mode must be one of the accepted values
+    close_mode_val = data.get("close_mode")
+    if close_mode_val is not None and close_mode_val not in ("fixed", "dynamic"):
+        errors.append(
+            f"  'close_mode': must be 'fixed' or 'dynamic', got {close_mode_val!r}"
+        )
 
     if errors:
         msg = (
@@ -181,6 +192,8 @@ class RSIBollingerStrategyV2:
             "contract_size",
             "bb_std",
             "close_on_bb_cross",
+            "close_mode",
+            "atr_multiplier",
         }
     )
 
@@ -193,6 +206,7 @@ class RSIBollingerStrategyV2:
             "candle_frequency",
             "api_mode",
             "operation_mode",
+            "atr_period",
         }
     )
 
@@ -260,9 +274,12 @@ class RSIBollingerStrategyV2:
         self._current_spread: float | None = None
 
         # Rolling window of closed candles — minimum length for indicator calculation
-        # Needs bb_period + rsi_period candles for both indicators to be valid
-        min_window = max(params.bb_period, params.rsi_period) + 1
+        # Needs max(bb_period, rsi_period, atr_period) candles for all indicators to be valid
+        min_window = max(params.bb_period, params.rsi_period, params.atr_period) + 1
         self._candle_window: deque = deque(maxlen=min_window + 50)
+        # Parallel high/low windows for ATR computation — same maxlen as _candle_window
+        self._high_window: deque = deque(maxlen=min_window + 50)
+        self._low_window: deque = deque(maxlen=min_window + 50)
         logger.debug(
             f"Candle window initialised: min_required={min_window} maxlen={min_window + 50}"
         )
@@ -304,19 +321,26 @@ class RSIBollingerStrategyV2:
     # ---------------------------------------------------------------------- #
 
     def _compute_indicators(self, candle: dict) -> dict | None:
-        """Add candle to the rolling window and compute BB and RSI.
+        """Add candle to the rolling windows and compute BB, RSI, and ATR.
 
         Args:
-            candle: OHLC candle dict with at least a 'close' key.
+            candle: OHLC candle dict with keys 'close', 'high', and 'low'.
 
         Returns:
-            Dict with keys bb_upper, bb_middle, bb_lower, rsi, close when
+            Dict with keys bb_upper, bb_middle, bb_lower, rsi, close, atr when
             enough history is available; None if the window is too short.
         """
-        self._candle_window.append(candle["close"])
+        close = candle["close"]
+        self._candle_window.append(close)
+        # Fall back to close when high/low are absent (e.g. minimal test candles)
+        self._high_window.append(candle.get("high", close))
+        self._low_window.append(candle.get("low", close))
 
         window_size = len(self._candle_window)
-        min_required = max(self.params.bb_period, self.params.rsi_period) + 1
+        min_required = (
+            max(self.params.bb_period, self.params.rsi_period, self.params.atr_period)
+            + 1
+        )
 
         if window_size < min_required:
             logger.debug(
@@ -339,20 +363,35 @@ class RSIBollingerStrategyV2:
         )
         rsi = ta.RSI(closes, timeperiod=self.params.rsi_period)
 
+        # ATR requires aligned high/low/close arrays. Use the minimum length so that
+        # manually pre-filled _candle_window (in tests) does not cause shape mismatches.
+        n = min(len(self._candle_window), len(self._high_window), len(self._low_window))
+        if n > 0:
+            highs = np.array(list(self._high_window)[-n:], dtype=float)
+            lows = np.array(list(self._low_window)[-n:], dtype=float)
+            closes_for_atr = closes[-n:]
+            atr_arr = ta.ATR(
+                highs, lows, closes_for_atr, timeperiod=self.params.atr_period
+            )
+        else:
+            atr_arr = np.array([np.nan])
+
         current_close = closes[-1]
         current_bb_upper = float(bb_upper[-1])
         current_bb_middle = float(bb_middle[-1])
         current_bb_lower = float(bb_lower[-1])
         current_rsi = float(rsi[-1])
+        current_atr = float(atr_arr[-1]) if not np.isnan(atr_arr[-1]) else 0.0
 
-        if any(np.isnan(v) for v in [current_bb_upper, current_bb_lower, current_rsi]):
+        nan_check = [current_bb_upper, current_bb_lower, current_rsi]
+        if any(np.isnan(v) for v in nan_check):
             logger.debug("NaN indicators — skipping candle.")
             return None
 
         logger.debug(
             f"Indicators computed: close={current_close:.2f} "
             f"BB=[{current_bb_lower:.2f}, {current_bb_middle:.2f}, {current_bb_upper:.2f}] "
-            f"RSI={current_rsi:.2f}"
+            f"RSI={current_rsi:.2f} ATR={current_atr:.4f}"
         )
 
         return {
@@ -361,7 +400,47 @@ class RSIBollingerStrategyV2:
             "bb_lower": current_bb_lower,
             "rsi": current_rsi,
             "close": current_close,
+            "atr": current_atr,
         }
+
+    # ---------------------------------------------------------------------- #
+    # Close parameter resolution                                              #
+    # ---------------------------------------------------------------------- #
+
+    def _get_close_params(
+        self, indicators: dict
+    ) -> tuple[int | float, int | float] | None:
+        """Resolve TP/SL distances based on close_mode.
+
+        In fixed mode, returns the statically configured tick distances.
+        In dynamic mode, derives both distances from the current ATR value
+        stored in the indicators dict.
+
+        Args:
+            indicators: Dict from _compute_indicators (or _cached_indicators in
+                tick mode). Must contain an 'atr' key when close_mode is
+                'dynamic'. Missing or zero/NaN ATR causes an early return of None.
+
+        Returns:
+            (limit_distance, stop_distance) as ints (rounded points), or None
+            when dynamic mode cannot produce a valid distance (ATR <= 0 or NaN).
+            Callers MUST skip open_position() when None is returned.
+        """
+        if self.params.close_mode == "dynamic":
+            atr = indicators.get("atr", 0.0)
+            if not atr or np.isnan(atr) or atr <= 0:
+                logger.error(
+                    f"ATR unavailable in dynamic mode (atr={atr!r}) — skipping open"
+                )
+                return None
+            dist = round(self.params.atr_multiplier * atr)
+            if dist < 5:
+                logger.warning(
+                    f"ATR-derived distance {dist} is below min spread guard of 5 points"
+                )
+            return (dist, dist)
+        # Fixed mode — pass through configured ticks
+        return (self.params.take_profit_ticks, self.params.stop_loss_ticks)
 
     # ---------------------------------------------------------------------- #
     # Spread update                                                            #
@@ -388,20 +467,25 @@ class RSIBollingerStrategyV2:
     # ---------------------------------------------------------------------- #
 
     def _warmup(self) -> None:
-        """Pre-fill the candle window from REST historical data before streaming starts.
+        """Pre-fill the candle windows from REST historical data before streaming starts.
 
-        Fetches max(bb_period, rsi_period) + 1 candles via IGClient.get_candles()
-        and appends each row's Close price directly to _candle_window. Sets
-        _last_warmup_ts to the last REST candle's timestamp so that _on_candle
-        can discard overlapping streaming candles.
+        Fetches max(bb_period, rsi_period, atr_period) + 1 candles via
+        IGClient.get_candles() and appends each row's Close/High/Low directly to
+        _candle_window/_high_window/_low_window. Sets _last_warmup_ts to the last
+        REST candle's timestamp so that _on_candle can discard overlapping streaming
+        candles.
 
         On failure (None response or any exception), logs a WARNING and returns early.
         The strategy then starts in cold-start mode with an empty candle window.
         """
-        num_candles = max(self.params.bb_period, self.params.rsi_period) + 1
+        num_candles = (
+            max(self.params.bb_period, self.params.rsi_period, self.params.atr_period)
+            + 1
+        )
         logger.debug(
             f"Warm-up: requesting {num_candles} candles "
-            f"(bb_period={self.params.bb_period} rsi_period={self.params.rsi_period})"
+            f"(bb_period={self.params.bb_period} rsi_period={self.params.rsi_period} "
+            f"atr_period={self.params.atr_period})"
         )
         logger.info(
             f"Warm-up starting: fetching {num_candles} historical candles "
@@ -431,6 +515,8 @@ class RSIBollingerStrategyV2:
             loaded = 0
             for _, row in df.iterrows():
                 self._candle_window.append(float(row["Close"]))
+                self._high_window.append(float(row["High"]))
+                self._low_window.append(float(row["Low"]))
                 loaded += 1
 
             # IG REST snapshotTime is London local time (naive). Localise to
@@ -584,8 +670,10 @@ class RSIBollingerStrategyV2:
                 )
                 return
 
-        limit_distance = self.params.take_profit_ticks
-        stop_distance = self.params.stop_loss_ticks
+        close_params = self._get_close_params(indicators)
+        if close_params is None:
+            return
+        limit_distance, stop_distance = close_params
         size = self.params.contract_size
         logger.debug(
             f"Long entry signal: close={close:.2f} bb_lower={bb_lower:.2f} "
@@ -727,8 +815,10 @@ class RSIBollingerStrategyV2:
                 )
                 return
 
-        limit_distance = self.params.take_profit_ticks
-        stop_distance = self.params.stop_loss_ticks
+        close_params = self._get_close_params(indicators)
+        if close_params is None:
+            return
+        limit_distance, stop_distance = close_params
         size = self.params.contract_size
         logger.debug(
             f"Short entry signal: close={close:.2f} bb_upper={bb_upper:.2f} "
@@ -1030,10 +1120,11 @@ class RSIBollingerStrategyV2:
             )
             return
 
-        logger.debug(
+        logger.info(
             f"Candle processed: close={indicators['close']:.2f} "
             f"BB=[{indicators['bb_lower']:.2f}, {indicators['bb_upper']:.2f}] "
             f"RSI={indicators['rsi']:.2f} "
+            f"ATR={indicators['atr']:.2f} "
             f"longs={len(self._long_positions)} shorts={len(self._short_positions)}"
         )
 
@@ -1188,13 +1279,24 @@ class RSIBollingerStrategyV2:
             self._tick_short_in_flight = True
             positions = self._short_positions
 
+        # Resolve TP/SL from cached indicators (set by last _on_candle)
+        close_params = self._get_close_params(self._cached_indicators or {})
+        if close_params is None:
+            # ATR unavailable in dynamic mode — skip open
+            if side == "BUY":
+                self._tick_long_in_flight = False
+            else:
+                self._tick_short_in_flight = False
+            return
+        limit, stop = close_params
+
         try:
             response = self.ig.open_position(
                 epic=self.epic,
                 size=self.params.contract_size,
                 side=side,
-                limit=self.params.take_profit_ticks,
-                stop=self.params.stop_loss_ticks,
+                limit=limit,
+                stop=stop,
             )
             deal_id = _extract_deal_id(response)
             if deal_id != "unknown":

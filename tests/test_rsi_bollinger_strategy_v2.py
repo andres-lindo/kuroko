@@ -72,6 +72,7 @@ def _make_indicators(
     bb_lower: float = 0.0,
     rsi: float = 50.0,
     close: float = 100.0,
+    atr: float = 0.0,
 ) -> dict:
     """Return a computed-indicators dict as produced by _compute_indicators."""
     return {
@@ -80,6 +81,7 @@ def _make_indicators(
         "bb_lower": bb_lower,
         "rsi": rsi,
         "close": close,
+        "atr": atr,
     }
 
 
@@ -110,6 +112,9 @@ class TestLoadParams:
             "take_profit_ticks": 240.0,
             "stop_loss_ticks": 100.0,
             "close_on_bb_cross": False,
+            "close_mode": "fixed",
+            "atr_period": 14,
+            "atr_multiplier": 1.5,
         }
         path = tmp_path / "RSIBollingerStrategyV2.json"
         path.write_text(json.dumps(data))
@@ -2078,6 +2083,9 @@ class TestValidateParamsBranches:
             "take_profit_ticks": 240,  # int value for float field — should be accepted
             "stop_loss_ticks": 100.0,
             "close_on_bb_cross": False,
+            "close_mode": "fixed",
+            "atr_period": 14,
+            "atr_multiplier": 1.5,
         }
         path = tmp_path / "v2.json"
         path.write_text(json.dumps(data))
@@ -2183,7 +2191,11 @@ class TestValidateParamsBranches:
             "contract_size": 0.1,
             "min_dist_between_entries_ticks": 20,
             "take_profit_ticks": 240.0,
+            "stop_loss_ticks": 100.0,
             "close_on_bb_cross": False,
+            "close_mode": "fixed",
+            "atr_period": 14,
+            "atr_multiplier": 1.5,
             "test_flag": "not_a_bool",  # string for a bool-typed key → must be rejected
         }
         path = tmp_path / "v2.json"
@@ -2216,6 +2228,9 @@ _HOT_RELOAD_BASE_PARAMS = {
     "take_profit_ticks": 50.0,
     "stop_loss_ticks": 100.0,
     "close_on_bb_cross": True,
+    "close_mode": "fixed",
+    "atr_period": 14,
+    "atr_multiplier": 1.5,
 }
 
 
@@ -2555,6 +2570,9 @@ class TestHotReloadRoundTrip:
             "take_profit_ticks": 240.0,
             "stop_loss_ticks": 100.0,
             "close_on_bb_cross": False,
+            "close_mode": "fixed",
+            "atr_period": 14,
+            "atr_multiplier": 1.5,
             "test_flag": True,  # valid bool — must pass
         }
         path = tmp_path / "v2.json"
@@ -2893,11 +2911,11 @@ class TestComputeIndicatorsNaN:
         self, make_strategy_v2, make_params_v2
     ):
         """Uniform close prices can cause NaN standard deviation in BB — returns None."""
-        # Use a small bb_period so we can fill the window with few values
-        params = make_params_v2(bb_period=3, rsi_period=2)
+        # Use small periods so we can fill the window with few values
+        params = make_params_v2(bb_period=3, rsi_period=2, atr_period=2)
         strat, _, _ = make_strategy_v2(params=params)
         # Fill with exact same price — BB std dev = 0 → BB bands may produce NaN for RSI
-        # We need min_required = max(3, 2) + 1 = 4 entries, then a 5th to evaluate
+        # min_required = max(3, 2, 2) + 1 = 4 entries, then a 5th to evaluate
         for _ in range(4):
             strat._candle_window.append(100.0)
 
@@ -2922,9 +2940,9 @@ class TestComputeIndicatorsNaN:
         window-size guard passes, then pass a candle with close=NaN. TA-Lib
         propagates NaN to the last bar of BB and RSI output, hitting lines 241-242.
         """
-        params = make_params_v2(bb_period=3, rsi_period=2)
+        params = make_params_v2(bb_period=3, rsi_period=2, atr_period=2)
         strat, _, _ = make_strategy_v2(params=params)
-        # min_required = max(3, 2) + 1 = 4; pre-fill 4 valid entries so the
+        # min_required = max(3, 2, 2) + 1 = 4; pre-fill 4 valid entries so the
         # window-size guard passes after _compute_indicators appends the NaN candle
         for i in range(4):
             strat._candle_window.append(100.0 + i)
@@ -4786,3 +4804,398 @@ class TestCloseonBBCross:
         strat._long_positions = [{"deal_id": "DEAL1", "entry_price": 90.0, "size": 1.0}]
         strat._manage_longs(indicators)
         mock_ig.close_position.assert_called_once_with("DEAL1", "SELL", 1.0)
+
+
+# =========================================================================== #
+# Dynamic close mode (close-mode change)                                       #
+# =========================================================================== #
+
+
+class TestCloseModeSchema:
+    """close_mode, atr_period, atr_multiplier must be in _PARAMS_SCHEMA (REQ-9)."""
+
+    def test_close_mode_in_params_schema(self):
+        """_PARAMS_SCHEMA must include close_mode."""
+        assert "close_mode" in _PARAMS_SCHEMA, "close_mode missing from _PARAMS_SCHEMA"
+
+    def test_atr_period_in_params_schema(self):
+        """_PARAMS_SCHEMA must include atr_period."""
+        assert "atr_period" in _PARAMS_SCHEMA, "atr_period missing from _PARAMS_SCHEMA"
+
+    def test_atr_multiplier_in_params_schema(self):
+        """_PARAMS_SCHEMA must include atr_multiplier."""
+        assert (
+            "atr_multiplier" in _PARAMS_SCHEMA
+        ), "atr_multiplier missing from _PARAMS_SCHEMA"
+
+    def test_close_mode_schema_type_is_str(self):
+        """close_mode schema type must be str."""
+        assert _PARAMS_SCHEMA.get("close_mode") is str
+
+    def test_atr_period_schema_type_is_int(self):
+        """atr_period schema type must be int."""
+        assert _PARAMS_SCHEMA.get("atr_period") is int
+
+    def test_atr_multiplier_schema_type_is_float(self):
+        """atr_multiplier schema type must be float."""
+        assert _PARAMS_SCHEMA.get("atr_multiplier") is float
+
+    def test_invalid_close_mode_value_raises_value_error(self, tmp_path):
+        """close_mode='trailing' must be rejected — only 'fixed' and 'dynamic' are valid (REQ-9)."""
+        data = dict(_HOT_RELOAD_BASE_PARAMS)
+        data["close_mode"] = "trailing"
+        path = tmp_path / "v2.json"
+        path.write_text(json.dumps(data))
+
+        with pytest.raises((SystemExit, ValueError)):
+            load_params(str(path))
+
+    def test_atr_period_as_string_raises_value_error(self, tmp_path):
+        """atr_period='fourteen' (string) must be rejected by schema validation (REQ-9)."""
+        data = dict(_HOT_RELOAD_BASE_PARAMS)
+        data["atr_period"] = "fourteen"
+        path = tmp_path / "v2.json"
+        path.write_text(json.dumps(data))
+
+        with pytest.raises((SystemExit, ValueError)):
+            load_params(str(path))
+
+
+class TestGetCloseParamsFixed:
+    """_get_close_params returns configured TP/SL in fixed mode (REQ-1)."""
+
+    def test_fixed_mode_returns_configured_ticks(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Fixed mode: returns (take_profit_ticks, stop_loss_ticks) unchanged."""
+        params = make_params_v2(
+            close_mode="fixed", take_profit_ticks=50.0, stop_loss_ticks=100.0
+        )
+        strat, _, _ = make_strategy_v2(params=params)
+
+        result = strat._get_close_params({})
+
+        assert result == (50.0, 100.0)
+
+    def test_fixed_mode_ignores_atr_in_indicators(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Fixed mode: ATR in indicators dict is ignored; configured ticks are returned."""
+        params = make_params_v2(
+            close_mode="fixed", take_profit_ticks=30.0, stop_loss_ticks=60.0
+        )
+        strat, _, _ = make_strategy_v2(params=params)
+
+        # Even with ATR present, fixed mode must return the configured ticks
+        result = strat._get_close_params({"atr": 999.0})
+
+        assert result == (30.0, 60.0)
+
+
+class TestGetCloseParamsDynamic:
+    """_get_close_params computes TP/SL from ATR in dynamic mode (REQ-2)."""
+
+    def test_dynamic_mode_returns_rounded_atr_multiplied_distance(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Dynamic mode: returns (round(atr * multiplier), round(atr * multiplier))."""
+        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        strat, _, _ = make_strategy_v2(params=params)
+        # ATR=20.0, multiplier=1.5 → dist = round(30.0) = 30
+        result = strat._get_close_params({"atr": 20.0})
+
+        assert result == (30, 30)
+
+    def test_dynamic_mode_zero_atr_returns_none(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """Dynamic mode: ATR=0 → returns None and logs ERROR (REQ-4)."""
+        import logging
+
+        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        strat, _, _ = make_strategy_v2(params=params)
+
+        with caplog.at_level(logging.ERROR):
+            result = strat._get_close_params({"atr": 0.0})
+
+        assert result is None
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+    def test_dynamic_mode_nan_atr_returns_none(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """Dynamic mode: ATR=NaN → treated as <= 0, returns None and logs ERROR (REQ-4)."""
+        import logging
+
+        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        strat, _, _ = make_strategy_v2(params=params)
+
+        with caplog.at_level(logging.ERROR):
+            result = strat._get_close_params({"atr": float("nan")})
+
+        assert result is None
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+    def test_dynamic_mode_missing_atr_key_returns_none(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """Dynamic mode: missing 'atr' key defaults to 0.0 → returns None (REQ-4)."""
+        import logging
+
+        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        strat, _, _ = make_strategy_v2(params=params)
+
+        with caplog.at_level(logging.ERROR):
+            result = strat._get_close_params({})
+
+        assert result is None
+
+    def test_dynamic_mode_narrow_stop_logs_warning(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """Dynamic mode: dist < 5 logs WARNING but still returns the tuple (REQ-8)."""
+        import logging
+
+        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=0.1)
+        strat, _, _ = make_strategy_v2(params=params)
+        # ATR=20.0, multiplier=0.1 → dist = round(2.0) = 2 → WARNING
+        with caplog.at_level(logging.WARNING):
+            result = strat._get_close_params({"atr": 20.0})
+
+        assert result is not None
+        assert result == (2, 2)
+        assert any(r.levelno == logging.WARNING for r in caplog.records)
+
+
+class TestManageLongsFixedModeRegression:
+    """_manage_longs in fixed mode calls open_position with configured TP/SL (REQ-1)."""
+
+    def test_fixed_mode_long_entry_uses_configured_ticks(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Fixed mode: open_position called with limit=take_profit_ticks, stop=stop_loss_ticks."""
+        params = make_params_v2(
+            close_mode="fixed", take_profit_ticks=50.0, stop_loss_ticks=100.0
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "DEAL_FIXED",
+        }
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0, atr=20.0
+        )
+
+        strat._manage_longs(indicators)
+
+        call_kwargs = mock_ig.open_position.call_args.kwargs
+        assert call_kwargs["limit"] == pytest.approx(50.0)
+        assert call_kwargs["stop"] == pytest.approx(100.0)
+
+
+class TestManageLongsDynamicMode:
+    """_manage_longs in dynamic mode uses ATR-based TP/SL (REQ-2)."""
+
+    def test_dynamic_mode_long_entry_uses_atr_distance(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Dynamic mode: open_position called with limit=dist, stop=dist (ATR*multiplier)."""
+        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "DEAL_DYN",
+        }
+        # ATR=20.0, multiplier=1.5 → dist=30
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0, atr=20.0
+        )
+
+        strat._manage_longs(indicators)
+
+        call_kwargs = mock_ig.open_position.call_args.kwargs
+        assert call_kwargs["limit"] == 30
+        assert call_kwargs["stop"] == 30
+
+    def test_dynamic_mode_zero_atr_skips_long_entry(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Dynamic mode: ATR=0 → open_position NOT called (REQ-4)."""
+        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0, atr=0.0
+        )
+
+        strat._manage_longs(indicators)
+
+        mock_ig.open_position.assert_not_called()
+
+
+class TestManageShortsDynamicMode:
+    """_manage_shorts in dynamic mode uses ATR-based TP/SL (REQ-2)."""
+
+    def test_dynamic_mode_short_entry_uses_atr_distance(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Dynamic mode: open_position called with limit=dist, stop=dist for shorts."""
+        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "DEAL_SHORT_DYN",
+        }
+        # ATR=20.0, multiplier=1.5 → dist=30
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0, atr=20.0
+        )
+
+        strat._manage_shorts(indicators)
+
+        call_kwargs = mock_ig.open_position.call_args.kwargs
+        assert call_kwargs["limit"] == 30
+        assert call_kwargs["stop"] == 30
+
+    def test_dynamic_mode_zero_atr_skips_short_entry(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Dynamic mode: ATR=0 → short open_position NOT called (REQ-4)."""
+        params = make_params_v2(close_mode="dynamic", atr_period=14, atr_multiplier=1.5)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0, atr=0.0
+        )
+
+        strat._manage_shorts(indicators)
+
+        mock_ig.open_position.assert_not_called()
+
+
+class TestTickTryOpenDynamicMode:
+    """_tick_try_open in dynamic mode reads ATR from _cached_indicators (REQ-3)."""
+
+    def test_tick_mode_dynamic_uses_cached_atr(self, make_strategy_v2, make_params_v2):
+        """Tick mode + dynamic: open_position called with limit=30, stop=30 when ATR=20."""
+        params = make_params_v2(
+            operation_mode="tick",
+            close_mode="dynamic",
+            atr_period=14,
+            atr_multiplier=1.5,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "DEAL_TICK_DYN",
+        }
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=20.0, close=100.0, atr=20.0
+        )
+
+        strat._tick_try_open("BUY", bid=95.0, spread=1.0)
+
+        call_kwargs = mock_ig.open_position.call_args.kwargs
+        assert call_kwargs["limit"] == 30
+        assert call_kwargs["stop"] == 30
+
+    def test_tick_mode_dynamic_zero_atr_skips_open(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick mode + dynamic: ATR=0 in cached_indicators → open_position NOT called."""
+        params = make_params_v2(
+            operation_mode="tick",
+            close_mode="dynamic",
+            atr_period=14,
+            atr_multiplier=1.5,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=20.0, close=100.0, atr=0.0
+        )
+
+        strat._tick_try_open("BUY", bid=95.0, spread=1.0)
+
+        mock_ig.open_position.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# _compute_indicators — ATR with real high/low data                            #
+# --------------------------------------------------------------------------- #
+
+
+class TestComputeIndicatorsATR:
+    """_compute_indicators produces a positive ATR value with varied H/L data."""
+
+    def test_compute_indicators_returns_positive_atr_with_real_hl(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """ATR is a positive float when high/low data has real variance.
+
+        Uses atr_period=3 so only a few candles are needed. Pre-fills
+        _candle_window, _high_window, _low_window with varied values,
+        then calls _compute_indicators with a final candle and asserts
+        the returned dict has an 'atr' key with a positive float value.
+        """
+        params = make_params_v2(bb_period=3, rsi_period=2, atr_period=3)
+        strat, _, _ = make_strategy_v2(params=params)
+        # min_required = max(3, 2, 3) + 1 = 4; pre-fill 4 entries
+        closes = [100.0, 102.0, 98.0, 104.0]
+        highs = [103.0, 106.0, 101.0, 108.0]
+        lows = [97.0, 99.0, 95.0, 100.0]
+        for c, h, l in zip(closes, highs, lows):
+            strat._candle_window.append(c)
+            strat._high_window.append(h)
+            strat._low_window.append(l)
+
+        # 5th candle via _compute_indicators — window is now >= min_required
+        result = strat._compute_indicators(
+            {"close": 106.0, "high": 110.0, "low": 102.0}
+        )
+
+        assert result is not None
+        assert "atr" in result
+        assert isinstance(result["atr"], float)
+        assert result["atr"] > 0
+
+
+# --------------------------------------------------------------------------- #
+# _warmup — parallel deque population (high/low windows)                       #
+# --------------------------------------------------------------------------- #
+
+
+class TestWarmupParallelDeques:
+    """_warmup() populates _high_window and _low_window from DataFrame High/Low columns."""
+
+    def test_warmup_fills_high_and_low_windows(self, make_strategy_v2):
+        """After _warmup, _high_window and _low_window contain the DataFrame's High and Low values."""
+        strat, mock_ig, _ = make_strategy_v2()
+        num_candles = (
+            max(
+                strat.params.bb_period, strat.params.rsi_period, strat.params.atr_period
+            )
+            + 1
+        )
+        # Create a DataFrame with distinct High/Low values per row
+        idx = pd.date_range(
+            start=datetime(2026, 1, 1, 9, 0),
+            periods=num_candles,
+            freq="5min",
+        )
+        data = {
+            "Open": [100.0] * num_candles,
+            "High": [100.0 + i * 2 for i in range(num_candles)],
+            "Low": [100.0 - i * 1.5 for i in range(num_candles)],
+            "Close": [100.0 + i * 0.1 for i in range(num_candles)],
+        }
+        df = pd.DataFrame(data, index=idx)
+        mock_ig.get_candles.return_value = df
+
+        strat._warmup()
+
+        # Verify parallel deques are populated
+        assert len(strat._high_window) == num_candles
+        assert len(strat._low_window) == num_candles
+        # Verify values match the DataFrame
+        expected_highs = [100.0 + i * 2 for i in range(num_candles)]
+        expected_lows = [100.0 - i * 1.5 for i in range(num_candles)]
+        assert list(strat._high_window) == expected_highs
+        assert list(strat._low_window) == expected_lows
