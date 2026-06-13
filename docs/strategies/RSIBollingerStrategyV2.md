@@ -101,7 +101,10 @@ Lightstreamer
 
 ### Warm-up details
 
-`_warmup()` calls `IGClient.get_candles(epic, candle_frequency, num_candles)`,
+`_warmup()` calls `ig.clear_cache()` before anything else, discarding both the
+in-memory and parquet caches so every restart triggers a full historical fetch
+rather than the incremental 3-candle update path. It then calls
+`IGClient.get_candles(epic, candle_frequency, num_candles)`,
 where `num_candles = max(bb_period, rsi_period, atr_period) + 1`. The returned
 DataFrame has capitalized OHLC columns (`Open`, `High`, `Low`, `Close`) and a
 `DatetimeIndex`.

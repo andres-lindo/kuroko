@@ -477,6 +477,8 @@ class RSIBollingerStrategyV2:
         On failure (None response or any exception), logs a WARNING and returns early.
         The strategy then starts in cold-start mode with an empty candle window.
         """
+        self.ig.clear_cache()
+        logger.info("Candle cache cleared — forcing fresh historical load.")
         num_candles = (
             max(self.params.bb_period, self.params.rsi_period, self.params.atr_period)
             + 1

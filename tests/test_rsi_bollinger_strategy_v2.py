@@ -1262,6 +1262,23 @@ class TestWarmupFillsWindow:
         expected_utc = datetime(2026, 7, 1, 17, 20, tzinfo=timezone.utc)
         assert strat._last_warmup_ts == expected_utc
 
+    def test_warmup_clears_cache_before_fetch(self, make_strategy_v2):
+        """_warmup() clears the IGClient cache before fetching candles."""
+        strat, mock_ig, _ = make_strategy_v2()
+        num_candles = (
+            max(
+                strat.params.bb_period, strat.params.rsi_period, strat.params.atr_period
+            )
+            + 1
+        )
+        df = _make_warmup_dataframe(num_candles)
+        mock_ig.get_candles = MagicMock(return_value=df)
+        mock_ig.clear_cache = MagicMock()
+
+        strat._warmup()
+
+        mock_ig.clear_cache.assert_called_once()
+
 
 class TestWarmupGracefulDegradation:
     """_warmup() handles REST failure without crashing the strategy."""

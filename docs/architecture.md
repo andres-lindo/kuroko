@@ -57,7 +57,7 @@ Wrapper around the `trading-ig` library. All API calls go through `_safe_api_cal
 - **Maintenance window handling**: `json.JSONDecodeError` (IG returning an empty HTTP body) is included in the retry clause so transient outages are retried automatically
 - **Candle caching**: two-layer cache
   - In-memory (`dict`): avoids redundant API calls within the same process lifetime
-  - Parquet files (`./cache/`): survives restarts; cache key is `{epic}_{resolution}`
+  - Parquet files (`./cache/`): survives restarts; cache key is `{epic}_{resolution}`. V2 clears this cache at every startup during `_warmup()` so restarts always trigger a full historical fetch.
 - **Incomplete candle removal**: the current (open) candle is always stripped before returning data to the strategy
 
 Key methods: `get_candles()`, `get_open_positions()`, `open_position()`, `close_position()`, `update_position()`.
