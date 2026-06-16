@@ -88,7 +88,11 @@ V2 strategy. Event-driven bidirectional mean-reversion. Receives closed OHLC can
 
 Wraps `trading_ig`'s `IGStreamService` to deliver closed OHLC candles at the configured resolution via callback. Subscribes to `CHART:{epic}:{resolution}` natively; falls back to `CHART:{epic}:TICK` with in-process `TickAggregator` if the native subscription fails. Candles are delivered from a dedicated worker thread, never directly from the Lightstreamer listener. Resolution is determined by `candle_frequency` in the strategy JSON, converted via `candle_frequency_to_resolution()`.
 
-Public API: `start(on_candle, on_tick=None)`, `stop()`. When `on_tick` is provided (tick mode), a second subscription to `CHART:{epic}:TICK` is opened via `_DirectTickListener`.
+Public API: `start(on_candle, on_tick=None, on_reconnect=None)`, `stop()`. When `on_tick` is provided (tick mode), a second subscription to `CHART:{epic}:TICK` is opened via `_DirectTickListener`.
+
+**Streaming reconnect.** A `_ConnectionListener` (implements `ClientListener`) is attached to the Lightstreamer client on every `start()` call. When the Lightstreamer status transitions to the bare string `"DISCONNECTED"` (not `"DISCONNECTED:WILL-RETRY"` or `"DISCONNECTED:TRYING-RECOVERY"`, which the library handles internally), the listener places a `{"type": "reconnect"}` sentinel on the shared worker queue. The worker thread dequeues it and dispatches it to the `on_reconnect` callback. If `on_reconnect` is `None`, the sentinel is discarded with a warning.
+
+`_restart_streaming(on_candle, on_tick=None)` cycles only the Lightstreamer service — it disconnects the old `IGStreamService`, creates a new one, re-subscribes, and attaches a fresh `_ConnectionListener`. It does NOT touch `_worker` or `_stop_event`; the worker thread stays alive throughout and resumes polling after the method returns. This method is called from within the `on_reconnect` callback, which itself runs on the worker thread.
 
 #### `AzureBlobHandler` (`azure_log_handler.py`)
 

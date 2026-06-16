@@ -681,7 +681,7 @@ class TestSingleQueuePattern:
         strat, _, mock_streaming = make_strategy_v2()
         captured = {}
 
-        def fake_start(callback, on_tick=None):
+        def fake_start(callback, on_tick=None, on_reconnect=None):
             captured["callback"] = callback
             # Immediately stop so run() returns
             strat.stop()
@@ -3492,7 +3492,7 @@ class TestSeedPositionsFromBroker:
         def fake_seed():
             call_log.append("seed")
 
-        def fake_start(callback, on_tick=None):
+        def fake_start(callback, on_tick=None, on_reconnect=None):
             call_log.append("streaming_start")
             strat.stop()
 
@@ -3562,7 +3562,7 @@ class TestSeedPositionsFromBroker:
         def fake_warmup():
             pass
 
-        def fake_start(callback, on_tick=None):
+        def fake_start(callback, on_tick=None, on_reconnect=None):
             strat.stop()
 
         mock_streaming.start.side_effect = fake_start
@@ -4664,3 +4664,291 @@ class TestWarmupParallelDeques:
         expected_lows = [100.0 - i * 1.5 for i in range(num_candles)]
         assert list(strat._high_window) == expected_highs
         assert list(strat._low_window) == expected_lows
+
+
+# --------------------------------------------------------------------------- #
+# _on_reconnect — idempotency guard [REQ-2]                                   #
+# --------------------------------------------------------------------------- #
+
+
+class TestOnReconnectIdempotency:
+    """_on_reconnect guard prevents concurrent reconnect attempts."""
+
+    def test_reconnect_guard_prevents_concurrent_reconnect(self, make_strategy_v2):
+        """If _reconnecting is True when called, returns immediately without touching state."""
+        strat, _, mock_streaming = make_strategy_v2()
+        strat._reconnecting = True
+        # Pre-fill a window so we can detect if it was cleared
+        strat._candle_window.extend([1.0, 2.0, 3.0])
+
+        strat._on_reconnect()
+
+        # State must be untouched
+        assert len(strat._candle_window) == 3
+        mock_streaming._restart_streaming.assert_not_called()
+        # Guard must remain True (we set it, and early-return does not clear it)
+        assert strat._reconnecting is True
+
+    def test_reconnecting_flag_is_false_after_successful_reconnect(
+        self, make_strategy_v2
+    ):
+        """_reconnecting is False after a successful reconnect."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None  # cold-start warmup
+        mock_streaming._restart_streaming.return_value = None
+
+        with patch.object(strat._stop_event, "wait", return_value=False):
+            strat._on_reconnect()
+
+        assert strat._reconnecting is False
+
+
+# --------------------------------------------------------------------------- #
+# _on_reconnect — state reset [REQ-3]                                         #
+# --------------------------------------------------------------------------- #
+
+
+class TestOnReconnectStateReset:
+    """_on_reconnect clears candle windows and indicator cache; preserves position grids."""
+
+    def test_reconnect_resets_state_before_warmup(self, make_strategy_v2):
+        """After a successful reconnect, candle windows are cleared and indicators reset."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None
+        mock_streaming._restart_streaming.return_value = None
+
+        # Pre-fill windows with stale data
+        strat._candle_window.extend([10.0, 20.0])
+        strat._high_window.extend([11.0, 21.0])
+        strat._low_window.extend([9.0, 19.0])
+        strat._cached_indicators = {"rsi": 50.0}
+        strat._last_warmup_ts = object()
+
+        with patch.object(strat._stop_event, "wait", return_value=False):
+            strat._on_reconnect()
+
+        # All windows must be empty (warmup with None return leaves them empty)
+        assert len(strat._candle_window) == 0
+        assert len(strat._high_window) == 0
+        assert len(strat._low_window) == 0
+        # Indicators must be reset
+        assert strat._cached_indicators is None
+        assert strat._last_warmup_ts is None
+
+    def test_reconnect_does_not_clear_position_grids(self, make_strategy_v2):
+        """Position grids are preserved through reconnect."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None
+        mock_streaming._restart_streaming.return_value = None
+
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 100.0, "size": 1.0}]
+        strat._short_positions = [{"deal_id": "S1", "entry_price": 200.0, "size": 1.0}]
+
+        with patch.object(strat._stop_event, "wait", return_value=False):
+            strat._on_reconnect()
+
+        assert len(strat._long_positions) == 1
+        assert strat._long_positions[0]["deal_id"] == "L1"
+        assert len(strat._short_positions) == 1
+        assert strat._short_positions[0]["deal_id"] == "S1"
+
+
+# --------------------------------------------------------------------------- #
+# _on_reconnect — backoff and max attempts [REQ-5, REQ-6]                     #
+# --------------------------------------------------------------------------- #
+
+
+class TestOnReconnectBackoff:
+    """_on_reconnect retries with bounded backoff; sets stop_event after max attempts."""
+
+    def test_reconnect_succeeds_on_first_attempt(self, make_strategy_v2):
+        """When _restart_streaming succeeds immediately, _reconnecting is False and stop event not set."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None
+        mock_streaming._restart_streaming.return_value = None
+
+        with patch.object(strat._stop_event, "wait", return_value=False):
+            strat._on_reconnect()
+
+        assert strat._reconnecting is False
+        assert not strat._stop_event.is_set()
+
+    def test_reconnect_delay_sequence(self, make_strategy_v2):
+        """Delays follow [5, 10, 20, ...] schedule when restart fails repeatedly."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None
+
+        # Fail 3 times, succeed on 4th
+        call_count = [0]
+
+        def _restart_side_effect(*a, **kw):
+            call_count[0] += 1
+            if call_count[0] < 4:
+                raise RuntimeError("connection refused")
+
+        mock_streaming._restart_streaming.side_effect = _restart_side_effect
+
+        with patch.object(strat._stop_event, "wait", return_value=False) as mock_wait:
+            strat._on_reconnect()
+
+        # Calls 1, 2, 3 fail → waits with [5, 10, 20]
+        wait_calls = [c[0][0] for c in mock_wait.call_args_list]
+        assert wait_calls == [5, 10, 20]
+
+    def test_system_exit_caught_and_retried(self, make_strategy_v2):
+        """SystemExit from create_session is caught and the attempt retried."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None
+
+        call_count = [0]
+
+        def _restart_side_effect(*a, **kw):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise SystemExit(1)
+
+        mock_streaming._restart_streaming.side_effect = _restart_side_effect
+
+        with patch.object(strat._stop_event, "wait", return_value=False):
+            strat._on_reconnect()
+
+        assert call_count[0] == 2
+        assert strat._reconnecting is False
+        assert not strat._stop_event.is_set()
+
+    def test_max_attempts_exceeded_sets_stop_event(self, make_strategy_v2):
+        """After 10 failures, _stop_event is set."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None
+        mock_streaming._restart_streaming.side_effect = RuntimeError("always fails")
+
+        with patch.object(strat._stop_event, "wait", return_value=False):
+            strat._on_reconnect()
+
+        assert strat._stop_event.is_set()
+
+    def test_max_attempts_exceeded_logs_critical(self, make_strategy_v2, caplog):
+        """After 10 failures, CRITICAL is logged."""
+        import logging
+
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None
+        mock_streaming._restart_streaming.side_effect = RuntimeError("always fails")
+
+        with caplog.at_level(
+            logging.CRITICAL, logger="strategies.RSIBollingerStrategyV2"
+        ):
+            with patch.object(strat._stop_event, "wait", return_value=False):
+                strat._on_reconnect()
+
+        critical_msgs = [
+            r.message for r in caplog.records if r.levelno == logging.CRITICAL
+        ]
+        assert len(critical_msgs) >= 1
+
+    def test_reconnect_clears_guard_on_success(self, make_strategy_v2):
+        """_reconnecting is False after successful reconnect."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None
+        mock_streaming._restart_streaming.return_value = None
+
+        with patch.object(strat._stop_event, "wait", return_value=False):
+            strat._on_reconnect()
+
+        assert strat._reconnecting is False
+
+    def test_reconnect_clears_guard_on_max_attempts(self, make_strategy_v2):
+        """_reconnecting is False after all attempts exhausted."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None
+        mock_streaming._restart_streaming.side_effect = RuntimeError("always fails")
+
+        with patch.object(strat._stop_event, "wait", return_value=False):
+            strat._on_reconnect()
+
+        assert strat._reconnecting is False
+
+
+# --------------------------------------------------------------------------- #
+# _on_reconnect — warmup ordering [REQ-4]                                     #
+# --------------------------------------------------------------------------- #
+
+
+class TestOnReconnectWarmup:
+    """_on_reconnect calls _warmup before _restart_streaming; warmup failure is non-fatal."""
+
+    def test_warmup_called_before_restart_streaming(self, make_strategy_v2):
+        """_warmup is called before _restart_streaming on each attempt."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None
+        mock_streaming._restart_streaming.return_value = None
+
+        call_order = []
+
+        original_warmup = strat._warmup
+
+        def _spy_warmup():
+            call_order.append("warmup")
+            original_warmup()
+
+        def _spy_restart(*a, **kw):
+            call_order.append("restart_streaming")
+
+        strat._warmup = _spy_warmup
+        mock_streaming._restart_streaming.side_effect = _spy_restart
+
+        with patch.object(strat._stop_event, "wait", return_value=False):
+            strat._on_reconnect()
+
+        assert call_order == ["warmup", "restart_streaming"]
+
+    def test_warmup_failure_does_not_abort_reconnect(self, make_strategy_v2):
+        """Even if _warmup raises, _restart_streaming is still attempted."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_streaming._restart_streaming.return_value = None
+
+        def _failing_warmup():
+            raise RuntimeError("REST unavailable")
+
+        strat._warmup = _failing_warmup
+
+        with patch.object(strat._stop_event, "wait", return_value=False):
+            strat._on_reconnect()
+
+        mock_streaming._restart_streaming.assert_called_once()
+        assert strat._reconnecting is False
+
+
+# --------------------------------------------------------------------------- #
+# run() — wires on_reconnect callback [REQ-9]                                  #
+# --------------------------------------------------------------------------- #
+
+
+class TestRunPassesOnReconnectCallback:
+    """run() passes on_reconnect=self._on_reconnect to streaming_client.start()."""
+
+    def test_run_passes_on_reconnect_to_streaming_client_start(self, make_strategy_v2):
+        """streaming_client.start() must be called with on_reconnect=strategy._on_reconnect."""
+        strat, mock_ig, mock_streaming = make_strategy_v2()
+        mock_ig.get_candles.return_value = None
+        mock_ig.get_open_positions.return_value = {"positions": []}
+
+        # Make start() immediately set the stop event so run() returns
+        def _fake_start(on_candle, on_tick=None, on_reconnect=None):
+            strat._stop_event.set()
+
+        mock_streaming.start.side_effect = _fake_start
+
+        strat.run()
+
+        mock_streaming.start.assert_called_once()
+        kwargs = mock_streaming.start.call_args
+        # Check keyword or positional
+        on_reconnect_arg = kwargs.kwargs.get("on_reconnect") or (
+            kwargs.args[2] if len(kwargs.args) > 2 else None
+        )
+        # Bound method identity: compare __func__ and __self__ since each attribute
+        # access creates a new bound method object (identity comparison would fail).
+        assert on_reconnect_arg is not None
+        assert on_reconnect_arg.__func__ is strat._on_reconnect.__func__
+        assert on_reconnect_arg.__self__ is strat

@@ -275,6 +275,73 @@ class _TickListener:
         logger.info(f"Tick subscription removed from {self._item_name}")
 
 
+class _ConnectionListener:
+    """Lightstreamer ClientListener that detects terminal disconnects.
+
+    Monitors the Lightstreamer connection status and enqueues a reconnect
+    sentinel onto the shared worker queue when a bare ``DISCONNECTED`` status
+    is received. ``DISCONNECTED:WILL-RETRY`` and ``DISCONNECTED:TRYING-RECOVERY``
+    are intentionally ignored — those transitions are handled internally by the
+    Lightstreamer library.
+
+    A ``_fired`` flag prevents duplicate sentinels from a single disconnect event,
+    since the library may fire ``onStatusChange`` multiple times for one physical drop.
+
+    Attributes:
+        _q: The shared worker queue.
+        _fired: True once the sentinel has been enqueued for this listener instance.
+    """
+
+    def __init__(self, reconnect_queue: queue.Queue):
+        """Initialise the connection listener.
+
+        Args:
+            reconnect_queue: The shared worker queue onto which the reconnect
+                sentinel is placed.
+        """
+        self._q = reconnect_queue
+        self._fired: bool = False
+
+    def onStatusChange(self, status: str) -> None:
+        """React to Lightstreamer connection status changes.
+
+        Places a ``{"type": "reconnect"}`` sentinel on the queue only when
+        ``status`` is the bare string ``"DISCONNECTED"`` and no sentinel has
+        been placed yet for this listener instance.
+
+        Args:
+            status: The new Lightstreamer connection status string.
+        """
+        if status == "DISCONNECTED" and not self._fired:
+            self._fired = True
+            logger.warning(
+                f"Lightstreamer terminal disconnect detected (status={status!r})"
+            )
+            self._q.put({"type": "reconnect"})
+
+    def onServerError(self, code: int, message: str) -> None:
+        """Log Lightstreamer server errors.
+
+        Args:
+            code: IG/Lightstreamer error code.
+            message: Human-readable error description.
+        """
+        logger.error(f"Lightstreamer server error: {code} {message}")
+
+    def onPropertyChange(self, property: str) -> None:
+        """No-op — property changes do not require action.
+
+        Args:
+            property: The name of the changed connection property.
+        """
+
+    def onListenStart(self) -> None:
+        """No-op — required by the ClientListener interface."""
+
+    def onListenEnd(self) -> None:
+        """No-op — required by the ClientListener interface."""
+
+
 class _DirectTickListener:
     """Lightstreamer SubscriptionListener for raw tick items in tick mode.
 
@@ -593,6 +660,7 @@ class IGStreamingClient:
         self,
         on_candle: Callable[[dict], None],
         on_tick: Optional[Callable[[dict], None]] = None,
+        on_reconnect: Optional[Callable[[], None]] = None,
     ) -> None:
         """Subscribe to candle data and begin delivering events to on_candle.
 
@@ -608,6 +676,12 @@ class IGStreamingClient:
         single worker thread — guaranteeing no concurrency between on_candle and
         on_tick.
 
+        When on_reconnect is provided, a _ConnectionListener is attached to the
+        Lightstreamer client. On terminal disconnect (bare ``DISCONNECTED`` status),
+        the listener places a reconnect sentinel on the queue and the worker thread
+        dispatches it to on_reconnect. If on_reconnect is None, sentinel items are
+        silently ignored.
+
         Notes:
             open/high/low/close are derived from BID prices (not mid-market).
             spread = OFR_CLOSE - BID_CLOSE at candle close.
@@ -621,6 +695,9 @@ class IGStreamingClient:
             on_tick: Optional callable invoked with each raw tick dict.
                      The dict has keys: type, bid, ofr, utm. When None (default),
                      no tick subscription is created and candle mode is unchanged.
+            on_reconnect: Optional callable invoked with no arguments when a terminal
+                          Lightstreamer disconnect is detected. Runs on the worker
+                          thread. When None (default), reconnect sentinels are ignored.
 
         Raises:
             RuntimeError: If start() is called while the client is already running.
@@ -642,11 +719,15 @@ class IGStreamingClient:
             self._stream_svc = None
             raise
 
+        # Attach a connection listener to detect terminal disconnects before
+        # starting the worker, so no status change is missed.
+        self._stream_svc.add_client_listener(_ConnectionListener(self._candle_queue))
+
         # Start the worker thread before subscribing so it is ready to
         # receive candles immediately when the subscription confirms.
         self._worker = threading.Thread(
             target=self._worker_loop,
-            args=(on_candle, on_tick),
+            args=(on_candle, on_tick, on_reconnect),
             daemon=True,
             name="ig-streaming-worker",
         )
@@ -728,8 +809,9 @@ class IGStreamingClient:
         self,
         on_candle: Callable[[dict], None],
         on_tick: Optional[Callable[[dict], None]] = None,
+        on_reconnect: Optional[Callable[[], None]] = None,
     ) -> None:
-        """Dequeue items and dispatch to on_candle or on_tick by item type.
+        """Dequeue items and dispatch to on_candle, on_tick, or on_reconnect by item type.
 
         Runs on a dedicated worker thread. Blocks on queue.get() with a
         short timeout so the stop event is checked regularly. After the stop
@@ -741,6 +823,8 @@ class IGStreamingClient:
         - ``item.get("type", "candle") == "candle"`` → ``on_candle(item)``
         - ``item.get("type", "candle") == "tick"`` and on_tick is not None
           → ``on_tick(item)``
+        - ``item.get("type") == "reconnect"`` and on_reconnect is not None
+          → ``on_reconnect()``
         - Items without a ``"type"`` key default to ``"candle"`` for
           backward compatibility with any producer that predates this change.
 
@@ -748,6 +832,9 @@ class IGStreamingClient:
             on_candle: Callback to invoke for each completed candle.
             on_tick: Optional callback to invoke for each raw tick. When None,
                 tick items are silently discarded (candle mode).
+            on_reconnect: Optional callback invoked when a reconnect sentinel
+                is dequeued. When None, reconnect sentinels are logged as a
+                warning and discarded.
         """
         logger.debug("Streaming worker thread started.")
 
@@ -756,6 +843,13 @@ class IGStreamingClient:
             if item_type == "tick":
                 if on_tick is not None:
                     on_tick(item)
+            elif item_type == "reconnect":
+                if on_reconnect is not None:
+                    on_reconnect()
+                else:
+                    logger.warning(
+                        "Reconnect sentinel received but no on_reconnect callback is registered."
+                    )
             else:
                 on_candle(item)
 
@@ -806,6 +900,62 @@ class IGStreamingClient:
             )
 
         logger.debug("Streaming worker thread stopped.")
+
+    def _restart_streaming(
+        self,
+        on_candle: Callable[[dict], None],
+        on_tick: Optional[Callable[[dict], None]] = None,
+    ) -> None:
+        """Cycle the Lightstreamer service without stopping the worker thread.
+
+        Intended to be called FROM the worker thread (inside the on_reconnect
+        callback). Disconnects the current Lightstreamer service, creates a new
+        one, re-subscribes, and attaches a fresh _ConnectionListener. The
+        worker thread continues polling the shared queue after this method
+        returns.
+
+        Does NOT touch ``_worker`` or ``_stop_event``. The worker thread stays
+        alive throughout — only the LS service is cycled.
+
+        Args:
+            on_candle: Candle delivery callback for the new subscription.
+            on_tick: Optional tick delivery callback. When not None and the
+                native subscription succeeds, a direct tick subscription is
+                also created.
+
+        Raises:
+            Exception: Any exception from ``create_session()`` or subscription
+                setup is re-raised so the caller (reconnect backoff loop) can
+                retry.
+            SystemExit: ``trading_ig`` calls ``sys.exit(1)`` on auth failure
+                inside ``create_session()``. The caller must catch this.
+        """
+        # Disconnect old service — best-effort, ignore errors
+        if self._stream_svc is not None:
+            try:
+                self._stream_svc.disconnect()
+            except Exception as e:
+                logger.warning(f"Error disconnecting old stream service: {e}")
+            self._stream_svc = None
+
+        # Clear subscription state so _subscribe_native starts clean
+        self._active_subscription = None
+        self._using_tick_fallback = False
+
+        # Create a new Lightstreamer session — may raise or sys.exit on auth failure
+        self._stream_svc = IGStreamService(self._ig_service)
+        self._stream_svc.create_session()
+
+        # Subscribe to candles (and optional direct ticks)
+        self._subscribe_native(on_candle)
+        if on_tick is not None and not self._using_tick_fallback:
+            self._subscribe_tick_direct()
+
+        # Attach a fresh ConnectionListener with _fired=False so the new session
+        # can detect terminal disconnects again.
+        self._stream_svc.add_client_listener(_ConnectionListener(self._candle_queue))
+
+        logger.info("_restart_streaming completed — new Lightstreamer session active.")
 
     def stop(self) -> None:
         """Disconnect the Lightstreamer session and shut down the worker thread.

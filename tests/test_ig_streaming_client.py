@@ -16,6 +16,7 @@ from ig_streaming_client import (
     IGStreamingClient,
     TickAggregator,
     _CandleSubscriptionListener,
+    _ConnectionListener,
     _DirectTickListener,
     _TickListener,
 )
@@ -1244,3 +1245,235 @@ class TestDualSubscription:
             client.stop()
 
         assert mock_ig_stream_service.subscribe.call_count == 1
+
+
+# =========================================================================== #
+# _ConnectionListener — disconnect detection [REQ-1, REQ-7]                    #
+# =========================================================================== #
+
+
+class TestConnectionListener:
+    """_ConnectionListener enqueues a sentinel only on bare DISCONNECTED status."""
+
+    def test_reconnect_sentinel_on_disconnected(self):
+        """Bare 'DISCONNECTED' places {type: reconnect} sentinel on the queue."""
+        q = queue.Queue()
+        listener = _ConnectionListener(q)
+
+        listener.onStatusChange("DISCONNECTED")
+
+        assert not q.empty()
+        item = q.get_nowait()
+        assert item == {"type": "reconnect"}
+
+    def test_no_sentinel_on_will_retry(self):
+        """'DISCONNECTED:WILL-RETRY' does not enqueue a sentinel."""
+        q = queue.Queue()
+        listener = _ConnectionListener(q)
+
+        listener.onStatusChange("DISCONNECTED:WILL-RETRY")
+
+        assert q.empty()
+
+    def test_no_sentinel_on_trying_recovery(self):
+        """'DISCONNECTED:TRYING-RECOVERY' does not enqueue a sentinel."""
+        q = queue.Queue()
+        listener = _ConnectionListener(q)
+
+        listener.onStatusChange("DISCONNECTED:TRYING-RECOVERY")
+
+        assert q.empty()
+
+    def test_no_sentinel_on_connected_status(self):
+        """Connected status strings do not enqueue a sentinel."""
+        q = queue.Queue()
+        listener = _ConnectionListener(q)
+
+        for status in ("CONNECTING", "CONNECTED:WS-STREAMING", "STALLED"):
+            listener.onStatusChange(status)
+
+        assert q.empty()
+
+    def test_fired_flag_prevents_duplicate_sentinels(self):
+        """A second bare DISCONNECTED call does not enqueue a second sentinel."""
+        q = queue.Queue()
+        listener = _ConnectionListener(q)
+
+        listener.onStatusChange("DISCONNECTED")
+        listener.onStatusChange("DISCONNECTED")
+
+        # Only one item must be in the queue
+        q.get_nowait()  # consume the first sentinel
+        assert q.empty(), "Second DISCONNECTED must not enqueue a second sentinel"
+
+    def test_on_server_error_does_not_raise(self):
+        """onServerError must not raise."""
+        q = queue.Queue()
+        listener = _ConnectionListener(q)
+        listener.onServerError(503, "Service unavailable")  # must not raise
+
+    def test_on_property_change_does_not_raise(self):
+        """onPropertyChange must not raise."""
+        q = queue.Queue()
+        listener = _ConnectionListener(q)
+        listener.onPropertyChange("serverAddress")  # must not raise
+
+    def test_on_listen_start_does_not_raise(self):
+        """onListenStart must not raise."""
+        _ConnectionListener(queue.Queue()).onListenStart()
+
+    def test_on_listen_end_does_not_raise(self):
+        """onListenEnd must not raise."""
+        _ConnectionListener(queue.Queue()).onListenEnd()
+
+
+# =========================================================================== #
+# Worker loop — reconnect sentinel dispatch [REQ-7]                            #
+# =========================================================================== #
+
+
+class TestWorkerLoopReconnectDispatch:
+    """Worker loop dispatches reconnect sentinel to the on_reconnect callback."""
+
+    def test_reconnect_sentinel_dispatches_on_reconnect_callback(self):
+        """A {type: reconnect} item on the queue calls on_reconnect once."""
+        on_reconnect = MagicMock()
+        client = IGStreamingClient(MagicMock(), EPIC)
+
+        client._candle_queue.put({"type": "reconnect"})
+        client._stop_event.set()
+
+        client._worker_loop(MagicMock(), None, on_reconnect)
+
+        on_reconnect.assert_called_once_with()
+
+    def test_reconnect_sentinel_without_callback_does_not_raise(self):
+        """When on_reconnect=None, a reconnect sentinel is silently ignored."""
+        client = IGStreamingClient(MagicMock(), EPIC)
+
+        client._candle_queue.put({"type": "reconnect"})
+        client._stop_event.set()
+
+        client._worker_loop(MagicMock(), None, None)  # must not raise
+
+    def test_candle_dispatch_unaffected_by_on_reconnect_param(self):
+        """Candle items are still dispatched to on_candle when on_reconnect is set."""
+        on_candle = MagicMock()
+        on_reconnect = MagicMock()
+        client = IGStreamingClient(MagicMock(), EPIC)
+
+        candle_item = {"type": "candle", "close": 100.0}
+        client._candle_queue.put(candle_item)
+        client._stop_event.set()
+
+        client._worker_loop(on_candle, None, on_reconnect)
+
+        on_candle.assert_called_once_with(candle_item)
+        on_reconnect.assert_not_called()
+
+
+# =========================================================================== #
+# _restart_streaming — service cycle contract [REQ-7]                          #
+# =========================================================================== #
+
+
+class TestRestartStreaming:
+    """_restart_streaming disconnects old service and creates a new one without touching the worker."""
+
+    def test_restart_streaming_disconnects_old_service(self, mock_ig_service):
+        """_restart_streaming calls disconnect() on the old _stream_svc."""
+        old_svc = MagicMock()
+        old_svc.create_session.return_value = None
+        old_svc.subscribe.return_value = None
+        old_svc.disconnect.return_value = None
+
+        new_svc = MagicMock()
+        new_svc.create_session.return_value = None
+        new_svc.subscribe.return_value = None
+        new_svc.add_client_listener.return_value = None
+
+        with patch(
+            "ig_streaming_client.IGStreamService", side_effect=[old_svc, new_svc]
+        ):
+            client = IGStreamingClient(mock_ig_service, EPIC)
+            client.start(on_candle=MagicMock())
+
+            client._restart_streaming(on_candle=MagicMock())
+            client.stop()
+
+        old_svc.disconnect.assert_called()
+
+    def test_restart_streaming_calls_create_session_on_new_service(
+        self, mock_ig_service
+    ):
+        """_restart_streaming calls create_session() on the newly created service."""
+        old_svc = MagicMock()
+        old_svc.create_session.return_value = None
+        old_svc.subscribe.return_value = None
+        old_svc.disconnect.return_value = None
+
+        new_svc = MagicMock()
+        new_svc.create_session.return_value = None
+        new_svc.subscribe.return_value = None
+        new_svc.add_client_listener.return_value = None
+
+        with patch(
+            "ig_streaming_client.IGStreamService", side_effect=[old_svc, new_svc]
+        ):
+            client = IGStreamingClient(mock_ig_service, EPIC)
+            client.start(on_candle=MagicMock())
+
+            client._restart_streaming(on_candle=MagicMock())
+            client.stop()
+
+        new_svc.create_session.assert_called_once()
+
+    def test_restart_streaming_does_not_set_stop_event(self, mock_ig_service):
+        """_restart_streaming must not set the stop event (worker keeps running)."""
+        old_svc = MagicMock()
+        old_svc.create_session.return_value = None
+        old_svc.subscribe.return_value = None
+        old_svc.disconnect.return_value = None
+
+        new_svc = MagicMock()
+        new_svc.create_session.return_value = None
+        new_svc.subscribe.return_value = None
+        new_svc.add_client_listener.return_value = None
+
+        with patch(
+            "ig_streaming_client.IGStreamService", side_effect=[old_svc, new_svc]
+        ):
+            client = IGStreamingClient(mock_ig_service, EPIC)
+            client.start(on_candle=MagicMock())
+
+            client._restart_streaming(on_candle=MagicMock())
+            assert not client._stop_event.is_set()
+            client.stop()
+
+    def test_restart_streaming_attaches_fresh_connection_listener(
+        self, mock_ig_service
+    ):
+        """_restart_streaming attaches a new _ConnectionListener to the new service."""
+        old_svc = MagicMock()
+        old_svc.create_session.return_value = None
+        old_svc.subscribe.return_value = None
+        old_svc.disconnect.return_value = None
+
+        new_svc = MagicMock()
+        new_svc.create_session.return_value = None
+        new_svc.subscribe.return_value = None
+        new_svc.add_client_listener.return_value = None
+
+        with patch(
+            "ig_streaming_client.IGStreamService", side_effect=[old_svc, new_svc]
+        ):
+            client = IGStreamingClient(mock_ig_service, EPIC)
+            client.start(on_candle=MagicMock())
+
+            client._restart_streaming(on_candle=MagicMock())
+            client.stop()
+
+        new_svc.add_client_listener.assert_called_once()
+        listener_arg = new_svc.add_client_listener.call_args[0][0]
+        assert isinstance(listener_arg, _ConnectionListener)
+        assert listener_arg._fired is False

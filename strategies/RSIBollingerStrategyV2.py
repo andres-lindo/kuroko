@@ -11,6 +11,7 @@ fixed (configured ticks) or dynamic (ATR-derived), controlled by close_mode.
 import json
 import os
 import sys
+import time
 import types
 import threading
 import logging
@@ -314,6 +315,10 @@ class RSIBollingerStrategyV2:
         # None when no warm-up has run (cold-start behavior — no dedup filtering).
         self._last_warmup_ts: datetime | None = None
 
+        # Reconnect guard — True while a reconnect attempt is in progress.
+        # Set and cleared exclusively on the worker thread; no lock required.
+        self._reconnecting: bool = False
+
     # ---------------------------------------------------------------------- #
     # Indicator computation                                                    #
     # ---------------------------------------------------------------------- #
@@ -547,6 +552,95 @@ class RSIBollingerStrategyV2:
                 f"Warm-up skipped — exception during warm-up: {e}. "
                 f"Falling back to cold-start."
             )
+
+    # ---------------------------------------------------------------------- #
+    # Reconnect handler                                                        #
+    # ---------------------------------------------------------------------- #
+
+    def _on_reconnect(self) -> None:
+        """Handle a terminal Lightstreamer disconnect by re-establishing streaming.
+
+        Called by the worker thread when a ``{"type": "reconnect"}`` sentinel is
+        dequeued. Resets candle state, re-warms from REST, and calls
+        ``streaming_client._restart_streaming()`` with bounded exponential backoff.
+
+        Position grids (``_long_positions``, ``_short_positions``) are intentionally
+        preserved — positions held at the broker during the disconnect window are
+        still open and will be reconciled by ``_reconcile_positions()`` on the first
+        post-reconnect candle.
+
+        The ``_reconnecting`` flag prevents a second concurrent invocation if
+        duplicate sentinels are dispatched before the first attempt completes.
+
+        Backoff schedule: ``[5, 10, 20, 60]`` seconds, capped at 60s.
+        Max attempts: 10 (~7-minute window). On exhaustion, logs CRITICAL and
+        sets ``_stop_event`` for a clean strategy exit.
+        """
+        if self._reconnecting:
+            logger.warning(
+                "Reconnect already in progress — ignoring duplicate sentinel."
+            )
+            return
+
+        if self._stop_event.is_set():
+            return
+
+        self._reconnecting = True
+        try:
+            delays = [5, 10, 20, 60]
+            max_attempts = 10
+
+            for attempt in range(1, max_attempts + 1):
+                logger.warning(f"Reconnect attempt {attempt}/{max_attempts}...")
+                try:
+                    # Reset candle state — order matters: clear first so that a
+                    # failed warmup does not leave stale partial data from a
+                    # previous loop iteration.
+                    self._last_warmup_ts = None
+                    self._candle_window.clear()
+                    self._high_window.clear()
+                    self._low_window.clear()
+                    self._cached_indicators = None
+
+                    # Re-warm from REST — proceed even on failure (cold-start mode).
+                    # Wrap separately so a warmup exception does not abort the attempt.
+                    try:
+                        self._warmup()
+                    except Exception as warmup_err:
+                        logger.warning(
+                            f"Warmup failed during reconnect attempt {attempt}: {warmup_err}. "
+                            "Proceeding in cold-start mode."
+                        )
+
+                    # Restart the Lightstreamer service without stopping the worker.
+                    on_tick = self._on_tick if self._operation_mode == "tick" else None
+                    self.streaming_client._restart_streaming(
+                        self._on_candle, on_tick=on_tick
+                    )
+
+                    logger.info(f"Reconnected successfully on attempt {attempt}.")
+                    return
+
+                except (Exception, SystemExit) as e:
+                    delay = delays[min(attempt - 1, len(delays) - 1)]
+                    logger.warning(
+                        f"Reconnect attempt {attempt} failed: {e}. "
+                        f"Retrying in {delay}s."
+                    )
+                    if self._stop_event.wait(delay):
+                        logger.info(
+                            "Stop event set during reconnect backoff — aborting reconnect."
+                        )
+                        return
+
+            logger.critical(
+                f"Streaming reconnect failed after {max_attempts} attempts. "
+                "Stopping strategy."
+            )
+            self._stop_event.set()
+
+        finally:
+            self._reconnecting = False
 
     # ---------------------------------------------------------------------- #
     # Guardrails                                                               #
@@ -1438,7 +1532,9 @@ class RSIBollingerStrategyV2:
             f"Seeding complete — starting streaming client (window_size={len(self._candle_window)})."
         )
         on_tick = self._on_tick if self._operation_mode == "tick" else None
-        self.streaming_client.start(self._on_candle, on_tick=on_tick)
+        self.streaming_client.start(
+            self._on_candle, on_tick=on_tick, on_reconnect=self._on_reconnect
+        )
         logger.debug("Streaming client started — blocking on stop event.")
         self._stop_event.wait()
         logger.info("RSIBollingerStrategyV2 stopped.")

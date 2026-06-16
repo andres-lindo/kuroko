@@ -94,9 +94,11 @@ Lightstreamer
    via `IGClient.get_open_positions()`, filters by `self.epic`, and populates
    `_long_positions` / `_short_positions` so that the strategy correctly tracks
    any positions that were open when the bot restarted.
-3. **`streaming_client.start(_on_candle, on_tick=...)`** — opens the Lightstreamer
+3. **`streaming_client.start(_on_candle, on_tick=..., on_reconnect=self._on_reconnect)`** — opens the Lightstreamer
    connection and begins delivering live candles. In tick mode, also opens a second
-   subscription to `CHART:{epic}:TICK` via `_DirectTickListener`.
+   subscription to `CHART:{epic}:TICK` via `_DirectTickListener`. The `on_reconnect`
+   callback is wired so that terminal disconnects trigger automatic reconnect (see
+   Automatic Reconnect below).
 4. **`_stop_event.wait()`** — blocks until `stop()` is called.
 
 ### Warm-up details
@@ -413,6 +415,76 @@ Any exception from either broker call is caught by a broad `try/except`. The met
 
 ---
 
+## Automatic Reconnect
+
+### Overview
+
+When the Lightstreamer connection terminates permanently (`"DISCONNECTED"` status), `_on_reconnect()` runs on the worker thread to re-establish streaming without stopping the bot. Position grids are preserved across the disconnect; the reconnect sequence is:
+
+1. **State reset** — `_candle_window`, `_high_window`, `_low_window` are cleared; `_cached_indicators` and `_last_warmup_ts` are set to `None`.
+2. **Re-warmup** — `_warmup()` is called to refill the candle windows from REST. If warmup fails, the strategy proceeds in cold-start mode.
+3. **Service restart** — `streaming_client._restart_streaming(on_candle, on_tick=...)` disconnects the old Lightstreamer service, creates a new one, re-subscribes, and attaches a fresh `_ConnectionListener`. The worker thread stays alive throughout; only the LS service is cycled.
+
+### Idempotency guard
+
+`_reconnecting: bool` prevents a second concurrent reconnect if duplicate sentinels are dispatched before the first attempt completes. Set to `True` at the start of `_on_reconnect`, reset to `False` in a `finally` block (on success or exhaustion). Checked at entry — if already `True`, the call returns immediately.
+
+### Backoff schedule
+
+| Attempt | Delay before attempt |
+|---------|----------------------|
+| 1 | 0s (immediate) |
+| 2 | 5s |
+| 3 | 10s |
+| 4 | 20s |
+| 5–10 | 60s each |
+
+Wait happens after a failed attempt, before the next retry.
+
+### Max attempts and failure exit
+
+After 10 consecutive failed attempts, `_on_reconnect` logs at CRITICAL level and sets `_stop_event`, causing `run()` to unblock and exit cleanly. The `_reconnecting` flag is cleared in `finally` regardless of outcome.
+
+### SystemExit handling
+
+`IGStreamService.create_session()` (from `trading_ig`) calls `sys.exit(1)` on auth failure. `_on_reconnect` catches `SystemExit` alongside `Exception` and treats it as a retriable failure — incrementing the attempt counter and sleeping before retry.
+
+### Position grid preservation
+
+`_long_positions` and `_short_positions` are NOT cleared during reconnect. Positions held at the broker during the outage are still open. `_reconcile_positions()` runs automatically on the first post-reconnect candle, removing any positions the broker closed (by TP/SL) during the disconnect window.
+
+### How sentinels flow
+
+```
+LS internal thread                     Worker thread (ig-streaming-worker)
+──────────────────                     ─────────────────────────────────────
+_ConnectionListener.onStatusChange
+  ("DISCONNECTED")
+      │
+      │ _q.put({"type":"reconnect"})
+      ▼                     ──────────►  queue.get() → type == "reconnect"
+                                              │
+                                              ▼
+                                         on_reconnect()
+                                         [= strategy._on_reconnect()]
+                                              │
+                                         ┌────┴─────┐
+                                         │ set _reconnecting = True
+                                         │ clear windows
+                                         │ _cached_indicators = None
+                                         │ _last_warmup_ts = None
+                                         │ _warmup()
+                                         │ streaming_client._restart_streaming(...)
+                                         │   (new LS service, same worker thread)
+                                         │ set _reconnecting = False
+                                         └──────────┘
+                                         (worker loop continues polling queue)
+```
+
+`"DISCONNECTED:WILL-RETRY"` and `"DISCONNECTED:TRYING-RECOVERY"` do NOT trigger a sentinel — the Lightstreamer library handles those transitions internally.
+
+---
+
 ## Threading Model
 
 The strategy runs on two threads:
@@ -423,21 +495,25 @@ The strategy runs on two threads:
 │                                │      │                                          │
 │  _CandleSubscriptionListener   ──────► queue.put({type:"candle",...})            │
 │  _DirectTickListener (tick mode)──────► queue.put({type:"tick",...})             │
+│  _ConnectionListener           ──────► queue.put({type:"reconnect"})             │
 │                                │      │  ↓                                       │
 │                                │      │  queue.get() → dispatch by type          │
-└────────────────────────────────┘      │  type=candle → _on_candle()              │
+└────────────────────────────────┘      │  type=candle    → _on_candle()           │
                                         │    → cache indicators (tick mode)        │
                                         │    → _manage_longs/_manage_shorts (candle)│
-                                        │  type=tick  → _on_tick()                 │
+                                        │  type=tick      → _on_tick()             │
                                         │    → warmup gate / in-flight guard       │
                                         │    → entry via ig_client                 │
+                                        │  type=reconnect → _on_reconnect()        │
+                                        │    → state reset → warmup                │
+                                        │    → _restart_streaming (no new thread)  │
                                         └──────────────────────────────────────────┘
 ```
 
 All data flows through the **single shared queue**. The worker thread dispatches
 by `item.get("type", "candle")` — items without a `"type"` key default to candle
-for backward compatibility. There is no concurrent REST call risk because `_on_candle`
-and `_on_tick` run sequentially on the same worker thread.
+for backward compatibility. There is no concurrent REST call risk because `_on_candle`,
+`_on_tick`, and `_on_reconnect` run sequentially on the same worker thread.
 
 `run()` blocks on `_stop_event.wait()` while the streaming client's worker thread
 handles all delivery and trading logic.
