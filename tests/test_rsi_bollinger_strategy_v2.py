@@ -73,6 +73,7 @@ def _make_indicators(
     rsi: float = 50.0,
     close: float = 100.0,
     atr: float = 0.0,
+    adx: float = float("nan"),
 ) -> dict:
     """Return a computed-indicators dict as produced by _compute_indicators."""
     return {
@@ -82,6 +83,7 @@ def _make_indicators(
         "rsi": rsi,
         "close": close,
         "atr": atr,
+        "adx": adx,
     }
 
 
@@ -115,6 +117,9 @@ class TestLoadParams:
             "atr_period": 14,
             "atr_multiplier_tp": 1.0,
             "atr_multiplier_sl": 1.5,
+            "enable_adx_filter": False,
+            "adx_period": 14,
+            "adx_threshold": 25.0,
         }
         path = tmp_path / "RSIBollingerStrategyV2.json"
         path.write_text(json.dumps(data))
@@ -1930,6 +1935,9 @@ class TestValidateParamsBranches:
             "atr_period": 14,
             "atr_multiplier_tp": 1.0,
             "atr_multiplier_sl": 1.5,
+            "enable_adx_filter": False,
+            "adx_period": 14,
+            "adx_threshold": 25.0,
         }
         path = tmp_path / "v2.json"
         path.write_text(json.dumps(data))
@@ -2075,6 +2083,9 @@ _HOT_RELOAD_BASE_PARAMS = {
     "atr_period": 14,
     "atr_multiplier_tp": 1.0,
     "atr_multiplier_sl": 1.5,
+    "enable_adx_filter": False,
+    "adx_period": 14,
+    "adx_threshold": 25.0,
 }
 
 
@@ -2417,6 +2428,9 @@ class TestHotReloadRoundTrip:
             "atr_period": 14,
             "atr_multiplier_tp": 1.0,
             "atr_multiplier_sl": 1.5,
+            "enable_adx_filter": False,
+            "adx_period": 14,
+            "adx_threshold": 25.0,
             "test_flag": True,  # valid bool — must pass
         }
         path = tmp_path / "v2.json"
@@ -2755,11 +2769,12 @@ class TestComputeIndicatorsNaN:
         self, make_strategy_v2, make_params_v2
     ):
         """Uniform close prices can cause NaN standard deviation in BB — returns None."""
-        # Use small periods so we can fill the window with few values
-        params = make_params_v2(bb_period=3, rsi_period=2, atr_period=2)
+        # Use small periods so we can fill the window with few values.
+        # adx_period=2 keeps min_required = max(3, 2, 2, 2) + 1 = 4 regardless of filter state.
+        params = make_params_v2(bb_period=3, rsi_period=2, atr_period=2, adx_period=2)
         strat, _, _ = make_strategy_v2(params=params)
         # Fill with exact same price — BB std dev = 0 → BB bands may produce NaN for RSI
-        # min_required = max(3, 2, 2) + 1 = 4 entries, then a 5th to evaluate
+        # min_required = max(3, 2, 2, 2) + 1 = 4 entries, then a 5th to evaluate
         for _ in range(4):
             strat._candle_window.append(100.0)
 
@@ -2784,9 +2799,9 @@ class TestComputeIndicatorsNaN:
         window-size guard passes, then pass a candle with close=NaN. TA-Lib
         propagates NaN to the last bar of BB and RSI output, hitting lines 241-242.
         """
-        params = make_params_v2(bb_period=3, rsi_period=2, atr_period=2)
+        params = make_params_v2(bb_period=3, rsi_period=2, atr_period=2, adx_period=2)
         strat, _, _ = make_strategy_v2(params=params)
-        # min_required = max(3, 2, 2) + 1 = 4; pre-fill 4 valid entries so the
+        # min_required = max(3, 2, 2, 2) + 1 = 4; pre-fill 4 valid entries so the
         # window-size guard passes after _compute_indicators appends the NaN candle
         for i in range(4):
             strat._candle_window.append(100.0 + i)
@@ -4600,9 +4615,9 @@ class TestComputeIndicatorsATR:
         then calls _compute_indicators with a final candle and asserts
         the returned dict has an 'atr' key with a positive float value.
         """
-        params = make_params_v2(bb_period=3, rsi_period=2, atr_period=3)
+        params = make_params_v2(bb_period=3, rsi_period=2, atr_period=3, adx_period=2)
         strat, _, _ = make_strategy_v2(params=params)
-        # min_required = max(3, 2, 3) + 1 = 4; pre-fill 4 entries
+        # min_required = max(3, 2, 3, 2) + 1 = 4; pre-fill 4 entries
         closes = [100.0, 102.0, 98.0, 104.0]
         highs = [103.0, 106.0, 101.0, 108.0]
         lows = [97.0, 99.0, 95.0, 100.0]
@@ -4952,3 +4967,327 @@ class TestRunPassesOnReconnectCallback:
         assert on_reconnect_arg is not None
         assert on_reconnect_arg.__func__ is strat._on_reconnect.__func__
         assert on_reconnect_arg.__self__ is strat
+
+
+# --------------------------------------------------------------------------- #
+# ADX regime filter — judgment-day fixes                                       #
+# --------------------------------------------------------------------------- #
+
+
+class TestADXFilterDisabled:
+    """When enable_adx_filter=False, ADX value does not affect entry decisions."""
+
+    def test_long_entry_proceeds_when_adx_filter_disabled_and_adx_above_threshold(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """ADX > threshold must NOT block long entry when filter is disabled."""
+        params = make_params_v2(enable_adx_filter=False, adx_threshold=25.0)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # ADX=40 is above threshold=25 — but filter is off, so entry proceeds
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0, adx=40.0
+        )
+
+        strat._manage_longs(indicators)
+
+        mock_ig.open_position.assert_called_once()
+
+    def test_short_entry_proceeds_when_adx_filter_disabled_and_adx_above_threshold(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """ADX > threshold must NOT block short entry when filter is disabled."""
+        params = make_params_v2(enable_adx_filter=False, adx_threshold=25.0)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # ADX=40 is above threshold=25 — but filter is off, so entry proceeds
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0, adx=40.0
+        )
+
+        strat._manage_shorts(indicators)
+
+        mock_ig.open_position.assert_called_once()
+
+
+class TestADXFilterEnabled:
+    """When enable_adx_filter=True, entries are blocked when ADX > threshold."""
+
+    def test_long_entry_allowed_when_adx_below_threshold(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """ADX < threshold allows long entry when filter is enabled."""
+        params = make_params_v2(enable_adx_filter=True, adx_threshold=25.0)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # ADX=20 is below threshold=25 — entry allowed
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0, adx=20.0
+        )
+
+        strat._manage_longs(indicators)
+
+        mock_ig.open_position.assert_called_once()
+
+    def test_long_entry_blocked_when_adx_above_threshold(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """ADX > threshold blocks long entry when filter is enabled."""
+        params = make_params_v2(enable_adx_filter=True, adx_threshold=25.0)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # ADX=30 exceeds threshold=25 — entry blocked
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0, adx=30.0
+        )
+
+        strat._manage_longs(indicators)
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_short_entry_blocked_when_adx_above_threshold(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """ADX > threshold blocks short entry when filter is enabled."""
+        params = make_params_v2(enable_adx_filter=True, adx_threshold=25.0)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # ADX=30 exceeds threshold=25 — entry blocked
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0, adx=30.0
+        )
+
+        strat._manage_shorts(indicators)
+
+        mock_ig.open_position.assert_not_called()
+
+
+class TestADXWarmupCandles:
+    """Warmup requests adx_period * 2 candles when ADX filter is enabled."""
+
+    def test_warmup_requests_2x_adx_period_candles_when_filter_enabled(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """When enable_adx_filter=True, num_candles >= adx_period * 2."""
+        params = make_params_v2(
+            enable_adx_filter=True,
+            adx_period=14,
+            bb_period=5,
+            rsi_period=5,
+            atr_period=5,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.get_candles.return_value = (
+            None  # trigger early return; we just care about the call
+        )
+
+        strat._warmup()
+
+        call_args = mock_ig.get_candles.call_args
+        requested_candles = (
+            call_args[0][2]
+            if call_args[0]
+            else call_args.kwargs.get("num_candles", call_args[0][2])
+        )
+        # adx_period * 2 = 28, all other periods are 5 — expected: 28 + 1 = 29
+        assert requested_candles == 14 * 2 + 1
+
+    def test_warmup_requests_standard_candles_when_filter_disabled(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """When enable_adx_filter=False, num_candles uses adx_period (not doubled)."""
+        params = make_params_v2(
+            enable_adx_filter=False,
+            adx_period=14,
+            bb_period=5,
+            rsi_period=5,
+            atr_period=5,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.get_candles.return_value = None
+
+        strat._warmup()
+
+        call_args = mock_ig.get_candles.call_args
+        requested_candles = (
+            call_args[0][2]
+            if call_args[0]
+            else call_args.kwargs.get("num_candles", call_args[0][2])
+        )
+        # max(5, 5, 5, 14) + 1 = 15
+        assert requested_candles == 15
+
+
+class TestADXFilterOnTick:
+    """ADX filter is enforced in _on_tick for both long and short paths."""
+
+    def test_on_tick_long_entry_blocked_by_adx_filter(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick-mode long entry must be blocked when ADX > threshold and filter is enabled."""
+        params = make_params_v2(
+            operation_mode="tick", enable_adx_filter=True, adx_threshold=25.0
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # Set cached indicators with ADX above threshold
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=20.0, close=100.0, adx=35.0
+        )
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_on_tick_short_entry_blocked_by_adx_filter(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick-mode short entry must be blocked when ADX > threshold and filter is enabled."""
+        params = make_params_v2(
+            operation_mode="tick", enable_adx_filter=True, adx_threshold=25.0
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # Set cached indicators with ADX above threshold — use bb values that would normally trigger short
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=80.0, close=100.0, adx=35.0
+        )
+        # bid > bb_upper: 105 > 100, rsi=80 > rsi_overbought=70
+        tick = {"bid": 105.0, "ofr": 106.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_on_tick_long_entry_allowed_when_adx_below_threshold(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick-mode long entry must proceed when ADX < threshold and filter is enabled."""
+        params = make_params_v2(
+            operation_mode="tick",
+            enable_adx_filter=True,
+            adx_threshold=25.0,
+            rsi_oversold=30,
+            max_long_positions=3,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "TICK_LONG_ADX",
+        }
+        # ADX=20 is below threshold=25 — entry must proceed
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=20.0, close=100.0, adx=20.0
+        )
+        # Qualifying tick: bid=90 < bb_lower=100, rsi=20 < rsi_oversold=30
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.open_position.assert_called_once()
+
+    def test_on_tick_short_entry_allowed_when_adx_below_threshold(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick-mode short entry must proceed when ADX < threshold and filter is enabled."""
+        params = make_params_v2(
+            operation_mode="tick",
+            enable_adx_filter=True,
+            adx_threshold=25.0,
+            rsi_overbought=70,
+            max_short_positions=3,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "TICK_SHORT_ADX",
+        }
+        # ADX=20 is below threshold=25 — entry must proceed
+        strat._cached_indicators = _make_indicators(
+            bb_upper=100.0, bb_lower=0.0, rsi=80.0, close=100.0, adx=20.0
+        )
+        # Qualifying tick: bid=110 > bb_upper=100, rsi=80 > rsi_overbought=70
+        tick = {"bid": 110.0, "ofr": 111.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.open_position.assert_called_once()
+
+
+class TestADXFilterNaNHotReload:
+    """NaN ADX never blocks entry — hot-reload scenario where filter toggled ON before ADX stabilizes."""
+
+    def test_long_entry_proceeds_when_adx_is_nan_and_filter_enabled(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """NaN ADX must NOT block long entry even when enable_adx_filter=True.
+
+        This covers the hot-reload scenario: operator toggles enable_adx_filter=True
+        during a cold-start before ADX has accumulated enough bars to stabilize.
+        The gate is strict > (greater-than), and NaN > threshold is always False,
+        so entry must proceed as if the market is ranging.
+        """
+        params = make_params_v2(enable_adx_filter=True, adx_threshold=25.0)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # ADX is NaN — filter on, but NaN should never block
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0, adx=float("nan")
+        )
+
+        strat._manage_longs(indicators)
+
+        mock_ig.open_position.assert_called_once()
+
+    def test_short_entry_proceeds_when_adx_is_nan_and_filter_enabled(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """NaN ADX must NOT block short entry even when enable_adx_filter=True.
+
+        Same hot-reload cold-start scenario as the long path above.
+        """
+        params = make_params_v2(enable_adx_filter=True, adx_threshold=25.0)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # ADX is NaN — filter on, but NaN should never block
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0, adx=float("nan")
+        )
+
+        strat._manage_shorts(indicators)
+
+        mock_ig.open_position.assert_called_once()
+
+
+class TestADXFilterBoundary:
+    """ADX == adx_threshold must NOT block entry — the gate is strict > (greater-than)."""
+
+    def test_long_entry_allowed_when_adx_equals_threshold(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """ADX exactly at threshold (25.0 == 25.0) must NOT block long entry.
+
+        The filter condition is ADX > threshold (strict greater-than).
+        Equal-to must pass through.
+        """
+        params = make_params_v2(enable_adx_filter=True, adx_threshold=25.0)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # ADX=25.0 exactly equals threshold=25.0 — entry must proceed (not blocked)
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0, adx=25.0
+        )
+
+        strat._manage_longs(indicators)
+
+        mock_ig.open_position.assert_called_once()
+
+    def test_short_entry_allowed_when_adx_equals_threshold(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """ADX exactly at threshold (25.0 == 25.0) must NOT block short entry.
+
+        The filter condition is ADX > threshold (strict greater-than).
+        Equal-to must pass through.
+        """
+        params = make_params_v2(enable_adx_filter=True, adx_threshold=25.0)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        # ADX=25.0 exactly equals threshold=25.0 — entry must proceed (not blocked)
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0, adx=25.0
+        )
+
+        strat._manage_shorts(indicators)
+
+        mock_ig.open_position.assert_called_once()

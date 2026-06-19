@@ -46,7 +46,7 @@ Indicators are computed and cached (`_cached_indicators`) on every candle close.
 Entry signals are evaluated on each live tick by `_on_tick()`, using
 the cached indicators together with the live `bid` and `ofr` prices from the tick.
 
-**Warmup gate**: `_on_tick` silently discards ticks until `_cached_indicators` is set — which happens on the first streaming candle that produces valid indicators (requires `max(bb_period, rsi_period, atr_period) + 1` entries in the candle window). After a successful warmup this is the first streaming candle. After a cold-start (warmup failure), this requires `max(bb_period, rsi_period, atr_period)` additional streaming candles. No WARNING is logged during this period.
+**Warmup gate**: `_on_tick` silently discards ticks until `_cached_indicators` is set — which happens on the first streaming candle that produces valid indicators (requires `num_candles` entries in the candle window, where `num_candles` follows the same two-branch formula as `_warmup()` above). After a successful warmup this is the first streaming candle. After a cold-start (warmup failure), this requires additional streaming candles until the window reaches the required size. No WARNING is logged during this period.
 
 **In-flight guards**: Two flags prevent duplicate REST calls in tick mode — `_tick_long_in_flight` and `_tick_short_in_flight`, managed inside `_tick_try_open`. Each flag is set immediately before the REST call and reset in a `finally` block so it is always `False` after the handler returns, even if the call raises.
 
@@ -85,11 +85,15 @@ Lightstreamer
 
 `run()` executes the following sequence on startup:
 
-1. **`_warmup()`** — fetches `max(bb_period, rsi_period, atr_period) + 1` historical
-   candles from the REST API via `IGClient.get_candles()` and appends each row's
-   `Close`, `High`, and `Low` prices directly to `_candle_window`, `_high_window`,
-   and `_low_window`. This pre-fills the windows so that all indicators (BB, RSI,
-   ATR) are valid on the very first live streaming candle.
+1. **`_warmup()`** — fetches historical candles from the REST API via
+   `IGClient.get_candles()` and appends each row's `Close`, `High`, and `Low`
+   prices directly to `_candle_window`, `_high_window`, and `_low_window`. The
+   number of candles requested depends on whether the ADX filter is enabled:
+   - `enable_adx_filter=false`: `max(bb_period, rsi_period, atr_period, adx_period) + 1`
+   - `enable_adx_filter=true`: `max(bb_period, rsi_period, atr_period, adx_period * 2) + 1`
+
+   This pre-fills the windows so that all indicators (BB, RSI, ATR, ADX) are
+   valid on the very first live streaming candle.
 2. **`_seed_positions_from_broker()`** — fetches all open positions from the broker
    via `IGClient.get_open_positions()`, filters by `self.epic`, and populates
    `_long_positions` / `_short_positions` so that the strategy correctly tracks
@@ -106,8 +110,12 @@ Lightstreamer
 `_warmup()` calls `ig.clear_cache()` before anything else, discarding both the
 in-memory and parquet caches so every restart triggers a full historical fetch
 rather than the incremental 3-candle update path. It then calls
-`IGClient.get_candles(epic, candle_frequency, num_candles)`,
-where `num_candles = max(bb_period, rsi_period, atr_period) + 1`. The returned
+`IGClient.get_candles(epic, candle_frequency, num_candles)`, where:
+
+- `enable_adx_filter=false`: `num_candles = max(bb_period, rsi_period, atr_period, adx_period) + 1`
+- `enable_adx_filter=true`: `num_candles = max(bb_period, rsi_period, atr_period, adx_period * 2) + 1`
+
+The returned
 DataFrame has capitalized OHLC columns (`Open`, `High`, `Low`, `Close`) and a
 `DatetimeIndex`.
 
@@ -184,8 +192,8 @@ from the Lightstreamer adapter — not mid-market prices. `bid_close` and
 on bid prices throughout.
 
 The strategy discards candle data until the rolling window holds at least
-`max(bb_period, rsi_period, atr_period) + 1` completed candles, ensuring
-indicators are computed from a full dataset.
+`num_candles` completed candles (using the same two-branch formula as `_warmup()`),
+ensuring all indicators are computed from a full dataset.
 
 ---
 
@@ -330,6 +338,48 @@ because the ATR indicator window must be re-computed from scratch.
 To revert: set `"close_mode"` back to `"fixed"`.
 
 ---
+
+## ADX Regime Filter
+
+The ADX (Average Directional Index) filter gates entry signals to low-trending
+(mean-reverting) market conditions. When ADX is above the configured threshold
+the market is trending strongly and the strategy's mean-reversion logic is less
+likely to succeed, so entries are blocked.
+
+### Parameters
+
+| Parameter | Type | Default | Hot-reload | Description |
+|-----------|------|---------|------------|-------------|
+| `enable_adx_filter` | bool | `true` | Yes | Enables ADX regime filter. When `false`, ADX is still computed but does not affect entry decisions. |
+| `adx_period` | int | `14` | No (restart required) | Rolling window for ADX calculation. Changing this requires a bot restart. |
+| `adx_threshold` | float | `25.0` | Yes | Entries are blocked when `ADX > adx_threshold`. Lower values restrict entries to more ranging markets. |
+
+### Behavior
+
+- **ADX ≤ threshold**: entry proceeds normally (ranging market — favorable for mean reversion).
+- **ADX > threshold**: entry blocked in both `_manage_longs`, `_manage_shorts`, and both `_on_tick` paths (log at INFO level).
+- **ADX is NaN**: entry proceeds normally — the warmup formula (`adx_period * 2`) ensures ADX is already stable when `_compute_indicators` first returns a valid dict.
+- **Filter disabled** (`enable_adx_filter=false`): ADX is computed on every candle for logging purposes but does not affect entry decisions.
+
+### Warmup candle count
+
+When `enable_adx_filter=true`, TA-Lib's `ADX(period=N)` needs `2 * N` bars
+to produce a valid (non-NaN) value. The warmup formula accounts for this:
+
+```
+enable_adx_filter=true:  num_candles = max(bb_period, rsi_period, atr_period, adx_period * 2) + 1
+enable_adx_filter=false: num_candles = max(bb_period, rsi_period, atr_period, adx_period) + 1
+```
+
+With default parameters (`adx_period=14`), the filter-enabled path fetches
+29 candles instead of 21. The warmup guarantees ADX is non-NaN by the time
+indicators are first returned — no stabilization window occurs in production.
+
+### Hot-reload behavior
+
+`enable_adx_filter` and `adx_threshold` are hot-safe — changes take effect on
+the next closed candle without restarting the bot. `adx_period` is
+restart-required because the ADX window must be re-computed from scratch.
 
 ---
 
@@ -591,7 +641,11 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
   "close_mode": "dynamic",
   "atr_period": 14,
   "atr_multiplier_tp": 1.0,
-  "atr_multiplier_sl": 1.5
+  "atr_multiplier_sl": 1.5,
+
+  "enable_adx_filter": true,
+  "adx_period": 14,
+  "adx_threshold": 25.0
 }
 ```
 

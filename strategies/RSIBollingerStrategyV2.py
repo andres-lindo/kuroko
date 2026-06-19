@@ -51,6 +51,9 @@ _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
     "atr_period": int,
     "atr_multiplier_tp": float,
     "atr_multiplier_sl": float,
+    "enable_adx_filter": bool,
+    "adx_period": int,
+    "adx_threshold": (int, float),
 }
 
 
@@ -195,6 +198,8 @@ class RSIBollingerStrategyV2:
             "close_mode",
             "atr_multiplier_tp",
             "atr_multiplier_sl",
+            "enable_adx_filter",
+            "adx_threshold",
         }
     )
 
@@ -208,6 +213,7 @@ class RSIBollingerStrategyV2:
             "api_mode",
             "operation_mode",
             "atr_period",
+            "adx_period",
         }
     )
 
@@ -275,8 +281,19 @@ class RSIBollingerStrategyV2:
         self._current_spread: float | None = None
 
         # Rolling window of closed candles — minimum length for indicator calculation
-        # Needs max(bb_period, rsi_period, atr_period) candles for all indicators to be valid
-        min_window = max(params.bb_period, params.rsi_period, params.atr_period) + 1
+        # When ADX filter is enabled, ADX(period=N) needs 2*N bars to stabilize,
+        # so use adx_period * 2 as the ADX term when the filter is active.
+        _adx_window_term = (
+            params.adx_period * 2
+            if getattr(params, "enable_adx_filter", False)
+            else params.adx_period
+        )
+        min_window = (
+            max(
+                params.bb_period, params.rsi_period, params.atr_period, _adx_window_term
+            )
+            + 1
+        )
         self._candle_window: deque = deque(maxlen=min_window + 50)
         # Parallel high/low windows for ATR computation — same maxlen as _candle_window
         self._high_window: deque = deque(maxlen=min_window + 50)
@@ -340,8 +357,18 @@ class RSIBollingerStrategyV2:
         self._low_window.append(candle.get("low", close))
 
         window_size = len(self._candle_window)
+        _adx_window_term = (
+            self.params.adx_period * 2
+            if getattr(self.params, "enable_adx_filter", False)
+            else self.params.adx_period
+        )
         min_required = (
-            max(self.params.bb_period, self.params.rsi_period, self.params.atr_period)
+            max(
+                self.params.bb_period,
+                self.params.rsi_period,
+                self.params.atr_period,
+                _adx_window_term,
+            )
             + 1
         )
 
@@ -379,6 +406,14 @@ class RSIBollingerStrategyV2:
         else:
             atr_arr = np.array([np.nan])
 
+        if n > 0:
+            adx_arr = ta.ADX(
+                highs, lows, closes_for_atr, timeperiod=self.params.adx_period
+            )
+            current_adx = float(adx_arr[-1])
+        else:
+            current_adx = float("nan")
+
         current_close = closes[-1]
         current_bb_upper = float(bb_upper[-1])
         current_bb_middle = float(bb_middle[-1])
@@ -394,7 +429,7 @@ class RSIBollingerStrategyV2:
         logger.debug(
             f"Indicators computed: close={current_close:.2f} "
             f"BB=[{current_bb_lower:.2f}, {current_bb_middle:.2f}, {current_bb_upper:.2f}] "
-            f"RSI={current_rsi:.2f} ATR={current_atr:.4f}"
+            f"RSI={current_rsi:.2f} ATR={current_atr:.4f} ADX={current_adx:.2f}"
         )
 
         return {
@@ -404,6 +439,7 @@ class RSIBollingerStrategyV2:
             "rsi": current_rsi,
             "close": current_close,
             "atr": current_atr,
+            "adx": current_adx,
         }
 
     # ---------------------------------------------------------------------- #
@@ -473,25 +509,41 @@ class RSIBollingerStrategyV2:
     def _warmup(self) -> None:
         """Pre-fill the candle windows from REST historical data before streaming starts.
 
-        Fetches max(bb_period, rsi_period, atr_period) + 1 candles via
-        IGClient.get_candles() and appends each row's Close/High/Low directly to
-        _candle_window/_high_window/_low_window. Sets _last_warmup_ts to the last
-        REST candle's timestamp so that _on_candle can discard overlapping streaming
-        candles.
+        Fetches num_candles via IGClient.get_candles() and appends each row's
+        Close/High/Low directly to _candle_window/_high_window/_low_window.
+        Sets _last_warmup_ts to the last REST candle's timestamp so that
+        _on_candle can discard overlapping streaming candles.
+
+        num_candles formula:
+          enable_adx_filter=True:  max(bb_period, rsi_period, atr_period, adx_period * 2) + 1
+          enable_adx_filter=False: max(bb_period, rsi_period, atr_period, adx_period) + 1
+
+        The adx_period * 2 term ensures ADX is non-NaN on the first returned
+        indicators dict when the filter is active.
 
         On failure (None response or any exception), logs a WARNING and returns early.
         The strategy then starts in cold-start mode with an empty candle window.
         """
         self.ig.clear_cache()
         logger.info("Candle cache cleared — forcing fresh historical load.")
+        _adx_window_term = (
+            self.params.adx_period * 2
+            if getattr(self.params, "enable_adx_filter", False)
+            else self.params.adx_period
+        )
         num_candles = (
-            max(self.params.bb_period, self.params.rsi_period, self.params.atr_period)
+            max(
+                self.params.bb_period,
+                self.params.rsi_period,
+                self.params.atr_period,
+                _adx_window_term,
+            )
             + 1
         )
         logger.debug(
             f"Warm-up: requesting {num_candles} candles "
             f"(bb_period={self.params.bb_period} rsi_period={self.params.rsi_period} "
-            f"atr_period={self.params.atr_period})"
+            f"atr_period={self.params.atr_period} adx_period={self.params.adx_period})"
         )
         logger.info(
             f"Warm-up starting: fetching {num_candles} historical candles "
@@ -698,6 +750,13 @@ class RSIBollingerStrategyV2:
                 f"rsi={rsi:.2f} rsi_oversold={self.params.rsi_oversold}"
             )
             return
+        if self.params.enable_adx_filter:
+            adx = indicators.get("adx", float("nan"))
+            if adx > self.params.adx_threshold:
+                logger.info(
+                    f"Long entry skipped — ADX filter: adx={adx:.2f} > threshold={self.params.adx_threshold:.1f}"
+                )
+                return
         if len(self._long_positions) >= self.params.max_long_positions:
             logger.debug(
                 f"Long entry skipped — max positions reached: "
@@ -754,7 +813,8 @@ class RSIBollingerStrategyV2:
                 )
                 logger.info(
                     f"Opened LONG {deal_id} @ {close:.2f} | "
-                    f"size={size} | ATR={indicators['atr']:.2f} | TP dist={limit_distance} | SL dist={stop_distance}"
+                    f"size={size} | ATR={indicators['atr']:.2f} | TP dist={limit_distance} | SL dist={stop_distance} | "
+                    f"ADX={indicators.get('adx', float('nan')):.2f} (filter={'ON' if self.params.enable_adx_filter else 'OFF'})"
                 )
         except Exception as e:
             logger.error(f"Failed to open long position: {e}")
@@ -796,6 +856,13 @@ class RSIBollingerStrategyV2:
                 f"rsi={rsi:.2f} rsi_overbought={self.params.rsi_overbought}"
             )
             return
+        if self.params.enable_adx_filter:
+            adx = indicators.get("adx", float("nan"))
+            if adx > self.params.adx_threshold:
+                logger.info(
+                    f"Short entry skipped — ADX filter: adx={adx:.2f} > threshold={self.params.adx_threshold:.1f}"
+                )
+                return
         if len(self._short_positions) >= self.params.max_short_positions:
             logger.debug(
                 f"Short entry skipped — max positions reached: "
@@ -852,7 +919,8 @@ class RSIBollingerStrategyV2:
                 )
                 logger.info(
                     f"Opened SHORT {deal_id} @ {close:.2f} | "
-                    f"size={size} | ATR={indicators['atr']:.2f} | TP dist={limit_distance} | SL dist={stop_distance}"
+                    f"size={size} | ATR={indicators['atr']:.2f} | TP dist={limit_distance} | SL dist={stop_distance} | "
+                    f"ADX={indicators.get('adx', float('nan')):.2f} (filter={'ON' if self.params.enable_adx_filter else 'OFF'})"
                 )
         except Exception as e:
             logger.error(f"Failed to open short position: {e}")
@@ -1127,6 +1195,7 @@ class RSIBollingerStrategyV2:
             f"BB=[{indicators['bb_lower']:.2f}, {indicators['bb_upper']:.2f}] "
             f"RSI={indicators['rsi']:.2f} "
             f"ATR={indicators['atr']:.2f} "
+            f"ADX={indicators.get('adx', float('nan')):.2f} (filter={'ON' if self.params.enable_adx_filter else 'OFF'}) "
             f"longs={len(self._long_positions)} shorts={len(self._short_positions)}"
         )
 
@@ -1386,6 +1455,11 @@ class RSIBollingerStrategyV2:
                         bid,
                         last_entry,
                     )
+            if _long_dist_ok and self.params.enable_adx_filter:
+                _adx = self._cached_indicators.get("adx", float("nan"))
+                if _adx > self.params.adx_threshold:
+                    logger.info("tick long_entry: skipped (ADX filter) adx=%.2f", _adx)
+                    _long_dist_ok = False
             if _long_dist_ok:
                 logger.debug(
                     "tick long_entry: triggered bid=%.5f < bb_lower=%.5f rsi=%.2f",
@@ -1414,6 +1488,11 @@ class RSIBollingerStrategyV2:
                         bid,
                         last_entry,
                     )
+            if _short_dist_ok and self.params.enable_adx_filter:
+                _adx = self._cached_indicators.get("adx", float("nan"))
+                if _adx > self.params.adx_threshold:
+                    logger.info("tick short_entry: skipped (ADX filter) adx=%.2f", _adx)
+                    _short_dist_ok = False
             if _short_dist_ok:
                 logger.debug(
                     "tick short_entry: triggered bid=%.5f > bb_upper=%.5f rsi=%.2f",

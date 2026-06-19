@@ -103,6 +103,9 @@ def make_params_v2():
             "atr_period": 14,
             "atr_multiplier_tp": 1.0,
             "atr_multiplier_sl": 1.5,
+            "enable_adx_filter": False,
+            "adx_period": 14,
+            "adx_threshold": 25.0,
         }
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)

@@ -8,7 +8,7 @@
   "bb_period": 20,
   "bb_std": 1.8,
   "rsi_period": 7,
-  "rsi_oversold": 30.0,
+  "rsi_oversold":30.0,
   "rsi_overbought": 70.0,
 
   "max_long_positions": 10,
@@ -21,6 +21,10 @@
 
   "close_mode": "dynamic",
   "atr_period": 14,
-  "atr_multiplier_tp": 1.0,
-  "atr_multiplier_sl": 1.5
+  "atr_multiplier_tp": 1.5,
+  "atr_multiplier_sl": 1.5,
+
+  "enable_adx_filter": true,
+  "adx_period": 14,
+  "adx_threshold": 25.0
 }
