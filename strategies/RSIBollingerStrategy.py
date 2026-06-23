@@ -23,14 +23,9 @@ logger = logging.getLogger(__name__)
 # float fields accept int values (e.g. 240 is valid for take_profit_ticks).
 # bool fields are checked before int because bool is a subclass of int in Python.
 _PARAMS_SCHEMA: dict[str, type] = {
-    "log_partition_key": str,
     "epic": str,
-    "candle_frecuency": str,
-    "leverage": int,
+    "candle_frequency": str,
     "lookback": int,
-    "demo_starting_balance": float,
-    "initial_cash_balance": float,
-    "security_buffer": float,
     "max_positions": int,
     "position_size": float,
     "min_dist_between_entries_ticks": float,
@@ -92,15 +87,15 @@ def _validate_params(data: dict, path: str) -> None:
             )
 
     if errors:
-        logging.critical(
+        logger.critical(
             f"Parameter validation failed for {path} — {len(errors)} error(s):\n"
             + "\n".join(errors)
         )
         sys.exit(1)
 
-    if not re.match(r"^\d+min$", data["candle_frecuency"]):
-        logging.critical(
-            f"Invalid candle_frecuency in {path} — must match '<N>min' (e.g. '15min'), got: {data['candle_frecuency']!r}"
+    if not re.match(r"^[1-9]\d*min$", data["candle_frequency"]):
+        logger.critical(
+            f"Invalid candle_frequency in {path} — must match '<N>min' (e.g. '15min'), got: {data['candle_frequency']!r}"
         )
         sys.exit(1)
 
@@ -123,24 +118,26 @@ def load_params(
 
     Raises:
         SystemExit: If the file is missing, unreadable, contains invalid JSON,
-            has missing keys, type mismatches, or an invalid ``candle_frecuency``.
+            has missing keys, type mismatches, or an invalid ``candle_frequency``.
     """
     try:
         with open(path, "r", encoding="utf-8") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        logging.critical(f"Parameters file not found: {path}")
+        logger.critical(f"Parameters file not found: {path}")
         sys.exit(1)
     except json.JSONDecodeError as e:
-        logging.critical(f"Invalid JSON in {path}: {e}")
+        logger.critical(f"Invalid JSON in {path}: {e}")
         sys.exit(1)
     except OSError as e:
-        logging.critical(f"Could not read {path}: {e}")
+        logger.critical(f"Could not read {path}: {e}")
         sys.exit(1)
 
     _validate_params(data, path)
 
-    logging.info(f"Parameters loaded from {path}.")
+    # This fires during the bootstrap phase before setup_logging() is called,
+    # so the message reaches only the console via basicConfig — this is expected.
+    logger.info(f"Parameters loaded from {path}.")
     return types.SimpleNamespace(**data)
 
 
@@ -159,13 +156,16 @@ class RSIBollingerStrategy:
         max_drawdown_reached: Flag set when equity breaches the drawdown floor.
     """
 
-    def __init__(self, params, ig_client):
+    def __init__(self, params, ig_client, trading_config):
         """Initialise strategy state and load parameters.
 
         Args:
             params: Config object loaded from strategies/RSIBollingerStrategy.json
-                (e.g. candle_frecuency, max_positions, epic).
+                (e.g. candle_frequency, max_positions, lookback).
             ig_client: Authenticated IGClient instance.
+            trading_config: SimpleNamespace with infrastructure params sourced from
+                config.json["trading"] (epic, leverage, demo_starting_balance,
+                initial_cash_balance, security_buffer).
         """
         self.params = params
         self.ig = ig_client
@@ -193,13 +193,15 @@ class RSIBollingerStrategy:
 
         # Safety flag — True when ig_acc_type="LIVE", False otherwise (including "DEMO")
         self.is_live_account = os.getenv("ig_acc_type") == "LIVE"
-        self.demo_starting_balance = params.demo_starting_balance
-        self.initial_cash_balance = params.initial_cash_balance
 
-        self.leverage = params.leverage
+        # Infrastructure parameters — epic sourced from strategy JSON; others from config.json["trading"]
         self.epic = params.epic
+        self.leverage = trading_config.leverage
+        self.demo_starting_balance = trading_config.demo_starting_balance
+        self.initial_cash_balance = trading_config.initial_cash_balance
+        self.security_buffer = trading_config.security_buffer
+
         self.lookback = params.lookback
-        self.security_buffer = params.security_buffer
 
     def get_candles(self):
         """Fetch the latest candles from IG and compute all indicators.
@@ -223,7 +225,9 @@ class RSIBollingerStrategy:
             DataFrame when no cache exists and the fetch fails.
         """
         try:
-            df = self.ig.get_candles(self.epic, "15min", self.lookback)
+            df = self.ig.get_candles(
+                self.epic, self.params.candle_frequency, self.lookback
+            )
 
             if df is not None:
                 df = df.copy()
@@ -585,7 +589,10 @@ class RSIBollingerStrategy:
             n_trades = len(positions) if positions else 0
 
             if self.is_live_account:
-                # LIVE mode: use raw broker figures
+                # LIVE mode: use raw broker figures for consistency.
+                # Both used_margin (deposit) and free_margin (available) come from
+                # the broker so they reflect the same account state, including any
+                # positions or hedges not opened by this bot.
                 current_equity = account_info.get("balance", 0.0) + open_pnl
                 used_margin = (
                     sum((p["size"] * p["level"] / self.leverage) for p in positions)
@@ -661,7 +668,7 @@ class RSIBollingerStrategy:
         with the configured candle frequency, and runs the full cycle:
         fetch candles → manage positions → log account status.
         """
-        freq = int(self.params.candle_frecuency.replace("min", ""))
+        freq = int(self.params.candle_frequency.replace("min", ""))
         logger.info(f"Strategy running. Execution every {freq} minutes.")
         next_tick = (datetime.now() + timedelta(minutes=1)).replace(
             second=0, microsecond=0

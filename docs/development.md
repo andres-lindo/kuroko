@@ -99,9 +99,9 @@ pre-commit run --all-files
 - **Formatter**: black (enforced via pre-commit, line length default: 88)
 - **Language**: all code, variable names, inline comments, docstrings, and log messages must be in English
 - **Secrets**: never commit `credentials.env` or any file containing API keys or connection strings
-- **Config changes**: strategy parameters for live trading are stored in `strategies/RSIBollingerStrategy.json` and committed to the repository. Edit that file directly and redeploy the bot to apply changes. See [RSIBollingerStrategy documentation](../docs/strategies/RSIBollingerStrategy.md) for the full parameter reference.
+- **Config changes**: strategy parameters (signal and risk tuning) for live trading are stored in `strategies/<StrategyName>.json` and committed to the repository. Edit the file for the strategy you are running and redeploy the bot to apply changes. See the strategy documentation for the full parameter reference ([V1](../docs/strategies/RSIBollingerStrategy.md), [V2](../docs/strategies/RSIBollingerStrategyV2.md)). The `epic` instrument identifier is stored in the strategy JSON for both V1 and V2. Infrastructure parameters (`leverage`, `demo_starting_balance`, `initial_cash_balance`, `security_buffer`) are stored in `config.json["trading"]`.
 
-> **Note**: `strategies/RSIBollingerStrategy.json` (live) and `backtest/strategies/RSIBollingerStrategy.json` (backtest) are independent files. Tuning results from Optuna must be manually applied to the live config. See [backtest/README.md](../backtest/README.md) for details.
+> **Note**: `strategies/RSIBollingerStrategy.json` (live V1) and `backtest/strategies/RSIBollingerStrategy.json` (backtest) are independent files. Tuning results from Optuna must be manually applied to the live config. See [backtest/README.md](../backtest/README.md) for details.
 
 - **Dependencies**: add new external packages to `requirements.txt` (root) or `backtest/requirements.txt` depending on which execution context requires them
 
@@ -126,6 +126,38 @@ logger.info(f"Cache loaded from disk for {epic} {res}")
 # wrong
 logger.info("Cache loaded from disk for %s %s", epic, res)
 ```
+
+#### Logging Configuration
+
+Logging is bootstrapped by `logging_setup.py`. Startup follows this sequence:
+
+1. `logging.basicConfig()` at module level provides console output during the bootstrap phase (config and strategy loading).
+2. `load_app_config()` reads `config.json` from the project root.
+3. `load_strategy()` / `load_params()` loads the strategy class and its parameters.
+4. `setup_logging(config["logging"], config["logging"]["azure_log_partition_key"], override_level=args.log_level)` — called **once**, after params are loaded. This replaces the basicConfig handlers with the configured file, Azure Blob, and/or console handlers. If `--log-level` was passed on the CLI, it overrides the `log_level` value from `config.json`.
+
+If `load_params` or `load_strategy` crashes, the error is visible on the console via `basicConfig` — this is acceptable for a startup failure.
+
+**`config.json` — `logging` section keys:**
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `log_type` | array | `["file"]` | Active handler types. Valid values: `"file"`, `"azure_table"`. Any combination is valid; `[]` disables all non-console handlers. |
+| `log_level` | string | `"INFO"` | Root logger level (`"DEBUG"`, `"INFO"`, `"WARNING"`, `"ERROR"`, `"CRITICAL"`). |
+| `log_dir` | string | `"logs"` | Directory for rotated log files. Created automatically if it does not exist. |
+| `log_file_name` | string | `"kuroko.log"` | Base filename inside `log_dir`. Rotated files get a date suffix (e.g. `kuroko.log.2026-05-27`). |
+| `retention_days` | integer | `7` | Log files older than this many days are deleted at startup. |
+| `console_logging` | boolean | `true` | Attach a `StreamHandler(stdout)` when `true`. |
+| `structured_format` | boolean | `true` | When `true`, uses pipe-delimited format: `%(asctime)s | %(levelname)s | %(name)s | %(message)s`. When `false`, uses `%(asctime)s [%(levelname)s] %(name)s: %(message)s`. |
+
+**Fallback behaviour:** If `config.json` is missing or contains invalid JSON, `load_app_config()` returns the defaults above and logs a `WARNING`. The bot continues normally — no crash on config absence.
+
+**`azure_log_partition_key`** is sourced from `config.json["logging"]["azure_log_partition_key"]`. It is passed as the `partition_key` argument to `setup_logging()`. It is NOT stored in the strategy JSON.
+
+**Adding a new handler type:**
+1. Add a new string value (e.g. `"file_json"`) to the valid `log_type` values.
+2. In `logging_setup.py`, add an `if "file_json" in log_type:` branch inside `setup_logging()`.
+3. Apply `formatter` to the new handler before attaching it to `root` — all handlers share the same formatter instance for consistent output.
 
 ### Error Handling
 
@@ -159,7 +191,7 @@ def open_position(self, epic: str, size: float, side: str) -> dict:
     """Opens a new market position via the IG API.
 
     Args:
-        epic: Instrument identifier (e.g. 'IX.D.NASDAQ.IFMM.IP').
+        epic: Instrument identifier (e.g. 'IX.D.SPTRD.IFMM.IP').
         size: Position size in contracts.
         side: Trade direction, either 'BUY' or 'SELL'.
 
@@ -268,4 +300,58 @@ The `strategies/` directory is a Python package (contains `__init__.py`). The mo
 
 After updating the live strategy module, update the corresponding values in `strategies/<StrategyClassName>.json` and commit before deploying.
 
+#### api_mode (required in every strategy JSON)
+
+Every strategy JSON **must** declare `"api_mode"`. Valid values:
+
+| Value | Behaviour |
+|-------|-----------|
+| `"rest"` | `kuroko.py` uses the existing REST polling flow. No streaming client is created. |
+| `"streaming"` | `kuroko.py` creates `IGStreamingClient` from `IGClient.ig_service` and passes it to the strategy constructor. |
+
+`kuroko.py` raises `ConfigurationError` (and exits with code 1) if `api_mode` is absent or has any other value. There is no implicit fallback.
+
+#### REST-mode strategy (reference: RSIBollingerStrategy)
+
+Constructor signature: `__init__(self, params, ig_client, trading_config)`
+
+The strategy receives a polling interval via `params.candle_frequency` and calls
+`ig_client` REST methods directly inside its run loop.
+
 See [RSIBollingerStrategy documentation](../docs/strategies/RSIBollingerStrategy.md) for the reference implementation.
+
+#### Streaming-mode strategy (reference: RSIBollingerStrategyV2)
+
+Constructor signature: `__init__(self, params, ig_client, streaming_client, trading_config)`
+
+The extra `streaming_client` argument is an `IGStreamingClient` instance. The
+strategy registers `_on_candle` as the callback and blocks on a stop event:
+
+```python
+def run(self) -> None:
+    self._stop_event.clear()
+    self.streaming_client.start(self._on_candle)
+    self._stop_event.wait()
+
+def stop(self) -> None:
+    self.streaming_client.stop()  # halt candle delivery immediately
+    self._stop_event.set()        # unblock run()
+```
+
+`IGStreamingClient` maintains its own internal queue and worker thread. Candles
+flow: LS thread → `IGStreamingClient` queue → worker thread → `_on_candle()`.
+There is no intermediate queue inside the strategy. All trading logic and REST
+calls run on the streaming client's worker thread.
+
+When mocking `IGStreamingClient` in unit tests, patch `start()` to immediately
+invoke the callback with a pre-built candle dict, then assert on `ig_client`
+method calls:
+
+```python
+def fake_start(callback):
+    callback(candle)
+
+mock_streaming.start.side_effect = fake_start
+```
+
+See [RSIBollingerStrategyV2 documentation](../docs/strategies/RSIBollingerStrategyV2.md) for the full reference.

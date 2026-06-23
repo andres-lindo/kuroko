@@ -1,0 +1,18 @@
+{
+  "logging": {
+    "log_type": ["file"],
+    "log_level": "INFO",
+    "log_dir": "logs",
+    "log_file_name": "kuroko.log",
+    "retention_days": 7,
+    "console_logging": true,
+    "structured_format": true,
+    "azure_log_partition_key": "DEV_NQ100"
+  },
+  "trading": {
+    "leverage": 200,
+    "demo_starting_balance": 20000.0,
+    "initial_cash_balance": 4000.0,
+    "security_buffer": 1000.0
+  }
+}

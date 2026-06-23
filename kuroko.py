@@ -1,20 +1,31 @@
 """Entry point for the Kuroko live trading bot.
 
-Dynamically loads the configured strategy module, initialises logging
-(console and Azure Blob), connects to IG Markets, and starts the strategy loop.
+Dynamically loads the configured strategy module, initialises logging via
+logging_setup (file, Azure Blob, and/or console per config.json), wires
+infrastructure params from config.json["trading"] into the strategy, connects
+to IG Markets, and starts the strategy loop.
+
+Supports two api_mode values declared in the strategy JSON:
+- ``"rest"``: existing REST-polling flow; no streaming infrastructure created.
+- ``"streaming"``: creates IGStreamingClient and passes it to the strategy.
+
+api_mode is required. A missing or unrecognised value raises ConfigurationError
+immediately — there is no implicit fallback.
 """
 
 import importlib
 import logging
 import os
 import sys
+import types
 import warnings
 
 import argparse
 from dotenv import load_dotenv
 
-from azure_log_handler import AzureBlobHandler
+from logging_setup import _DEFAULTS, load_app_config, setup_logging
 from ig_client import IGClient
+from ig_streaming_client import IGStreamingClient, candle_frequency_to_resolution
 
 BANNER = r"""
   ██╗  ██╗██╗   ██╗██████╗  ██████╗ ██╗  ██╗ ██████╗
@@ -28,30 +39,11 @@ BANNER = r"""
        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-
-# Route unhandled exceptions through the standard logger instead of stderr
-def handle_exception(exc_type, exc_value, exc_traceback):
-    """Log unhandled exceptions before the interpreter exits.
-
-    Allows KeyboardInterrupt to pass through to the default handler so
-    CTRL+C still terminates the process cleanly.
-
-    Args:
-        exc_type: Exception class of the unhandled exception.
-        exc_value: Exception instance.
-        exc_traceback: Traceback object.
-    """
-    if issubclass(exc_type, KeyboardInterrupt):
-        sys.__excepthook__(exc_type, exc_value, exc_traceback)
-        return
-
-    logging.error("Unhandled exception:", exc_info=(exc_type, exc_value, exc_traceback))
-
-
 # Load secrets from credentials.env before any module reads environment variables
 load_dotenv("credentials.env")
 
-# Configure root logger so all modules emit to stdout with a consistent format
+# Configure a minimal root logger so early-startup warnings (e.g. from
+# load_app_config) are visible before setup_logging() replaces the handlers.
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
@@ -65,6 +57,121 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="trading_ig.uti
 warnings.filterwarnings("ignore", category=FutureWarning, module="trading_ig.rest")
 
 logger = logging.getLogger(__name__)
+
+_VALID_API_MODES = ("rest", "streaming")
+
+
+class ConfigurationError(Exception):
+    """Raised when a required configuration value is missing or unrecognised.
+
+    Used to signal startup failures that are not recoverable — e.g. a strategy
+    JSON that lacks an ``api_mode`` key or declares an unknown mode.
+    """
+
+
+def _wire_strategy(
+    strategy_class: type,
+    params,
+    ig,
+    trading_config,
+    return_streaming: bool = False,
+    params_path: str | None = None,
+):
+    """Instantiate the strategy with the appropriate clients for its api_mode.
+
+    Reads ``params.api_mode`` and either creates an ``IGStreamingClient``
+    (streaming mode) or uses only the REST client (rest mode).  Raises
+    ``ConfigurationError`` if ``api_mode`` is absent or unrecognised.
+
+    Args:
+        strategy_class: The strategy class to instantiate.
+        params: SimpleNamespace loaded from the strategy JSON.  Must contain
+            an ``api_mode`` attribute.
+        ig: Authenticated ``IGClient`` instance.
+        trading_config: SimpleNamespace with infrastructure params sourced from
+            ``config.json["trading"]``.
+        return_streaming: When True, return a ``(strategy, streaming_client)``
+            tuple instead of only the strategy.  Useful for shutdown wiring.
+        params_path: Optional path to the strategy JSON file passed through to
+            the strategy constructor to enable hot-reload on candle close.
+
+    Returns:
+        The instantiated strategy, or ``(strategy, streaming_client)`` when
+        ``return_streaming`` is True.
+
+    Raises:
+        ConfigurationError: If ``api_mode`` is missing or not in
+            ``_VALID_API_MODES``.
+    """
+    api_mode = getattr(params, "api_mode", None)
+
+    if api_mode is None:
+        raise ConfigurationError(
+            "Strategy params are missing the required 'api_mode' key. "
+            f'Add \'"api_mode": "rest"\' or \'"api_mode": "streaming"\' '
+            f"to the strategy JSON."
+        )
+
+    if api_mode not in _VALID_API_MODES:
+        raise ConfigurationError(
+            f"Unknown api_mode '{api_mode}'. "
+            f"Valid values are: {', '.join(_VALID_API_MODES)}."
+        )
+
+    streaming_client = None
+
+    if api_mode == "streaming":
+        candle_freq = getattr(params, "candle_frequency", "5min")
+        resolution = candle_frequency_to_resolution(candle_freq)
+        streaming_client = IGStreamingClient(
+            ig.ig_service,
+            params.epic,
+            resolution=resolution,
+        )
+        strat = strategy_class(
+            params=params,
+            ig_client=ig,
+            streaming_client=streaming_client,
+            trading_config=trading_config,
+            params_path=params_path,
+        )
+        logger.info("Streaming mode: IGStreamingClient wired to strategy.")
+    else:
+        strat = strategy_class(
+            params=params,
+            ig_client=ig,
+            trading_config=trading_config,
+        )
+        logger.info("REST mode: using existing REST-polling flow.")
+
+    if return_streaming:
+        return strat, streaming_client
+    return strat
+
+
+def _run_strategy(strat, streaming_client=None) -> None:
+    """Run the strategy loop and handle graceful shutdown.
+
+    Calls ``strat.run()`` and catches ``KeyboardInterrupt`` for clean exit.
+    When a streaming client is provided, ``stop()`` is called on it after the
+    strategy finishes (regardless of how it exits).
+
+    Args:
+        strat: Instantiated strategy with a ``run()`` method.
+        streaming_client: Optional ``IGStreamingClient`` to stop on exit.
+    """
+    logger.info("Kuroko started. Press CTRL+C to stop.")
+    try:
+        strat.run()
+    except KeyboardInterrupt:
+        logger.info("CTRL+C detected. Exiting...")
+    except Exception:
+        logger.exception("Critical application error:")
+        raise
+    finally:
+        if streaming_client is not None:
+            logger.info("Stopping streaming client...")
+            streaming_client.stop()
 
 
 def load_strategy(strategy_name: str) -> tuple[type, callable]:
@@ -115,37 +222,12 @@ def load_strategy(strategy_name: str) -> tuple[type, callable]:
     return strategy_class, load_params_fn
 
 
-def setup_azure_logging(partition_key: str) -> None:
-    """Attach the AzureBlobHandler to the root logger for cloud log shipping.
-
-    Also registers the unhandled-exception hook so crashes are captured in the
-    blob before the process exits. Fails gracefully — a warning is logged and
-    the bot continues without cloud shipping if the handler cannot be created.
-
-    Args:
-        partition_key: Label used to identify this deployment's log blob.
-    """
-    try:
-        conn_str = os.getenv("table_storage_connection")
-        azure_handler = AzureBlobHandler(
-            connection_string=conn_str, blob_name=partition_key, container_name="logs"
-        )
-        azure_handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-        )
-        logging.getLogger().addHandler(azure_handler)
-        logging.info(f"Azure Blob logging configured for partition: {partition_key}")
-        sys.excepthook = handle_exception
-    except Exception as e:
-        logging.warning(f"Could not configure Azure Blob logging: {e}")
-
-
 def main():
     """Parse CLI arguments, bootstrap the bot, and start the strategy loop.
 
     Dynamically loads the configured strategy and its parameters, attaches
-    Azure Blob log shipping (using ``log_partition_key`` from the strategy
-    JSON), and then runs the strategy until interrupted.
+    Azure Blob log shipping (using ``azure_log_partition_key`` from
+    config.json["logging"]), and then runs the strategy until interrupted.
 
     If the strategy module cannot be loaded or parameter loading fails, a
     CRITICAL log entry is written and the process exits with code 1.
@@ -158,24 +240,58 @@ def main():
         required=True,
         help="Strategy class name (e.g. RSIBollingerStrategy)",
     )
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        type=str.upper,
+        help="Set the root logging level (default: INFO)",
+    )
     args = parser.parse_args()
 
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(project_root, "config.json")
+    config = load_app_config(config_path)
+
+    # Resolve log_dir to an absolute path anchored at the project root so the
+    # bot creates logs relative to its own directory regardless of CWD.
+    log_dir = config["logging"].get("log_dir", "logs")
+    if not os.path.isabs(log_dir):
+        config["logging"]["log_dir"] = os.path.join(project_root, log_dir)
+
     strategy_class, load_params = load_strategy(args.strategy)
-    params = load_params(f"strategies/{args.strategy}.json")
-    setup_azure_logging(params.log_partition_key)
+    strategy_path = os.path.join(project_root, "strategies", f"{args.strategy}.json")
+    params = load_params(strategy_path)
 
-    # Initialise broker client and strategy, then enter the main loop
+    # Configure all handlers once, after params are loaded so the Azure Blob
+    # handler uses the correct partition_key from config.json["logging"].
+    # Console output during the bootstrap phase above is handled by basicConfig.
+    partition_key = config["logging"].get(
+        "azure_log_partition_key",
+        _DEFAULTS["logging"]["azure_log_partition_key"],
+    )
+    setup_logging(config["logging"], partition_key, override_level=args.log_level)
+
+    # Build trading_config from config["trading"]
+    trading_config = types.SimpleNamespace(**config["trading"])
+
+    # Initialise broker client, wire strategy for the declared api_mode, and run
     ig = IGClient()
-    strat = strategy_class(params=params, ig_client=ig)
 
-    logging.info("Kuroko started. Press CTRL+C to stop.")
     try:
-        strat.run()
-    except KeyboardInterrupt:
-        logging.info("CTRL+C detected. Exiting...")
-    except Exception:
-        logging.exception("Critical application error:")
-        raise
+        strat, streaming = _wire_strategy(
+            strategy_class=strategy_class,
+            params=params,
+            ig=ig,
+            trading_config=trading_config,
+            return_streaming=True,
+            params_path=strategy_path,
+        )
+    except ConfigurationError as e:
+        logger.critical(f"Configuration error: {e}")
+        sys.exit(1)
+
+    _run_strategy(strat, streaming)
 
 
 if __name__ == "__main__":
