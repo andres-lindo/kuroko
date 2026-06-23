@@ -11,7 +11,8 @@ import logging
 import pandas as pd
 from pathlib import Path
 from time import sleep
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from requests.exceptions import ConnectionError, RequestException
 
 from trading_ig import IGService
@@ -62,12 +63,29 @@ class IGClient:
         self.cache_dir = Path("./cache")
         self.cache_dir.mkdir(exist_ok=True)
 
+    @property
+    def ig_service(self):
+        """Return the underlying IGService instance for streaming auth.
+
+        Provides read-only access to the authenticated IGService so that
+        callers (e.g. IGStreamingClient) can create a streaming session
+        from the same REST auth without re-authenticating.
+
+        Returns:
+            The active IGService object created during __init__.
+        """
+        return self._svc
+
     def _safe_api_call(self, func, *args, max_retries=3, **kwargs):
         """Execute an API call with retry and session-refresh logic.
 
         Retries up to max_retries times on connection or IG API errors.
         If the error message indicates an expired token, the session is
-        refreshed before retrying. Waits use exponential backoff (1, 2, 4 s).
+        refreshed before retrying. If the refresh itself returns a token error
+        (session completely dead, e.g. after a weekend), a full re-login with
+        credentials is attempted. If re-login also fails, the call raises
+        immediately without further retries. Waits use exponential backoff
+        (1, 2, 4 s) for non-auth errors.
 
         Args:
             func: Callable from self._svc to invoke.
@@ -109,6 +127,28 @@ class IGClient:
                             continue  # Retry with the new session
                         except Exception as refresh_error:
                             log.error(f"Error refreshing session: {refresh_error}")
+                            # Refresh itself returned a token error — the session is
+                            # completely dead (e.g. after a weekend). Attempt a full
+                            # re-login with credentials before giving up.
+                            if "token" in str(refresh_error).lower():
+                                log.warning(
+                                    "Token refresh failed with auth error. "
+                                    "Clearing stale session headers and attempting "
+                                    "full re-login..."
+                                )
+                                # trading_ig persists CST and X-SECURITY-TOKEN on
+                                # the requests.Session. IG validates these even on
+                                # POST /session, so they must be cleared before a
+                                # fresh login can succeed.
+                                for header in ("CST", "X-SECURITY-TOKEN"):
+                                    self._svc.session.headers.pop(header, None)
+                                try:
+                                    self._svc.create_session()
+                                    log.info("Full re-login succeeded.")
+                                    continue  # Retry the original call
+                                except Exception as relogin_error:
+                                    log.error(f"Full re-login failed: {relogin_error}")
+                                    raise  # Session unrecoverable — give up immediately
 
                 log.debug(
                     f"Connection error (attempt {attempt + 1}/{max_retries}): {e}"
@@ -146,9 +186,18 @@ class IGClient:
         if df.empty:
             return df
 
-        # Normalise execution time to the current minute boundary
-        exec_time = datetime.now().replace(second=0, microsecond=0)
-        last_candle_time = pd.to_datetime(df.index[-1]).replace(second=0, microsecond=0)
+        # IG REST API returns snapshotTime in London local time (Europe/London).
+        # Localise the last candle's naive timestamp to London, convert to UTC,
+        # then compare against the current UTC time — so the comparison is correct
+        # regardless of the machine's local timezone.
+        _LONDON = ZoneInfo("Europe/London")
+        last_candle_naive = pd.to_datetime(df.index[-1]).replace(
+            second=0, microsecond=0
+        )
+        last_candle_time = last_candle_naive.replace(tzinfo=_LONDON).astimezone(
+            timezone.utc
+        )
+        exec_time = datetime.now(timezone.utc).replace(second=0, microsecond=0)
 
         # Derive timeframe width from resolution string
         timeframe_minutes = (
@@ -170,7 +219,13 @@ class IGClient:
             )
             return df
 
-    def get_candles(self, epic: str, res: str, num_points: int = 200) -> pd.DataFrame:
+    def get_candles(
+        self,
+        epic: str,
+        res: str,
+        num_points: int = 200,
+        price_type: str = "bid",
+    ) -> pd.DataFrame:
         """Return OHLC candles for the given epic, using cached data when possible.
 
         On the first call for an epic/resolution pair, fetches num_points + 1
@@ -179,9 +234,12 @@ class IGClient:
         and merge them into the cache, so the API is queried minimally.
 
         Args:
-            epic: Instrument identifier (e.g. 'IX.D.NASDAQ.IFMM.IP').
+            epic: Instrument identifier (e.g. 'IX.D.SPTRD.IFMM.IP').
             res: Candle resolution string (e.g. '15min').
             num_points: Number of candles to return.
+            price_type: Which IG price series to use — 'bid', 'ask', or 'mid'.
+                Defaults to 'bid'. Use 'mid' to align indicator values with
+                broker charts that display mid prices.
 
         Returns:
             DataFrame with columns Open/High/Low/Close and a datetime index,
@@ -189,7 +247,7 @@ class IGClient:
             load fails after all retries — callers must handle None explicitly
             and treat it as "no data available for this tick."
         """
-        cache_key = f"{epic}_{res}"
+        cache_key = f"{epic}_{res}_{price_type}"
 
         # Try to warm the cache from disk on first access
         if cache_key not in self.candles_cache:
@@ -213,7 +271,12 @@ class IGClient:
                     res,
                     num_points + 1,  # one extra to guard against an incomplete bar
                 )
-                df = resp["prices"]["bid"]
+                prices = resp["prices"]
+                df = (
+                    (prices["bid"] + prices["ask"]) / 2
+                    if price_type == "mid"
+                    else prices[price_type]
+                )
 
                 # Drop the current (incomplete) candle if present
                 df = self._remove_incomplete_candle(df, res)
@@ -240,7 +303,12 @@ class IGClient:
             resp = self._safe_api_call(
                 self._svc.fetch_historical_prices_by_epic_and_num_points, epic, res, 3
             )
-            new_df = resp["prices"]["bid"]
+            prices = resp["prices"]
+            new_df = (
+                (prices["bid"] + prices["ask"]) / 2
+                if price_type == "mid"
+                else prices[price_type]
+            )
 
             # Drop the incomplete candle from the freshly fetched slice
             new_df = self._remove_incomplete_candle(new_df, res)
@@ -288,8 +356,8 @@ class IGClient:
 
         Returns:
             List of dicts with keys: dealReference, dealId, level, size,
-            createdDate, direction. Returns an empty list on error or if
-            there are no open positions.
+            createdDate, direction, epic. Returns an empty list on error or
+            if there are no open positions.
         """
         try:
             open_positions = self._safe_api_call(self._svc.fetch_open_positions)
@@ -297,9 +365,24 @@ class IGClient:
             if open_positions.empty:
                 return []
 
-            return open_positions[
-                ["dealReference", "dealId", "level", "size", "createdDate", "direction"]
-            ].to_dict(orient="records")
+            expected_cols = [
+                "dealReference",
+                "dealId",
+                "level",
+                "size",
+                "createdDate",
+                "direction",
+                "epic",
+            ]
+            missing_cols = [c for c in expected_cols if c not in open_positions.columns]
+            if missing_cols:
+                log.warning(
+                    f"get_open_positions: unexpected DataFrame schema — missing columns "
+                    f"{missing_cols}. Returning empty list to avoid KeyError."
+                )
+                return []
+
+            return open_positions[expected_cols].to_dict(orient="records")
         except Exception as e:
             log.error(f"Error fetching open positions: {e}")
             return []
@@ -334,7 +417,7 @@ class IGClient:
         """Open a new market-order position.
 
         Args:
-            epic: Instrument identifier (e.g. 'IX.D.NASDAQ.IFMM.IP').
+            epic: Instrument identifier (e.g. 'IX.D.SPTRD.IFMM.IP').
             size: Number of contracts to trade.
             side: Trade direction, either 'BUY' or 'SELL'.
             currency: Currency code for the deal (default 'USD').
@@ -345,7 +428,7 @@ class IGClient:
             API response dict from trading_ig containing dealReference
             and confirmation status.
         """
-        return self._safe_api_call(
+        response = self._safe_api_call(
             self._svc.create_open_position,
             currency_code=currency,
             direction=side,
@@ -364,6 +447,8 @@ class IGClient:
             trailing_stop=None,
             trailing_stop_increment=None,
         )
+        log.debug(f"open_position confirms response: {response}")
+        return response
 
     def update_position(self, dealid: str, stop: float = None, limit: float = None):
         """Update the stop-loss and/or take-profit level on an open position.
