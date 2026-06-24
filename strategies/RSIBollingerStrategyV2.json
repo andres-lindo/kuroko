@@ -22,9 +22,18 @@
   "close_mode": "dynamic",
   "atr_period": 14,
   "atr_multiplier_tp": 1.5,
-  "atr_multiplier_sl": 1.5,
+  "atr_multiplier_sl": 1.7,
 
   "enable_adx_filter": true,
   "adx_period": 14,
-  "adx_threshold": 25.0
+  "adx_threshold": 20.0,
+
+  "reconcile_grace_period_seconds": 30,
+  "session_filter_enabled": true,
+  "session_filter_start_utc": 0,
+  "session_filter_end_utc": 7,
+  "enable_adx_regime_exit": true,
+  "enable_daily_circuit_breaker": true,
+  "daily_loss_limit_usd": -50.0,
+  "max_trades_per_day": 15
 }
