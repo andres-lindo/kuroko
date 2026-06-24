@@ -104,6 +104,14 @@
       "sessions": 3,
       "memories": 11,
       "prompts": 0
+    },
+    {
+      "id": "ac17fdfe",
+      "created_by": "lindocag",
+      "created_at": "2026-06-24T11:50:05Z",
+      "sessions": 2,
+      "memories": 15,
+      "prompts": 0
     }
   ]
 }
