@@ -120,6 +120,13 @@ class TestLoadParams:
             "enable_adx_filter": False,
             "adx_period": 14,
             "adx_threshold": 25.0,
+            "session_filter_enabled": False,
+            "session_filter_start_utc": 0,
+            "session_filter_end_utc": 7,
+            "enable_adx_regime_exit": False,
+            "enable_daily_circuit_breaker": False,
+            "daily_loss_limit_usd": -50.0,
+            "max_trades_per_day": 15,
         }
         path = tmp_path / "RSIBollingerStrategyV2.json"
         path.write_text(json.dumps(data))
@@ -804,7 +811,7 @@ class TestPhantomPositionReconciliation:
 
         positions_at_manage_longs_call: list = []
 
-        def capture_positions_snapshot(indicators):
+        def capture_positions_snapshot(indicators, **kwargs):
             # Snapshot the long positions list at the moment _manage_longs runs.
             # Reconciliation must have already cleared DEAD by this point.
             positions_at_manage_longs_call.extend(list(strat._long_positions))
@@ -1938,6 +1945,13 @@ class TestValidateParamsBranches:
             "enable_adx_filter": False,
             "adx_period": 14,
             "adx_threshold": 25.0,
+            "session_filter_enabled": False,
+            "session_filter_start_utc": 0,
+            "session_filter_end_utc": 7,
+            "enable_adx_regime_exit": False,
+            "enable_daily_circuit_breaker": False,
+            "daily_loss_limit_usd": -50.0,
+            "max_trades_per_day": 15,
         }
         path = tmp_path / "v2.json"
         path.write_text(json.dumps(data))
@@ -2048,6 +2062,16 @@ class TestValidateParamsBranches:
             "atr_period": 14,
             "atr_multiplier_tp": 1.0,
             "atr_multiplier_sl": 1.5,
+            "enable_adx_filter": False,
+            "adx_period": 14,
+            "adx_threshold": 25.0,
+            "session_filter_enabled": False,
+            "session_filter_start_utc": 0,
+            "session_filter_end_utc": 7,
+            "enable_adx_regime_exit": False,
+            "enable_daily_circuit_breaker": False,
+            "daily_loss_limit_usd": -50.0,
+            "max_trades_per_day": 15,
             "test_flag": "not_a_bool",  # string for a bool-typed key → must be rejected
         }
         path = tmp_path / "v2.json"
@@ -2086,6 +2110,13 @@ _HOT_RELOAD_BASE_PARAMS = {
     "enable_adx_filter": False,
     "adx_period": 14,
     "adx_threshold": 25.0,
+    "session_filter_enabled": False,
+    "session_filter_start_utc": 0,
+    "session_filter_end_utc": 7,
+    "enable_adx_regime_exit": False,
+    "enable_daily_circuit_breaker": False,
+    "daily_loss_limit_usd": -50.0,
+    "max_trades_per_day": 15,
 }
 
 
@@ -2431,6 +2462,13 @@ class TestHotReloadRoundTrip:
             "enable_adx_filter": False,
             "adx_period": 14,
             "adx_threshold": 25.0,
+            "session_filter_enabled": False,
+            "session_filter_start_utc": 0,
+            "session_filter_end_utc": 7,
+            "enable_adx_regime_exit": False,
+            "enable_daily_circuit_breaker": False,
+            "daily_loss_limit_usd": -50.0,
+            "max_trades_per_day": 15,
             "test_flag": True,  # valid bool — must pass
         }
         path = tmp_path / "v2.json"
@@ -5290,4 +5328,557 @@ class TestADXFilterBoundary:
 
         strat._manage_shorts(indicators)
 
-        mock_ig.open_position.assert_called_once()
+
+# =========================================================================== #
+# Phase 1: Schema & Config — strategy-safeguards                               #
+# =========================================================================== #
+
+_NEW_PARAM_KEYS = [
+    "session_filter_enabled",
+    "session_filter_start_utc",
+    "session_filter_end_utc",
+    "enable_adx_regime_exit",
+    "enable_daily_circuit_breaker",
+    "daily_loss_limit_usd",
+    "max_trades_per_day",
+]
+
+
+class TestSchemaIncludesNewParams:
+    """All 8 new params must be declared in _PARAMS_SCHEMA."""
+
+    def test_schema_includes_new_params(self):
+        """All 8 new param keys must be present in _PARAMS_SCHEMA."""
+        for key in _NEW_PARAM_KEYS:
+            assert key in _PARAMS_SCHEMA, f"'{key}' missing from _PARAMS_SCHEMA"
+
+
+class TestNewParamsAreHotSafe:
+    """All 8 new params must be present in _HOT_SAFE_PARAMS."""
+
+    def test_new_params_are_hot_safe(self):
+        """All 8 new param keys must be in _HOT_SAFE_PARAMS."""
+        from strategies.RSIBollingerStrategyV2 import RSIBollingerStrategyV2
+
+        for key in _NEW_PARAM_KEYS:
+            assert (
+                key in RSIBollingerStrategyV2._HOT_SAFE_PARAMS
+            ), f"'{key}' missing from _HOT_SAFE_PARAMS"
+
+
+class TestADXThresholdConfig:
+    """RSIBollingerStrategyV2.json must have adx_threshold=20.0 and all 8 new params."""
+
+    def test_json_adx_threshold_is_20(self):
+        """adx_threshold in V2 JSON must be 20.0 after the config change."""
+        data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
+        assert data.get("adx_threshold") == pytest.approx(
+            20.0
+        ), f"Expected adx_threshold=20.0, got {data.get('adx_threshold')!r}"
+
+    def test_json_has_new_params(self):
+        """All 8 new param keys must be present in V2 JSON."""
+        data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
+        for key in _NEW_PARAM_KEYS:
+            assert key in data, f"'{key}' missing from RSIBollingerStrategyV2.json"
+
+
+# =========================================================================== #
+# Phase 3: Session Time Filter — TestSessionFilter                             #
+# =========================================================================== #
+
+
+class TestSessionFilter:
+    """_is_session_entry_allowed enforces UTC hour range (with wrap-around)."""
+
+    def test_is_session_entry_allowed_blocked_in_range(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Hour 3 is inside range [0, 7) -> blocked (returns False)."""
+        params = make_params_v2(
+            session_filter_enabled=True,
+            session_filter_start_utc=0,
+            session_filter_end_utc=7,
+        )
+        strat, _, _ = make_strategy_v2(params=params)
+        with patch("strategies.RSIBollingerStrategyV2.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 5, 3, 0, tzinfo=timezone.utc)
+            result = strat._is_session_entry_allowed()
+        assert result is False
+
+    def test_is_session_entry_allowed_allowed_outside_range(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Hour 9 is outside range [0, 7) -> allowed (returns True)."""
+        params = make_params_v2(
+            session_filter_enabled=True,
+            session_filter_start_utc=0,
+            session_filter_end_utc=7,
+        )
+        strat, _, _ = make_strategy_v2(params=params)
+        with patch("strategies.RSIBollingerStrategyV2.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 5, 9, 0, tzinfo=timezone.utc)
+            result = strat._is_session_entry_allowed()
+        assert result is True
+
+    def test_is_session_entry_allowed_disabled(self, make_strategy_v2, make_params_v2):
+        """When session_filter_enabled=False, all hours return True."""
+        params = make_params_v2(
+            session_filter_enabled=False,
+            session_filter_start_utc=0,
+            session_filter_end_utc=7,
+        )
+        strat, _, _ = make_strategy_v2(params=params)
+        with patch("strategies.RSIBollingerStrategyV2.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 5, 3, 0, tzinfo=timezone.utc)
+            result = strat._is_session_entry_allowed()
+        assert result is True
+
+    def test_is_session_entry_allowed_wraparound_blocked_before_midnight(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Wrap-around range [22, 7): hour 23 is blocked."""
+        params = make_params_v2(
+            session_filter_enabled=True,
+            session_filter_start_utc=22,
+            session_filter_end_utc=7,
+        )
+        strat, _, _ = make_strategy_v2(params=params)
+        with patch("strategies.RSIBollingerStrategyV2.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 5, 23, 0, tzinfo=timezone.utc)
+            result = strat._is_session_entry_allowed()
+        assert result is False
+
+    def test_is_session_entry_allowed_wraparound_blocked_after_midnight(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Wrap-around range [22, 7): hour 5 is blocked."""
+        params = make_params_v2(
+            session_filter_enabled=True,
+            session_filter_start_utc=22,
+            session_filter_end_utc=7,
+        )
+        strat, _, _ = make_strategy_v2(params=params)
+        with patch("strategies.RSIBollingerStrategyV2.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 5, 5, 0, tzinfo=timezone.utc)
+            result = strat._is_session_entry_allowed()
+        assert result is False
+
+    def test_is_session_entry_allowed_wraparound_allowed(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Wrap-around range [22, 7): hour 10 is allowed."""
+        params = make_params_v2(
+            session_filter_enabled=True,
+            session_filter_start_utc=22,
+            session_filter_end_utc=7,
+        )
+        strat, _, _ = make_strategy_v2(params=params)
+        with patch("strategies.RSIBollingerStrategyV2.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 1, 5, 10, 0, tzinfo=timezone.utc)
+            result = strat._is_session_entry_allowed()
+        assert result is True
+
+    def test_manage_longs_skips_entry_when_can_enter_false(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """_manage_longs(can_enter=False) must not call open_position."""
+        params = make_params_v2(
+            session_filter_enabled=True,
+            session_filter_start_utc=0,
+            session_filter_end_utc=7,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
+        )
+
+        strat._manage_longs(indicators, can_enter=False)
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_manage_shorts_skips_entry_when_can_enter_false(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """_manage_shorts(can_enter=False) must not call open_position."""
+        params = make_params_v2(
+            session_filter_enabled=True,
+            session_filter_start_utc=0,
+            session_filter_end_utc=7,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0
+        )
+
+        strat._manage_shorts(indicators, can_enter=False)
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_on_tick_respects_cached_daily_limit_ok_false(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """When _cached_daily_limit_ok=False, _on_tick must not attempt any entry."""
+        params = make_params_v2(
+            operation_mode="tick",
+            session_filter_enabled=True,
+            session_filter_start_utc=0,
+            session_filter_end_utc=7,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._cached_indicators = _make_indicators(
+            bb_upper=200.0, bb_lower=100.0, rsi=20.0, close=100.0
+        )
+        strat._cached_daily_limit_ok = False
+        tick = {"bid": 90.0, "ofr": 91.0, "utm": 0}
+
+        strat._on_tick(tick)
+
+        mock_ig.open_position.assert_not_called()
+
+
+# =========================================================================== #
+# Phase 4: Regime Exit — TestRegimeExit                                        #
+# =========================================================================== #
+
+
+class TestRegimeExit:
+    """_check_regime_exit closes losing positions when ADX signals a trending regime."""
+
+    def test_losing_long_closed_when_adx_above_threshold(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Losing long with ADX=28 > threshold=20 must be closed via ig.close_position."""
+        params = make_params_v2(
+            enable_adx_regime_exit=True,
+            enable_adx_filter=True,
+            adx_threshold=20.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 100.0, "size": 1.0}]
+        indicators = _make_indicators(close=98.0, adx=28.0)
+
+        strat._check_regime_exit(indicators)
+
+        mock_ig.close_position.assert_called_once_with("L1", "SELL", 1.0)
+
+    def test_profitable_long_not_closed(self, make_strategy_v2, make_params_v2):
+        """Profitable long (close > entry) must NOT be closed by regime exit."""
+        params = make_params_v2(
+            enable_adx_regime_exit=True,
+            enable_adx_filter=True,
+            adx_threshold=20.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 100.0, "size": 1.0}]
+        indicators = _make_indicators(close=102.0, adx=28.0)
+
+        strat._check_regime_exit(indicators)
+
+        mock_ig.close_position.assert_not_called()
+
+    def test_losing_short_closed_when_adx_above_threshold(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Losing short (close > entry) with ADX=28 must be closed with side=BUY."""
+        params = make_params_v2(
+            enable_adx_regime_exit=True,
+            enable_adx_filter=True,
+            adx_threshold=20.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._short_positions = [{"deal_id": "S1", "entry_price": 100.0, "size": 1.0}]
+        indicators = _make_indicators(close=102.0, adx=28.0)
+
+        strat._check_regime_exit(indicators)
+
+        mock_ig.close_position.assert_called_once_with("S1", "BUY", 1.0)
+
+    def test_profitable_short_not_closed(self, make_strategy_v2, make_params_v2):
+        """Profitable short (close < entry) must NOT be closed by regime exit."""
+        params = make_params_v2(
+            enable_adx_regime_exit=True,
+            enable_adx_filter=True,
+            adx_threshold=20.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._short_positions = [{"deal_id": "S1", "entry_price": 100.0, "size": 1.0}]
+        indicators = _make_indicators(close=98.0, adx=28.0)
+
+        strat._check_regime_exit(indicators)
+
+        mock_ig.close_position.assert_not_called()
+
+    def test_regime_exit_disabled(self, make_strategy_v2, make_params_v2):
+        """When enable_adx_regime_exit=False, no position must be closed."""
+        params = make_params_v2(
+            enable_adx_regime_exit=False,
+            enable_adx_filter=True,
+            adx_threshold=20.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 100.0, "size": 1.0}]
+        indicators = _make_indicators(close=98.0, adx=28.0)
+
+        strat._check_regime_exit(indicators)
+
+        mock_ig.close_position.assert_not_called()
+
+    def test_regime_exit_requires_adx_filter_enabled(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Regime exit must not fire when enable_adx_filter=False."""
+        params = make_params_v2(
+            enable_adx_regime_exit=True,
+            enable_adx_filter=False,
+            adx_threshold=20.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 100.0, "size": 1.0}]
+        indicators = _make_indicators(close=98.0, adx=28.0)
+
+        strat._check_regime_exit(indicators)
+
+        mock_ig.close_position.assert_not_called()
+
+    def test_regime_exit_removes_position_from_grid(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """After regime exit closes a position, it must be removed from _long_positions."""
+        params = make_params_v2(
+            enable_adx_regime_exit=True,
+            enable_adx_filter=True,
+            adx_threshold=20.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._long_positions = [{"deal_id": "L1", "entry_price": 100.0, "size": 1.0}]
+        indicators = _make_indicators(close=98.0, adx=28.0)
+
+        strat._check_regime_exit(indicators)
+
+        assert len(strat._long_positions) == 0
+
+    def test_regime_exit_logs_warning(self, make_strategy_v2, make_params_v2, caplog):
+        """Regime exit must emit a WARNING log including ADX value and deal_id."""
+        import logging
+
+        params = make_params_v2(
+            enable_adx_regime_exit=True,
+            enable_adx_filter=True,
+            adx_threshold=20.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._long_positions = [
+            {"deal_id": "WARN_DEAL", "entry_price": 100.0, "size": 1.0}
+        ]
+        indicators = _make_indicators(close=98.0, adx=28.0)
+
+        with caplog.at_level(
+            logging.WARNING, logger="strategies.RSIBollingerStrategyV2"
+        ):
+            strat._check_regime_exit(indicators)
+
+        warning_msgs = [
+            r.message for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any("WARN_DEAL" in m or "28" in m for m in warning_msgs)
+
+
+# =========================================================================== #
+# Phase 5: Daily Circuit Breaker — TestDailyCircuitBreaker                    #
+# =========================================================================== #
+
+
+class TestDailyCircuitBreaker:
+    """_is_daily_limit_reached and _check_daily_reset control daily entry limits."""
+
+    def test_entries_blocked_after_max_trades(self, make_strategy_v2, make_params_v2):
+        """_is_daily_limit_reached returns True when trade count >= max_trades_per_day."""
+        params = make_params_v2(
+            enable_daily_circuit_breaker=True,
+            max_trades_per_day=15,
+            daily_loss_limit_usd=-50.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.get_account_summary.return_value = {"balance": 1000.0}
+        strat._daily_trade_count = 15
+        strat._session_start_balance = 1000.0
+
+        assert strat._is_daily_limit_reached() is True
+
+    def test_entries_blocked_when_loss_limit_exceeded(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """_is_daily_limit_reached returns True when balance delta < daily_loss_limit_usd."""
+        params = make_params_v2(
+            enable_daily_circuit_breaker=True,
+            max_trades_per_day=15,
+            daily_loss_limit_usd=-50.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._daily_trade_count = 5
+        strat._session_start_balance = 1000.0
+        mock_ig.get_account_summary.return_value = {"balance": 944.0}
+
+        assert strat._is_daily_limit_reached() is True
+
+    def test_entries_allowed_when_within_limits(self, make_strategy_v2, make_params_v2):
+        """_is_daily_limit_reached returns False when both limits are within range."""
+        params = make_params_v2(
+            enable_daily_circuit_breaker=True,
+            max_trades_per_day=15,
+            daily_loss_limit_usd=-50.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._daily_trade_count = 5
+        strat._session_start_balance = 1000.0
+        mock_ig.get_account_summary.return_value = {"balance": 980.0}
+
+        assert strat._is_daily_limit_reached() is False
+
+    def test_circuit_breaker_disabled(self, make_strategy_v2, make_params_v2):
+        """When enable_daily_circuit_breaker=False, _is_daily_limit_reached returns False."""
+        params = make_params_v2(
+            enable_daily_circuit_breaker=False,
+            max_trades_per_day=0,
+            daily_loss_limit_usd=0.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._daily_trade_count = 100
+        strat._session_start_balance = 1000.0
+        mock_ig.get_account_summary.return_value = {"balance": 0.0}
+
+        assert strat._is_daily_limit_reached() is False
+
+    def test_midnight_reset_resets_trade_count(self, make_strategy_v2, make_params_v2):
+        """_check_daily_reset resets _daily_trade_count to 0 when date changes."""
+        from datetime import date
+
+        params = make_params_v2(
+            enable_daily_circuit_breaker=True,
+            max_trades_per_day=15,
+            daily_loss_limit_usd=-50.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        yesterday = date(2026, 1, 4)
+        strat._last_reset_date = yesterday
+        strat._daily_trade_count = 10
+        mock_ig.get_account_summary.return_value = {"balance": 1000.0}
+
+        with patch("strategies.RSIBollingerStrategyV2.datetime") as mock_dt:
+            mock_dt.now.return_value.date.return_value = date(2026, 1, 5)
+            strat._check_daily_reset()
+
+        assert strat._daily_trade_count == 0
+
+    def test_midnight_reset_recaptures_balance(self, make_strategy_v2, make_params_v2):
+        """_check_daily_reset recaptures _session_start_balance from get_account_summary."""
+        from datetime import date
+
+        params = make_params_v2(
+            enable_daily_circuit_breaker=True,
+            max_trades_per_day=15,
+            daily_loss_limit_usd=-50.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        yesterday = date(2026, 1, 4)
+        strat._last_reset_date = yesterday
+        strat._session_start_balance = 900.0
+        mock_ig.get_account_summary.return_value = {"balance": 1050.0}
+
+        with patch("strategies.RSIBollingerStrategyV2.datetime") as mock_dt:
+            mock_dt.now.return_value.date.return_value = date(2026, 1, 5)
+            strat._check_daily_reset()
+
+        assert strat._session_start_balance == pytest.approx(1050.0)
+
+    def test_trade_count_incremented_on_manage_longs_open(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Successful long open must increment _daily_trade_count by 1."""
+        params = make_params_v2(
+            enable_daily_circuit_breaker=True,
+            max_trades_per_day=15,
+            daily_loss_limit_usd=-50.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "TRADE_COUNT_LONG",
+        }
+        strat._daily_trade_count = 3
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
+        )
+
+        strat._manage_longs(indicators)
+
+        assert strat._daily_trade_count == 4
+
+    def test_trade_count_incremented_on_manage_shorts_open(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Successful short open must increment _daily_trade_count by 1."""
+        params = make_params_v2(
+            enable_daily_circuit_breaker=True,
+            max_trades_per_day=15,
+            daily_loss_limit_usd=-50.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "TRADE_COUNT_SHORT",
+        }
+        strat._daily_trade_count = 3
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0
+        )
+
+        strat._manage_shorts(indicators)
+
+        assert strat._daily_trade_count == 4
+
+    def test_entries_blocked_when_rest_exception(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """_is_daily_limit_reached returns True (fail-closed) when REST call raises."""
+        params = make_params_v2(
+            enable_daily_circuit_breaker=True,
+            max_trades_per_day=15,
+            daily_loss_limit_usd=-50.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._session_start_balance = 1000.0
+        strat._daily_trade_count = 0
+        mock_ig.get_account_summary.side_effect = RuntimeError("connection failed")
+
+        assert strat._is_daily_limit_reached() is True
+
+    def test_circuit_breaker_logs_warning_on_trip(
+        self, make_strategy_v2, make_params_v2, caplog
+    ):
+        """WARNING must be logged when circuit breaker trips."""
+        import logging
+
+        params = make_params_v2(
+            enable_daily_circuit_breaker=True,
+            max_trades_per_day=5,
+            daily_loss_limit_usd=-50.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        strat._daily_trade_count = 5
+        strat._session_start_balance = 1000.0
+        mock_ig.get_account_summary.return_value = {"balance": 1000.0}
+
+        with caplog.at_level(
+            logging.WARNING, logger="strategies.RSIBollingerStrategyV2"
+        ):
+            strat._is_daily_limit_reached()
+
+        warning_msgs = [
+            r.message for r in caplog.records if r.levelno == logging.WARNING
+        ]
+        assert any(
+            "circuit" in m.lower() or "limit" in m.lower() or "trade" in m.lower()
+            for m in warning_msgs
+        )

@@ -106,6 +106,14 @@ def make_params_v2():
             "enable_adx_filter": False,
             "adx_period": 14,
             "adx_threshold": 25.0,
+            # strategy-safeguards defaults (off by default in tests)
+            "session_filter_enabled": False,
+            "session_filter_start_utc": 0,
+            "session_filter_end_utc": 7,
+            "enable_adx_regime_exit": False,
+            "enable_daily_circuit_breaker": False,
+            "daily_loss_limit_usd": -50.0,
+            "max_trades_per_day": 15,
         }
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)

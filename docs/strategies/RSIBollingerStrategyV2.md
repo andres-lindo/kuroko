@@ -332,7 +332,7 @@ because the ATR indicator window must be re-computed from scratch.
 ### Switching from fixed to dynamic
 
 1. Edit `strategies/RSIBollingerStrategyV2.json`: set `"close_mode": "dynamic"`.
-2. Optionally tune `atr_multiplier_tp` (default `1.0`) and `atr_multiplier_sl` (default `1.5`).
+2. Optionally tune `atr_multiplier_tp` (default `1.5`) and `atr_multiplier_sl` (default `1.7`).
 3. Save the file — the change takes effect on the next candle close (no restart needed).
 
 To revert: set `"close_mode"` back to `"fixed"`.
@@ -352,7 +352,7 @@ likely to succeed, so entries are blocked.
 |-----------|------|---------|------------|-------------|
 | `enable_adx_filter` | bool | `true` | Yes | Enables ADX regime filter. When `false`, ADX is still computed but does not affect entry decisions. |
 | `adx_period` | int | `14` | No (restart required) | Rolling window for ADX calculation. Changing this requires a bot restart. |
-| `adx_threshold` | float | `25.0` | Yes | Entries are blocked when `ADX > adx_threshold`. Lower values restrict entries to more ranging markets. |
+| `adx_threshold` | float | `20.0` | Yes | Entries are blocked when `ADX > adx_threshold`. Lower values restrict entries to more ranging markets. |
 
 ### Behavior
 
@@ -380,6 +380,89 @@ indicators are first returned — no stabilization window occurs in production.
 `enable_adx_filter` and `adx_threshold` are hot-safe — changes take effect on
 the next closed candle without restarting the bot. `adx_period` is
 restart-required because the ADX window must be re-computed from scratch.
+
+---
+
+## Strategy Safeguards
+
+Four independently toggleable guards added to protect against specific failure modes. Each guard is hot-safe (changeable without restart) and defaults to **enabled** in `RSIBollingerStrategyV2.json`. Guards default to **disabled** in `tests/conftest.py` to preserve existing test behavior.
+
+### Guard Execution Order in `_on_candle`
+
+Guards run in this fixed order before any entry logic:
+
+1. `_reconcile_positions()` — sync local grids against broker
+2. `_check_regime_exit(indicators)` — close losing positions if ADX is trending
+3. `_check_daily_reset()` — reset daily counters at midnight UTC
+4. Gate evaluation: `can_enter = _is_session_entry_allowed() and not _is_daily_limit_reached()`
+5. `_manage_longs(indicators, can_enter=can_enter)` / `_manage_shorts(...)`
+
+In tick mode, `_on_tick` re-evaluates the session filter live on each tick (cheap check — `datetime.now().hour` only) to avoid up to 5 minutes of staleness at hour boundaries. The circuit breaker flag remains cached from the most recent candle (it involves REST calls).
+
+### Improvement #1 — ADX Threshold 25→20
+
+The entry-filter ADX threshold was lowered from 25.0 to 20.0 in `RSIBollingerStrategyV2.json`. This allows entries in slightly more trending conditions, widening the signal window. No code change — `adx_threshold` is hot-safe and read at runtime.
+
+### Improvement #2 — Session Time Filter
+
+**Problem**: Certain UTC hour ranges (e.g., the Asian session 00:00–07:00) are chronically unprofitable for a mean-reversion strategy on US futures.
+
+**Solution**: `_is_session_entry_allowed()` checks the current UTC hour. When the hour falls within `[session_filter_start_utc, session_filter_end_utc)`, all new entries are blocked in `_manage_longs`, `_manage_shorts`, and `_on_tick`. Exits are unaffected.
+
+**Wrap-around**: if `session_filter_start_utc > session_filter_end_utc`, the range crosses midnight (e.g. `start=22, end=7` blocks 22:00–06:59 UTC):
+
+```
+if start < end:
+    blocked = start <= hour < end
+else:
+    blocked = hour >= start or hour < end
+```
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `session_filter_enabled` | `true` | Set to `false` to disable |
+| `session_filter_start_utc` | `0` | Inclusive start hour (0–23, UTC) |
+| `session_filter_end_utc` | `7` | Exclusive end hour (0–23, UTC) |
+
+**Log**: INFO at most once per candle when entry is blocked.
+
+### Improvement #3 — ADX Regime Exit
+
+**Problem**: When ADX spikes into trending territory, underwater positions have low probability of recovering to TP. Leaving them open worsens drawdown.
+
+**Solution**: `_check_regime_exit(indicators)` scans all open longs and shorts after reconciliation. Any position that is underwater AND `ADX > adx_threshold` is closed via `ig.close_position(deal_id, side, size)`. Profitable positions are never touched.
+
+This is the **first path in V2 that calls `close_position()`**, gated behind `enable_adx_regime_exit` (opt-in).
+
+**Guard dependency**: requires both `enable_adx_regime_exit=true` AND `enable_adx_filter=true`.
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `enable_adx_regime_exit` | `true` | Requires `enable_adx_filter=true` to fire |
+
+**Log**: WARNING when a position is closed: `[REGIME EXIT] Closing {side} {deal_id} ADX=X entry=Y close=Z loss=W`
+
+### Improvement #4 — Daily Circuit Breaker
+
+**Problem**: Bad-market days can produce a runaway sequence of entries that individually hit SL, depleting capital before conditions improve.
+
+**Solution**: `_is_daily_limit_reached()` checks two conditions every candle:
+1. `_daily_trade_count >= max_trades_per_day`
+2. `current_balance - _session_start_balance < daily_loss_limit_usd`
+
+When either trips, `can_enter=False` for that candle and subsequent ticks until midnight UTC reset. Exits are unaffected.
+
+**Daily reset**: `_check_daily_reset()` fires when `datetime.now(timezone.utc).date() != _last_reset_date`. On reset: `_daily_trade_count = 0`, `_session_start_balance` re-captured from `get_account_summary()["balance"]`.
+
+**Trade count**: incremented by 1 after each successful `open_position()` call in `_manage_longs`, `_manage_shorts`, and `_tick_try_open`.
+
+| Param | Default | Notes |
+|-------|---------|-------|
+| `enable_daily_circuit_breaker` | `true` | Set to `false` to disable |
+| `daily_loss_limit_usd` | `-50.0` | Negative float; trips when daily P&L < this value |
+| `max_trades_per_day` | `15` | Integer; trips when this many opens are executed in one UTC day |
+
+**Log**: WARNING when tripped: `[CIRCUIT BREAKER] Daily trade limit reached: N/M` or `[CIRCUIT BREAKER] Daily loss limit reached: P&L=X < limit=Y`
 
 ---
 
@@ -593,14 +676,24 @@ loaded at startup into a `types.SimpleNamespace` via `load_params()`.
 | `stop_loss_ticks` | float | `16` | Broker stop-loss distance from entry price (ticks). Used only when `close_mode` is `"fixed"`. |
 | `close_mode` | string | `"dynamic"` | Controls how TP/SL distances are determined. `"fixed"`: use `take_profit_ticks` and `stop_loss_ticks` directly. `"dynamic"`: derive both distances from ATR (see Dynamic Close Mode below). Only `"fixed"` and `"dynamic"` are valid — any other value fails schema validation at startup. Can be changed at runtime via hot-reload. |
 | `atr_period` | int | `14` | ATR lookback period. Used in both `"fixed"` and `"dynamic"` modes (computed unconditionally for hot-switch readiness). Requires restart to change. |
-| `atr_multiplier_tp` | float | `1.0` | ATR multiplier for take-profit distance in dynamic mode. `limit_dist = round(atr_multiplier_tp * ATR)`. Can be changed at runtime via hot-reload. |
-| `atr_multiplier_sl` | float | `1.5` | ATR multiplier for stop-loss distance in dynamic mode. `stop_dist = round(atr_multiplier_sl * ATR)`. Can be changed at runtime via hot-reload. |
+| `atr_multiplier_tp` | float | `1.5` | ATR multiplier for take-profit distance in dynamic mode. `limit_dist = round(atr_multiplier_tp * ATR)`. Can be changed at runtime via hot-reload. |
+| `atr_multiplier_sl` | float | `1.7` | ATR multiplier for stop-loss distance in dynamic mode. `stop_dist = round(atr_multiplier_sl * ATR)`. Can be changed at runtime via hot-reload. |
+| `enable_adx_filter` | bool | `true` | Enables ADX regime filter. When `true`, entries are blocked when `ADX > adx_threshold`. When `false`, ADX is still computed but does not affect entry decisions. Can be changed at runtime via hot-reload. |
+| `adx_period` | int | `14` | ADX rolling window. When filter is enabled, warmup fetches `adx_period * 2` candles to guarantee ADX stabilisation before the first signal. Requires restart to change. |
+| `adx_threshold` | float | `20.0` | Entries blocked when `ADX > adx_threshold`. Lower values restrict entries to more ranging markets. Can be changed at runtime via hot-reload. |
+| `session_filter_enabled` | bool | `true` | Enables the session time filter. When `true`, new entries are blocked during the configured UTC hour range. Hot-safe. |
+| `session_filter_start_utc` | int | `0` | Start hour (UTC, 0–23) of the blocked session window (inclusive). Hot-safe. |
+| `session_filter_end_utc` | int | `7` | End hour (UTC, 0–23) of the blocked session window (exclusive). When `start > end`, the range wraps around midnight (e.g. `start=22, end=7` blocks 22:00–06:59). Hot-safe. |
+| `enable_adx_regime_exit` | bool | `true` | Enables programmatic regime-exit. When `true` and `enable_adx_filter=true`, positions that are underwater are closed individually when ADX exceeds `adx_threshold`. This is the first path in V2 that calls `close_position()` — gated behind this opt-in bool. Hot-safe. |
+| `enable_daily_circuit_breaker` | bool | `true` | Enables the daily circuit breaker. When `true`, new entries are blocked for the rest of the UTC day once either `max_trades_per_day` or `daily_loss_limit_usd` is reached. Counters reset at midnight UTC. Hot-safe. |
+| `daily_loss_limit_usd` | float | `-50.0` | Maximum daily realized loss (USD, negative value). Circuit breaker trips when `current_balance - session_start_balance < daily_loss_limit_usd`. Hot-safe. |
+| `max_trades_per_day` | int | `15` | Maximum number of `open_position` calls per UTC day. Circuit breaker trips immediately when this count is reached. Hot-safe. |
 
 Infrastructure parameters (`leverage`, `initial_cash_balance`,
 `demo_starting_balance`) come from `config.json["trading"]`. `epic` is stored
 in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
 
-> **Note on types**: `float` fields accept integer values — `"take_profit_ticks": 8` and `"take_profit_ticks": 8.0` are both valid.
+> **Note on types**: `float` fields accept integer values — `"take_profit_ticks": 15` and `"take_profit_ticks": 15.0` are both valid.
 
 > **Note**: `config.json["trading"]` also contains `security_buffer` (carried over from V1). V2 does not use it.
 
@@ -625,7 +718,7 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
   "operation_mode": "tick",
 
   "bb_period": 20,
-  "bb_std": 1.5,
+  "bb_std": 1.8,
   "rsi_period": 7,
   "rsi_oversold": 30.0,
   "rsi_overbought": 70.0,
@@ -634,18 +727,26 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
   "max_short_positions": 10,
 
   "contract_size": 3.0,
-  "min_dist_between_entries_ticks": 10,
-  "take_profit_ticks": 8,
-  "stop_loss_ticks": 16,
+  "min_dist_between_entries_ticks": 30,
+  "take_profit_ticks": 15,
+  "stop_loss_ticks": 15,
 
   "close_mode": "dynamic",
   "atr_period": 14,
-  "atr_multiplier_tp": 1.0,
-  "atr_multiplier_sl": 1.5,
+  "atr_multiplier_tp": 1.5,
+  "atr_multiplier_sl": 1.7,
 
   "enable_adx_filter": true,
   "adx_period": 14,
-  "adx_threshold": 25.0
+  "adx_threshold": 20.0,
+
+  "session_filter_enabled": true,
+  "session_filter_start_utc": 0,
+  "session_filter_end_utc": 7,
+  "enable_adx_regime_exit": true,
+  "enable_daily_circuit_breaker": true,
+  "daily_loss_limit_usd": -50.0,
+  "max_trades_per_day": 15
 }
 ```
 
@@ -698,6 +799,15 @@ The strategy can apply changes to `strategies/RSIBollingerStrategyV2.json` at ru
 | `close_mode` | Switch between `"fixed"` and `"dynamic"` TP/SL without restart |
 | `atr_multiplier_tp` | ATR multiplier for take-profit distance in dynamic mode |
 | `atr_multiplier_sl` | ATR multiplier for stop-loss distance in dynamic mode |
+| `enable_adx_filter` | Enable/disable ADX regime filter |
+| `adx_threshold` | ADX threshold for entry blocking |
+| `session_filter_enabled` | Enable/disable session time filter |
+| `session_filter_start_utc` | Start hour of blocked session window |
+| `session_filter_end_utc` | End hour of blocked session window |
+| `enable_adx_regime_exit` | Enable/disable ADX regime exit |
+| `enable_daily_circuit_breaker` | Enable/disable daily circuit breaker |
+| `daily_loss_limit_usd` | Maximum daily loss threshold |
+| `max_trades_per_day` | Maximum trades per UTC day |
 
 ### Restart-required parameters (change is logged but NOT applied)
 

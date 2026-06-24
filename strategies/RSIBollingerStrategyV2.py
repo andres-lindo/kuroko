@@ -11,11 +11,10 @@ fixed (configured ticks) or dynamic (ATR-derived), controlled by close_mode.
 import json
 import os
 import sys
-import time
 import types
 import threading
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 
 import talib as ta
@@ -54,6 +53,14 @@ _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
     "enable_adx_filter": bool,
     "adx_period": int,
     "adx_threshold": (int, float),
+    # strategy-safeguards (Phase 1)
+    "session_filter_enabled": bool,
+    "session_filter_start_utc": int,
+    "session_filter_end_utc": int,
+    "enable_adx_regime_exit": bool,
+    "enable_daily_circuit_breaker": bool,
+    "daily_loss_limit_usd": (int, float),
+    "max_trades_per_day": int,
 }
 
 
@@ -200,6 +207,14 @@ class RSIBollingerStrategyV2:
             "atr_multiplier_sl",
             "enable_adx_filter",
             "adx_threshold",
+            # strategy-safeguards (Phase 1)
+            "session_filter_enabled",
+            "session_filter_start_utc",
+            "session_filter_end_utc",
+            "enable_adx_regime_exit",
+            "enable_daily_circuit_breaker",
+            "daily_loss_limit_usd",
+            "max_trades_per_day",
         }
     )
 
@@ -335,6 +350,15 @@ class RSIBollingerStrategyV2:
         # Reconnect guard — True while a reconnect attempt is in progress.
         # Set and cleared exclusively on the worker thread; no lock required.
         self._reconnecting: bool = False
+
+        # Daily circuit breaker state (Improvement #4).
+        self._daily_trade_count: int = 0
+        self._session_start_balance: float | None = None
+        self._last_reset_date: date | None = None
+
+        # Gate cache: circuit breaker result evaluated once per candle, reused by _on_tick.
+        # Session filter is re-evaluated live in _on_tick (cheap datetime check).
+        self._cached_daily_limit_ok: bool = True
 
     # ---------------------------------------------------------------------- #
     # Indicator computation                                                    #
@@ -710,11 +734,194 @@ class RSIBollingerStrategyV2:
             ts = ts.astimezone(ZoneInfo("America/New_York"))
         return not (ts.weekday() == 4 and ts.hour >= 14)
 
+    def _is_session_entry_allowed(self) -> bool:
+        """Return False if the current UTC hour falls within the blocked session window.
+
+        Reads session_filter_enabled, session_filter_start_utc, and
+        session_filter_end_utc from params. When start > end, the range wraps
+        around midnight (e.g. start=22, end=7 blocks 22:00-06:59 UTC).
+
+        Returns:
+            True when entries are allowed, False when the session filter blocks them.
+        """
+        if not self.params.session_filter_enabled:
+            return True
+        start = self.params.session_filter_start_utc
+        end = self.params.session_filter_end_utc
+        hour = datetime.now(timezone.utc).hour
+        if start < end:
+            blocked = start <= hour < end
+        else:
+            # Wrap-around: e.g. start=22, end=7 → blocked when hour >= 22 or hour < 7
+            blocked = hour >= start or hour < end
+        return not blocked
+
+    def _check_regime_exit(self, indicators: dict) -> None:
+        """Close losing positions when ADX signals a trending regime.
+
+        Guard: requires enable_adx_regime_exit=True AND enable_adx_filter=True.
+        Eligibility: ADX > adx_threshold AND position is underwater.
+        Longs are closed with side='SELL'; shorts with side='BUY'.
+
+        After a successful close_position() call, the position is removed from
+        the internal grid immediately. There is an acceptable one-candle race
+        window: if the broker did not actually close the position, it will be
+        untracked until _reconcile_positions() re-seeds it on the next candle.
+
+        Args:
+            indicators: Dict from _compute_indicators containing 'close' and 'adx'.
+        """
+        if not self.params.enable_adx_regime_exit:
+            return
+        if not self.params.enable_adx_filter:
+            return
+        adx = indicators.get("adx")
+        if adx is None or adx <= self.params.adx_threshold:
+            return
+        close = indicators["close"]
+
+        # Evaluate longs — close underwater positions
+        remaining_longs = []
+        for pos in self._long_positions:
+            if close < pos["entry_price"]:
+                loss = close - pos["entry_price"]
+                logger.warning(
+                    f"[REGIME EXIT] Closing LONG {pos['deal_id']} "
+                    f"ADX={adx:.2f} entry={pos['entry_price']:.2f} "
+                    f"close={close:.2f} loss={loss:.2f}"
+                )
+                try:
+                    self.ig.close_position(pos["deal_id"], "SELL", pos["size"])
+                    # Position removed from grid after regime exit close —
+                    # reconciliation will verify on next candle.
+                    logger.debug(
+                        f"Position {pos['deal_id']} removed from grid after "
+                        f"regime exit close — reconciliation will verify on next candle"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[REGIME EXIT] Failed to close LONG {pos['deal_id']}: {e}"
+                    )
+                    remaining_longs.append(pos)
+            else:
+                remaining_longs.append(pos)
+        self._long_positions = remaining_longs
+
+        # Evaluate shorts — close underwater positions
+        remaining_shorts = []
+        for pos in self._short_positions:
+            if close > pos["entry_price"]:
+                loss = pos["entry_price"] - close
+                logger.warning(
+                    f"[REGIME EXIT] Closing SHORT {pos['deal_id']} "
+                    f"ADX={adx:.2f} entry={pos['entry_price']:.2f} "
+                    f"close={close:.2f} loss={loss:.2f}"
+                )
+                try:
+                    self.ig.close_position(pos["deal_id"], "BUY", pos["size"])
+                    # Position removed from grid after regime exit close —
+                    # reconciliation will verify on next candle.
+                    logger.debug(
+                        f"Position {pos['deal_id']} removed from grid after "
+                        f"regime exit close — reconciliation will verify on next candle"
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"[REGIME EXIT] Failed to close SHORT {pos['deal_id']}: {e}"
+                    )
+                    remaining_shorts.append(pos)
+            else:
+                remaining_shorts.append(pos)
+        self._short_positions = remaining_shorts
+
+    def _is_daily_limit_reached(self, balance: float | None = None) -> bool:
+        """Return True if the daily loss limit or max trades-per-day has been reached.
+
+        Checks in order:
+        1. If enable_daily_circuit_breaker is False, returns False immediately.
+        2. If _daily_trade_count >= max_trades_per_day, trips the breaker.
+        3. If current_balance - _session_start_balance < daily_loss_limit_usd, trips.
+
+        Args:
+            balance: Pre-fetched account balance. When provided, avoids a
+                redundant REST call to get_account_summary(). When None,
+                falls back to fetching balance from the broker directly.
+
+        Returns:
+            True when entries should be blocked; False otherwise.
+        """
+        if not self.params.enable_daily_circuit_breaker:
+            return False
+        if self._daily_trade_count >= self.params.max_trades_per_day:
+            logger.warning(
+                f"[CIRCUIT BREAKER] Daily trade limit reached: "
+                f"{self._daily_trade_count}/{self.params.max_trades_per_day} trades today"
+            )
+            return True
+        if self._session_start_balance is not None:
+            try:
+                if balance is None:
+                    balance = self.ig.get_account_summary()["balance"]
+                pnl = balance - self._session_start_balance
+                if pnl < self.params.daily_loss_limit_usd:
+                    logger.warning(
+                        f"[CIRCUIT BREAKER] Daily loss limit reached: "
+                        f"P&L={pnl:.2f} < limit={self.params.daily_loss_limit_usd:.2f}"
+                    )
+                    return True
+            except Exception as e:
+                logger.warning(
+                    f"[CIRCUIT BREAKER] Balance check failed — blocking entries "
+                    f"as safety precaution: {e}"
+                )
+                return True
+        return False
+
+    def _check_daily_reset(self, balance: float | None = None) -> None:
+        """Reset daily counters when the UTC date has changed since the last check.
+
+        On reset: _daily_trade_count is set to 0, _session_start_balance is
+        re-captured from get_account_summary(), and _last_reset_date is updated.
+
+        If _session_start_balance is still None after a failed capture, retries
+        on every subsequent candle until balance is successfully captured.
+
+        Args:
+            balance: Pre-fetched account balance. When provided, avoids a
+                redundant REST call to get_account_summary(). When None,
+                falls back to fetching balance from the broker directly.
+        """
+        today = datetime.now(timezone.utc).date()
+        is_new_day = self._last_reset_date != today
+
+        if is_new_day:
+            self._daily_trade_count = 0
+            self._last_reset_date = today
+
+        # Capture balance on date change OR retry if previous capture failed
+        if is_new_day or self._session_start_balance is None:
+            try:
+                if balance is not None:
+                    self._session_start_balance = balance
+                else:
+                    self._session_start_balance = self.ig.get_account_summary()[
+                        "balance"
+                    ]
+                logger.info(
+                    f"[CIRCUIT BREAKER] Daily reset: trade_count=0 "
+                    f"session_start_balance={self._session_start_balance:.2f}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[CIRCUIT BREAKER] Failed to capture start balance — "
+                    f"loss limit check disabled until balance is captured: {e}"
+                )
+
     # ---------------------------------------------------------------------- #
     # Long grid management                                                     #
     # ---------------------------------------------------------------------- #
 
-    def _manage_longs(self, indicators: dict) -> None:
+    def _manage_longs(self, indicators: dict, *, can_enter: bool = True) -> None:
         """Evaluate long entry conditions using the latest indicators.
 
         Entry condition: price STRICTLY < BB_lower AND RSI STRICTLY < rsi_oversold
@@ -727,7 +934,11 @@ class RSIBollingerStrategyV2:
         Args:
             indicators: Dict with bb_upper, bb_lower, rsi, close from
                 _compute_indicators.
+            can_enter: When False, all new entry logic is skipped. Set by
+                _on_candle based on session filter and circuit breaker state.
         """
+        if not can_enter:
+            return
         close = indicators["close"]
         bb_upper = indicators["bb_upper"]
         bb_lower = indicators["bb_lower"]
@@ -805,8 +1016,13 @@ class RSIBollingerStrategyV2:
                 )
             else:
                 self._long_positions.append(
-                    {"deal_id": deal_id, "entry_price": close, "size": size}
+                    {
+                        "deal_id": deal_id,
+                        "entry_price": close,
+                        "size": size,
+                    }
                 )
+                self._daily_trade_count += 1
                 logger.debug(
                     f"Long grid updated: {len(self._long_positions)} position(s) open "
                     f"entries={[round(p['entry_price'], 2) for p in self._long_positions]}"
@@ -823,7 +1039,7 @@ class RSIBollingerStrategyV2:
     # Short grid management                                                    #
     # ---------------------------------------------------------------------- #
 
-    def _manage_shorts(self, indicators: dict) -> None:
+    def _manage_shorts(self, indicators: dict, *, can_enter: bool = True) -> None:
         """Evaluate short entry conditions using the latest indicators.
 
         Entry condition: price STRICTLY > BB_upper AND RSI STRICTLY > rsi_overbought
@@ -836,7 +1052,11 @@ class RSIBollingerStrategyV2:
         Args:
             indicators: Dict with bb_upper, bb_lower, rsi, close from
                 _compute_indicators.
+            can_enter: When False, all new entry logic is skipped. Set by
+                _on_candle based on session filter and circuit breaker state.
         """
+        if not can_enter:
+            return
         close = indicators["close"]
         bb_upper = indicators["bb_upper"]
         bb_lower = indicators["bb_lower"]
@@ -911,8 +1131,13 @@ class RSIBollingerStrategyV2:
                 )
             else:
                 self._short_positions.append(
-                    {"deal_id": deal_id, "entry_price": close, "size": size}
+                    {
+                        "deal_id": deal_id,
+                        "entry_price": close,
+                        "size": size,
+                    }
                 )
+                self._daily_trade_count += 1
                 logger.debug(
                     f"Short grid updated: {len(self._short_positions)} position(s) open "
                     f"entries={[round(p['entry_price'], 2) for p in self._short_positions]}"
@@ -1190,6 +1415,25 @@ class RSIBollingerStrategyV2:
             )
             return
 
+        # Regime exit: close losing positions if ADX signals a trending regime.
+        # Runs before gate evaluation and entry logic per the guard execution order.
+        self._check_regime_exit(indicators)
+
+        # Fetch account summary once per candle — reused by _check_daily_reset,
+        # _is_daily_limit_reached, and log_account_status to avoid duplicate REST calls.
+        _account_balance: float | None = None
+        try:
+            _account_summary = self.ig.get_account_summary()
+            _account_balance = (
+                _account_summary.get("balance") if _account_summary else None
+            )
+        except Exception as e:
+            logger.warning(f"Failed to fetch account summary for this candle: {e}")
+            _account_summary = None
+
+        # Daily reset: must run before circuit breaker check.
+        self._check_daily_reset(balance=_account_balance)
+
         logger.info(
             f"Candle processed: close={indicators['close']:.2f} "
             f"BB=[{indicators['bb_lower']:.2f}, {indicators['bb_upper']:.2f}] "
@@ -1199,24 +1443,31 @@ class RSIBollingerStrategyV2:
             f"longs={len(self._long_positions)} shorts={len(self._short_positions)}"
         )
 
+        # Gate evaluation: circuit breaker cached per candle (involves REST);
+        # session filter is re-evaluated live in _on_tick (cheap datetime check).
+        self._cached_daily_limit_ok = not self._is_daily_limit_reached(
+            balance=_account_balance
+        )
+        can_enter = self._is_session_entry_allowed() and self._cached_daily_limit_ok
+
         # In tick mode, cache the indicators so _on_tick can evaluate signals
         # from live bid/ofr prices, then return early — tick handler owns entries.
         if self._operation_mode == "tick":
             self._cached_indicators = indicators
-            self.log_account_status()
+            self.log_account_status(account_info=_account_summary)
             return
 
-        self._manage_longs(indicators)
-        self._manage_shorts(indicators)
+        self._manage_longs(indicators, can_enter=can_enter)
+        self._manage_shorts(indicators, can_enter=can_enter)
 
         # Log account status AFTER trade decisions so the log reflects post-decision state.
-        self.log_account_status()
+        self.log_account_status(account_info=_account_summary)
 
     # ---------------------------------------------------------------------- #
     # Account status logging                                                   #
     # ---------------------------------------------------------------------- #
 
-    def log_account_status(self) -> None:
+    def log_account_status(self, account_info: dict | None = None) -> None:
         """Log account health, equity, margin, and per-grid position breakdown.
 
         Reads ``balance`` and ``profitLoss`` from get_account_summary().
@@ -1242,9 +1493,14 @@ class RSIBollingerStrategyV2:
 
         Emits a single INFO log line starting with STATUS. Never raises — full
         try/except with logger.error on failure.
+
+        Args:
+            account_info: Pre-fetched account summary dict. When provided,
+                avoids a redundant REST call. When None, fetches from broker.
         """
         try:
-            account_info = self.ig.get_account_summary()
+            if account_info is None:
+                account_info = self.ig.get_account_summary()
             if not account_info:
                 logger.warning(
                     "Account data unavailable — skipping account status log."
@@ -1379,6 +1635,7 @@ class RSIBollingerStrategyV2:
                     # Record spread at open for informational logging.
                     pos["entry_spread"] = spread
                 positions.append(pos)
+                self._daily_trade_count += 1
                 logger.info(
                     f"Tick: opened {side} {deal_id} @ bid={bid:.2f} "
                     f"ATR={self._cached_indicators.get('atr', 0.0):.2f} "
@@ -1421,6 +1678,11 @@ class RSIBollingerStrategyV2:
         bb_lower = indicators["bb_lower"]
         rsi = indicators["rsi"]
 
+        # Session filter is re-evaluated live on each tick (cheap — no REST call,
+        # just datetime.now().hour) to avoid up to 5 minutes of staleness at hour
+        # boundaries. Circuit breaker remains cached (it involves REST calls).
+        can_enter = self._is_session_entry_allowed() and self._cached_daily_limit_ok
+
         logger.debug(
             "tick bid=%.5f ask=%.5f spread=%.5f | bb_lower=%.5f bb_upper=%.5f rsi=%.2f"
             " | longs=%d shorts=%d",
@@ -1435,7 +1697,9 @@ class RSIBollingerStrategyV2:
         )
 
         # --- Long entry ---
-        if not self._is_long_entry_allowed():
+        if not can_enter:
+            pass  # session filter or circuit breaker blocked — skip both directions
+        elif not self._is_long_entry_allowed():
             logger.debug("tick long_entry: skipped (guardrail) Friday after 14:00 NY")
         elif (
             bid < bb_lower
@@ -1470,7 +1734,9 @@ class RSIBollingerStrategyV2:
                 self._tick_try_open("BUY", bid, spread)
 
         # --- Short entry ---
-        if (
+        if not can_enter:
+            pass  # already gated above — skip short direction too
+        elif (
             bid > bb_upper
             and rsi > self.params.rsi_overbought
             and not self._tick_short_in_flight
