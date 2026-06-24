@@ -595,12 +595,15 @@ loaded at startup into a `types.SimpleNamespace` via `load_params()`.
 | `atr_period` | int | `14` | ATR lookback period. Used in both `"fixed"` and `"dynamic"` modes (computed unconditionally for hot-switch readiness). Requires restart to change. |
 | `atr_multiplier_tp` | float | `1.0` | ATR multiplier for take-profit distance in dynamic mode. `limit_dist = round(atr_multiplier_tp * ATR)`. Can be changed at runtime via hot-reload. |
 | `atr_multiplier_sl` | float | `1.5` | ATR multiplier for stop-loss distance in dynamic mode. `stop_dist = round(atr_multiplier_sl * ATR)`. Can be changed at runtime via hot-reload. |
+| `enable_adx_filter` | bool | `true` | Enables ADX regime filter. When `true`, entries are blocked when `ADX > adx_threshold`. When `false`, ADX is still computed but does not affect entry decisions. Can be changed at runtime via hot-reload. |
+| `adx_period` | int | `14` | ADX rolling window. When filter is enabled, warmup fetches `adx_period * 2` candles to guarantee ADX stabilisation before the first signal. Requires restart to change. |
+| `adx_threshold` | float | `25.0` | Entries blocked when `ADX > adx_threshold`. Lower values restrict entries to more ranging markets. Can be changed at runtime via hot-reload. |
 
 Infrastructure parameters (`leverage`, `initial_cash_balance`,
 `demo_starting_balance`) come from `config.json["trading"]`. `epic` is stored
 in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
 
-> **Note on types**: `float` fields accept integer values — `"take_profit_ticks": 8` and `"take_profit_ticks": 8.0` are both valid.
+> **Note on types**: `float` fields accept integer values — `"take_profit_ticks": 15` and `"take_profit_ticks": 15.0` are both valid.
 
 > **Note**: `config.json["trading"]` also contains `security_buffer` (carried over from V1). V2 does not use it.
 
@@ -625,7 +628,7 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
   "operation_mode": "tick",
 
   "bb_period": 20,
-  "bb_std": 1.5,
+  "bb_std": 1.8,
   "rsi_period": 7,
   "rsi_oversold": 30.0,
   "rsi_overbought": 70.0,
@@ -634,9 +637,9 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
   "max_short_positions": 10,
 
   "contract_size": 3.0,
-  "min_dist_between_entries_ticks": 10,
-  "take_profit_ticks": 8,
-  "stop_loss_ticks": 16,
+  "min_dist_between_entries_ticks": 30,
+  "take_profit_ticks": 15,
+  "stop_loss_ticks": 15,
 
   "close_mode": "dynamic",
   "atr_period": 14,
