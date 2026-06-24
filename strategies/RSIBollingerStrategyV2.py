@@ -11,7 +11,6 @@ fixed (configured ticks) or dynamic (ATR-derived), controlled by close_mode.
 import json
 import os
 import sys
-import time
 import types
 import threading
 import logging
@@ -55,7 +54,6 @@ _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
     "adx_period": int,
     "adx_threshold": (int, float),
     # strategy-safeguards (Phase 1)
-    "reconcile_grace_period_seconds": int,
     "session_filter_enabled": bool,
     "session_filter_start_utc": int,
     "session_filter_end_utc": int,
@@ -210,7 +208,6 @@ class RSIBollingerStrategyV2:
             "enable_adx_filter",
             "adx_threshold",
             # strategy-safeguards (Phase 1)
-            "reconcile_grace_period_seconds",
             "session_filter_enabled",
             "session_filter_start_utc",
             "session_filter_end_utc",
@@ -354,7 +351,7 @@ class RSIBollingerStrategyV2:
         # Set and cleared exclusively on the worker thread; no lock required.
         self._reconnecting: bool = False
 
-        # Daily circuit breaker state (Improvement #5).
+        # Daily circuit breaker state (Improvement #4).
         self._daily_trade_count: int = 0
         self._session_start_balance: float | None = None
         self._last_reset_date: date | None = None
@@ -1023,7 +1020,6 @@ class RSIBollingerStrategyV2:
                         "deal_id": deal_id,
                         "entry_price": close,
                         "size": size,
-                        "submitted_at": time.time(),
                     }
                 )
                 self._daily_trade_count += 1
@@ -1139,7 +1135,6 @@ class RSIBollingerStrategyV2:
                         "deal_id": deal_id,
                         "entry_price": close,
                         "size": size,
-                        "submitted_at": time.time(),
                     }
                 )
                 self._daily_trade_count += 1
@@ -1198,22 +1193,12 @@ class RSIBollingerStrategyV2:
             f"Broker reports {len(broker_deal_ids)} open position(s): {broker_deal_ids}"
         )
 
-        grace = self.params.reconcile_grace_period_seconds
-        now = time.time()
-
         def _filter(positions: list[dict]) -> list[dict]:
             kept = []
             for pos in positions:
                 if pos["deal_id"] in broker_deal_ids:
                     pos.pop("needs_reconciliation", None)
                     kept.append(pos)
-                elif grace > 0 and now - pos.get("submitted_at", 0) < grace:
-                    kept.append(pos)
-                    age = now - pos.get("submitted_at", 0)
-                    logger.info(
-                        f"Reconciliation: keeping {pos['deal_id']} within grace period "
-                        f"(age={age:.1f}s < grace={grace}s)"
-                    )
                 else:
                     logger.warning(
                         f"Reconciliation: removing phantom position {pos['deal_id']} "
@@ -1645,7 +1630,6 @@ class RSIBollingerStrategyV2:
                     "deal_id": deal_id,
                     "entry_price": bid,
                     "size": self.params.contract_size,
-                    "submitted_at": time.time(),
                 }
                 if side == "BUY":
                     # Record spread at open for informational logging.

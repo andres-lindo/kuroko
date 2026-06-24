@@ -385,13 +385,13 @@ restart-required because the ADX window must be re-computed from scratch.
 
 ## Strategy Safeguards
 
-Five independently toggleable guards added to protect against specific failure modes. Each guard is hot-safe (changeable without restart) and defaults to **enabled** in `RSIBollingerStrategyV2.json`. Guards default to **disabled** in `tests/conftest.py` to preserve existing test behavior.
+Four independently toggleable guards added to protect against specific failure modes. Each guard is hot-safe (changeable without restart) and defaults to **enabled** in `RSIBollingerStrategyV2.json`. Guards default to **disabled** in `tests/conftest.py` to preserve existing test behavior.
 
 ### Guard Execution Order in `_on_candle`
 
 Guards run in this fixed order before any entry logic:
 
-1. `_reconcile_positions()` — sync local grids against broker (with grace period)
+1. `_reconcile_positions()` — sync local grids against broker
 2. `_check_regime_exit(indicators)` — close losing positions if ADX is trending
 3. `_check_daily_reset()` — reset daily counters at midnight UTC
 4. Gate evaluation: `can_enter = _is_session_entry_allowed() and not _is_daily_limit_reached()`
@@ -399,25 +399,11 @@ Guards run in this fixed order before any entry logic:
 
 In tick mode, `_on_tick` re-evaluates the session filter live on each tick (cheap check — `datetime.now().hour` only) to avoid up to 5 minutes of staleness at hour boundaries. The circuit breaker flag remains cached from the most recent candle (it involves REST calls).
 
-### Improvement #1 — Phantom Grace Period
-
-**Problem**: `_reconcile_positions()` previously removed any local position absent from the broker immediately. A freshly submitted order not yet confirmed by the broker would be removed as a phantom, making a real position invisible to the strategy.
-
-**Solution**: Position dicts now include `submitted_at: float` (epoch seconds via `time.time()`) at creation. `_filter()` keeps positions absent from the broker for up to `reconcile_grace_period_seconds` seconds after submission. After the grace window expires, the existing phantom-removal path runs unchanged.
-
-**Seeded positions**: positions restored from `_seed_positions_from_broker()` do NOT have `submitted_at` — they are already confirmed. `pos.get("submitted_at", 0)` returns `0`, always past the grace window, preserving legacy behavior.
-
-| Param | Default | Notes |
-|-------|---------|-------|
-| `reconcile_grace_period_seconds` | `30` | Set to `0` to restore legacy immediate-removal behavior |
-
-**Log**: INFO when a position is protected: `Reconciliation: keeping {deal_id} within grace period (age=Xs < grace=Ys)`
-
-### Improvement #2 — ADX Threshold 25→20
+### Improvement #1 — ADX Threshold 25→20
 
 The entry-filter ADX threshold was lowered from 25.0 to 20.0 in `RSIBollingerStrategyV2.json`. This allows entries in slightly more trending conditions, widening the signal window. No code change — `adx_threshold` is hot-safe and read at runtime.
 
-### Improvement #3 — Session Time Filter
+### Improvement #2 — Session Time Filter
 
 **Problem**: Certain UTC hour ranges (e.g., the Asian session 00:00–07:00) are chronically unprofitable for a mean-reversion strategy on US futures.
 
@@ -440,7 +426,7 @@ else:
 
 **Log**: INFO at most once per candle when entry is blocked.
 
-### Improvement #4 — ADX Regime Exit
+### Improvement #3 — ADX Regime Exit
 
 **Problem**: When ADX spikes into trending territory, underwater positions have low probability of recovering to TP. Leaving them open worsens drawdown.
 
@@ -456,7 +442,7 @@ This is the **first path in V2 that calls `close_position()`**, gated behind `en
 
 **Log**: WARNING when a position is closed: `[REGIME EXIT] Closing {side} {deal_id} ADX=X entry=Y close=Z loss=W`
 
-### Improvement #5 — Daily Circuit Breaker
+### Improvement #4 — Daily Circuit Breaker
 
 **Problem**: Bad-market days can produce a runaway sequence of entries that individually hit SL, depleting capital before conditions improve.
 
@@ -695,7 +681,6 @@ loaded at startup into a `types.SimpleNamespace` via `load_params()`.
 | `enable_adx_filter` | bool | `true` | Enables ADX regime filter. When `true`, entries are blocked when `ADX > adx_threshold`. When `false`, ADX is still computed but does not affect entry decisions. Can be changed at runtime via hot-reload. |
 | `adx_period` | int | `14` | ADX rolling window. When filter is enabled, warmup fetches `adx_period * 2` candles to guarantee ADX stabilisation before the first signal. Requires restart to change. |
 | `adx_threshold` | float | `20.0` | Entries blocked when `ADX > adx_threshold`. Lower values restrict entries to more ranging markets. Can be changed at runtime via hot-reload. |
-| `reconcile_grace_period_seconds` | int | `30` | Grace window (seconds) after a position is opened. During this window, a position absent from the broker is kept locally rather than removed as a phantom. Prevents false phantom removal when the broker has not yet processed a freshly submitted order. Set to `0` to restore legacy behavior (immediate removal). Hot-safe. |
 | `session_filter_enabled` | bool | `true` | Enables the session time filter. When `true`, new entries are blocked during the configured UTC hour range. Hot-safe. |
 | `session_filter_start_utc` | int | `0` | Start hour (UTC, 0–23) of the blocked session window (inclusive). Hot-safe. |
 | `session_filter_end_utc` | int | `7` | End hour (UTC, 0–23) of the blocked session window (exclusive). When `start > end`, the range wraps around midnight (e.g. `start=22, end=7` blocks 22:00–06:59). Hot-safe. |
@@ -755,7 +740,6 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
   "adx_period": 14,
   "adx_threshold": 20.0,
 
-  "reconcile_grace_period_seconds": 30,
   "session_filter_enabled": true,
   "session_filter_start_utc": 0,
   "session_filter_end_utc": 7,
@@ -817,7 +801,6 @@ The strategy can apply changes to `strategies/RSIBollingerStrategyV2.json` at ru
 | `atr_multiplier_sl` | ATR multiplier for stop-loss distance in dynamic mode |
 | `enable_adx_filter` | Enable/disable ADX regime filter |
 | `adx_threshold` | ADX threshold for entry blocking |
-| `reconcile_grace_period_seconds` | Grace window before phantom removal |
 | `session_filter_enabled` | Enable/disable session time filter |
 | `session_filter_start_utc` | Start hour of blocked session window |
 | `session_filter_end_utc` | End hour of blocked session window |

@@ -120,7 +120,6 @@ class TestLoadParams:
             "enable_adx_filter": False,
             "adx_period": 14,
             "adx_threshold": 25.0,
-            "reconcile_grace_period_seconds": 30,
             "session_filter_enabled": False,
             "session_filter_start_utc": 0,
             "session_filter_end_utc": 7,
@@ -1946,7 +1945,6 @@ class TestValidateParamsBranches:
             "enable_adx_filter": False,
             "adx_period": 14,
             "adx_threshold": 25.0,
-            "reconcile_grace_period_seconds": 30,
             "session_filter_enabled": False,
             "session_filter_start_utc": 0,
             "session_filter_end_utc": 7,
@@ -2067,7 +2065,6 @@ class TestValidateParamsBranches:
             "enable_adx_filter": False,
             "adx_period": 14,
             "adx_threshold": 25.0,
-            "reconcile_grace_period_seconds": 30,
             "session_filter_enabled": False,
             "session_filter_start_utc": 0,
             "session_filter_end_utc": 7,
@@ -2113,7 +2110,6 @@ _HOT_RELOAD_BASE_PARAMS = {
     "enable_adx_filter": False,
     "adx_period": 14,
     "adx_threshold": 25.0,
-    "reconcile_grace_period_seconds": 30,
     "session_filter_enabled": False,
     "session_filter_start_utc": 0,
     "session_filter_end_utc": 7,
@@ -2466,7 +2462,6 @@ class TestHotReloadRoundTrip:
             "enable_adx_filter": False,
             "adx_period": 14,
             "adx_threshold": 25.0,
-            "reconcile_grace_period_seconds": 30,
             "session_filter_enabled": False,
             "session_filter_start_utc": 0,
             "session_filter_end_utc": 7,
@@ -5339,7 +5334,6 @@ class TestADXFilterBoundary:
 # =========================================================================== #
 
 _NEW_PARAM_KEYS = [
-    "reconcile_grace_period_seconds",
     "session_filter_enabled",
     "session_filter_start_utc",
     "session_filter_end_utc",
@@ -5387,170 +5381,6 @@ class TestADXThresholdConfig:
         data = json.loads(_V2_JSON.read_text(encoding="utf-8"))
         for key in _NEW_PARAM_KEYS:
             assert key in data, f"'{key}' missing from RSIBollingerStrategyV2.json"
-
-
-# =========================================================================== #
-# Phase 2: Phantom Grace Period — TestReconcileGracePeriod                    #
-# =========================================================================== #
-
-
-class TestReconcileGracePeriod:
-    """Grace period prevents premature phantom-position removal."""
-
-    def test_position_within_grace_period_not_removed(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """Position submitted 10s ago and absent from broker must NOT be removed."""
-        params = make_params_v2(reconcile_grace_period_seconds=30)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        now = 1000.0
-        strat._long_positions = [
-            {
-                "deal_id": "NEW_DEAL",
-                "entry_price": 100.0,
-                "size": 1.0,
-                "submitted_at": now - 10,
-            }
-        ]
-        mock_ig.get_open_positions.return_value = []
-
-        with patch("time.time", return_value=now):
-            strat._reconcile_positions()
-
-        assert len(strat._long_positions) == 1
-        assert strat._long_positions[0]["deal_id"] == "NEW_DEAL"
-
-    def test_position_past_grace_period_removed(self, make_strategy_v2, make_params_v2):
-        """Position submitted 60s ago and absent from broker must be removed."""
-        params = make_params_v2(reconcile_grace_period_seconds=30)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        now = 1000.0
-        strat._long_positions = [
-            {
-                "deal_id": "OLD_DEAL",
-                "entry_price": 100.0,
-                "size": 1.0,
-                "submitted_at": now - 60,
-            }
-        ]
-        mock_ig.get_open_positions.return_value = []
-
-        with patch("time.time", return_value=now):
-            strat._reconcile_positions()
-
-        assert len(strat._long_positions) == 0
-
-    def test_grace_period_zero_reverts_to_legacy(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """When reconcile_grace_period_seconds=0, absent positions are removed immediately."""
-        params = make_params_v2(reconcile_grace_period_seconds=0)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        now = 1000.0
-        strat._long_positions = [
-            {
-                "deal_id": "ZERO_GRACE",
-                "entry_price": 100.0,
-                "size": 1.0,
-                "submitted_at": now - 1,
-            }
-        ]
-        mock_ig.get_open_positions.return_value = []
-
-        with patch("time.time", return_value=now):
-            strat._reconcile_positions()
-
-        assert len(strat._long_positions) == 0
-
-    def test_submitted_at_set_on_manage_longs_open(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """After _manage_longs opens a position, the dict must have submitted_at ~= time.time()."""
-        params = make_params_v2(reconcile_grace_period_seconds=30)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        mock_ig.open_position.return_value = {
-            "dealStatus": "ACCEPTED",
-            "dealId": "DEAL_WITH_TS",
-        }
-        indicators = _make_indicators(
-            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
-        )
-        now = 9999.0
-
-        with patch("time.time", return_value=now):
-            strat._manage_longs(indicators)
-
-        assert len(strat._long_positions) == 1
-        assert "submitted_at" in strat._long_positions[0]
-        assert strat._long_positions[0]["submitted_at"] == pytest.approx(now)
-
-    def test_submitted_at_set_on_manage_shorts_open(
-        self, make_strategy_v2, make_params_v2
-    ):
-        """After _manage_shorts opens a position, the dict must have submitted_at ~= time.time()."""
-        params = make_params_v2(reconcile_grace_period_seconds=30)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        mock_ig.open_position.return_value = {
-            "dealStatus": "ACCEPTED",
-            "dealId": "SHORT_WITH_TS",
-        }
-        indicators = _make_indicators(
-            bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0
-        )
-        now = 9999.0
-
-        with patch("time.time", return_value=now):
-            strat._manage_shorts(indicators)
-
-        assert len(strat._short_positions) == 1
-        assert "submitted_at" in strat._short_positions[0]
-        assert strat._short_positions[0]["submitted_at"] == pytest.approx(now)
-
-    def test_grace_period_info_logged(self, make_strategy_v2, make_params_v2, caplog):
-        """INFO log must be emitted when a position is protected by grace period."""
-        import logging
-
-        params = make_params_v2(reconcile_grace_period_seconds=30)
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        now = 1000.0
-        strat._long_positions = [
-            {
-                "deal_id": "GRACE_LOG",
-                "entry_price": 100.0,
-                "size": 1.0,
-                "submitted_at": now - 10,
-            }
-        ]
-        mock_ig.get_open_positions.return_value = []
-
-        with caplog.at_level(logging.INFO, logger="strategies.RSIBollingerStrategyV2"):
-            with patch("time.time", return_value=now):
-                strat._reconcile_positions()
-
-        info_msgs = [r.message for r in caplog.records if r.levelno == logging.INFO]
-        assert any("grace" in m.lower() or "GRACE_LOG" in m for m in info_msgs)
-
-    def test_submitted_at_set_on_tick_try_open(self, make_strategy_v2, make_params_v2):
-        """After _tick_try_open opens a position, the dict must have submitted_at ~= time.time()."""
-        params = make_params_v2(
-            operation_mode="tick", reconcile_grace_period_seconds=30
-        )
-        strat, mock_ig, _ = make_strategy_v2(params=params)
-        mock_ig.open_position.return_value = {
-            "dealStatus": "ACCEPTED",
-            "dealId": "TICK_DEAL_TS",
-        }
-        strat._cached_indicators = _make_indicators(
-            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
-        )
-        now = 8888.0
-
-        with patch("time.time", return_value=now):
-            strat._tick_try_open("BUY", bid=95.0, spread=1.0)
-
-        assert len(strat._long_positions) == 1
-        assert "submitted_at" in strat._long_positions[0]
-        assert strat._long_positions[0]["submitted_at"] == pytest.approx(now)
 
 
 # =========================================================================== #

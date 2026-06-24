@@ -6,10 +6,10 @@
   "operation_mode": "tick",
 
   "bb_period": 20,
-  "bb_std": 1.8,
+  "bb_std": 2.0,
   "rsi_period": 7,
-  "rsi_oversold":30.0,
-  "rsi_overbought": 70.0,
+  "rsi_oversold":25.0,
+  "rsi_overbought": 75.0,
 
   "max_long_positions": 10,
   "max_short_positions": 10,
@@ -28,11 +28,10 @@
   "adx_period": 14,
   "adx_threshold": 20.0,
 
-  "reconcile_grace_period_seconds": 30,
   "session_filter_enabled": true,
   "session_filter_start_utc": 0,
   "session_filter_end_utc": 7,
-  "enable_adx_regime_exit": true,
+  "enable_adx_regime_exit": false,
   "enable_daily_circuit_breaker": true,
   "daily_loss_limit_usd": -50.0,
   "max_trades_per_day": 15
