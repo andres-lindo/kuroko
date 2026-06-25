@@ -28,11 +28,11 @@
   "adx_period": 14,
   "adx_threshold": 20.0,
 
-  "session_filter_enabled": true,
+  "session_filter_enabled": false,
   "session_filter_start_utc": 0,
   "session_filter_end_utc": 7,
   "enable_adx_regime_exit": false,
   "enable_daily_circuit_breaker": true,
-  "daily_loss_limit_usd": -50.0,
+  "daily_loss_limit_usd": -100.0,
   "max_trades_per_day": 15
 }
