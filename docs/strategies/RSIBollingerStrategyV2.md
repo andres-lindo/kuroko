@@ -387,6 +387,8 @@ restart-required because the ADX window must be re-computed from scratch.
 
 Four independently toggleable guards added to protect against specific failure modes. Each guard is hot-safe (changeable without restart) and defaults to **enabled** in `RSIBollingerStrategyV2.json`. Guards default to **disabled** in `tests/conftest.py` to preserve existing test behavior.
 
+The `enabled` parameter (see Parameters Reference) is a broader master switch that gates all entry logic — it takes effect before any guard is evaluated. Setting `enabled=false` stops new entries immediately without stopping the process; existing positions continue to be managed by broker TP/SL, reconciliation, and regime-exit.
+
 ### Guard Execution Order in `_on_candle`
 
 Guards run in this fixed order before any entry logic:
@@ -660,6 +662,7 @@ loaded at startup into a `types.SimpleNamespace` via `load_params()`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `enabled` | bool | `true` | **Master entry switch.** When `false`, no new positions are opened in any mode (candle or tick). Existing positions are still managed normally — broker TP/SL handle exits, reconciliation and regime-exit still run. Hot-safe — toggle at runtime without restart. |
 | `api_mode` | string | `"streaming"` | Must be `"streaming"` — tells `kuroko.py` to instantiate `IGStreamingClient` |
 | `operation_mode` | string | `"candle"` | Signal evaluation mode. `"candle"`: signals fire on each closed candle (default). `"tick"`: indicators cached on candle close; signals fire on each live tick. Any other value logs a WARNING and falls back to `"candle"`. Required field — removing it causes startup to fail with a CRITICAL log and `SystemExit(1)`. |
 | `candle_frequency` | string | `"5min"` | Candle resolution in `"Nmin"` format (e.g. `"1min"`, `"5min"`, `"15min"`, `"60min"`). Mapped to IG Lightstreamer resolution strings (`"1MINUTE"`, `"5MINUTE"`, `"15MINUTE"`, `"1HOUR"`). Applied to both native candle subscription and tick-aggregation fallback. |
@@ -712,6 +715,7 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
 ```json
 {
   "epic": "IX.D.SPTRD.IFMM.IP",
+  "enabled": true,
 
   "api_mode": "streaming",
   "candle_frequency": "5min",
@@ -787,6 +791,7 @@ The strategy can apply changes to `strategies/RSIBollingerStrategyV2.json` at ru
 
 | Parameter | Description |
 |-----------|-------------|
+| `enabled` | Master entry switch — toggle new entries on/off without restart |
 | `rsi_oversold` | RSI threshold for long entry |
 | `rsi_overbought` | RSI threshold for short entry |
 | `max_long_positions` | Maximum simultaneous long positions |

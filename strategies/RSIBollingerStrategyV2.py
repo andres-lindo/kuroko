@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # float fields accept int values (e.g. 240 is valid for take_profit_ticks).
 _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
     "epic": str,
+    "enabled": bool,
     "api_mode": str,
     "operation_mode": str,
     "candle_frequency": str,
@@ -193,6 +194,7 @@ class RSIBollingerStrategyV2:
     # Parameters that can be applied live without restarting the bot.
     _HOT_SAFE_PARAMS: frozenset = frozenset(
         {
+            "enabled",
             "rsi_oversold",
             "rsi_overbought",
             "max_long_positions",
@@ -350,6 +352,9 @@ class RSIBollingerStrategyV2:
         # Reconnect guard — True while a reconnect attempt is in progress.
         # Set and cleared exclusively on the worker thread; no lock required.
         self._reconnecting: bool = False
+
+        # enabled flag logging: True once we log "entries disabled"; reset when enabled flips back.
+        self._logged_disabled: bool = False
 
         # Daily circuit breaker state (Improvement #4).
         self._daily_trade_count: int = 0
@@ -939,6 +944,14 @@ class RSIBollingerStrategyV2:
         """
         if not can_enter:
             return
+        if not self.params.enabled:
+            if not self._logged_disabled:
+                logger.info(
+                    "Entry disabled by 'enabled=false' parameter — no new positions will be opened."
+                )
+                self._logged_disabled = True
+            return
+        self._logged_disabled = False
         close = indicators["close"]
         bb_upper = indicators["bb_upper"]
         bb_lower = indicators["bb_lower"]
@@ -1057,6 +1070,14 @@ class RSIBollingerStrategyV2:
         """
         if not can_enter:
             return
+        if not self.params.enabled:
+            if not self._logged_disabled:
+                logger.info(
+                    "Entry disabled by 'enabled=false' parameter — no new positions will be opened."
+                )
+                self._logged_disabled = True
+            return
+        self._logged_disabled = False
         close = indicators["close"]
         bb_upper = indicators["bb_upper"]
         bb_lower = indicators["bb_lower"]
@@ -1444,7 +1465,7 @@ class RSIBollingerStrategyV2:
         )
 
         # Gate evaluation: circuit breaker cached per candle (involves REST);
-        # session filter is re-evaluated live in _on_tick (cheap datetime check).
+        # session filter and enabled are re-evaluated live in _on_tick (cheap checks).
         self._cached_daily_limit_ok = not self._is_daily_limit_reached(
             balance=_account_balance
         )
@@ -1678,10 +1699,23 @@ class RSIBollingerStrategyV2:
         bb_lower = indicators["bb_lower"]
         rsi = indicators["rsi"]
 
-        # Session filter is re-evaluated live on each tick (cheap — no REST call,
-        # just datetime.now().hour) to avoid up to 5 minutes of staleness at hour
-        # boundaries. Circuit breaker remains cached (it involves REST calls).
-        can_enter = self._is_session_entry_allowed() and self._cached_daily_limit_ok
+        # Session filter and enabled are re-evaluated live on each tick (cheap — no REST call).
+        # enabled is intentionally NOT cached: the whole point is to toggle it without restart.
+        # Circuit breaker remains cached (it involves REST calls).
+        _enabled = getattr(self.params, "enabled", True)
+        if not _enabled:
+            if not self._logged_disabled:
+                logger.info(
+                    "Entry disabled by 'enabled=false' parameter — no new positions will be opened."
+                )
+                self._logged_disabled = True
+        else:
+            self._logged_disabled = False
+        can_enter = (
+            _enabled
+            and self._is_session_entry_allowed()
+            and self._cached_daily_limit_ok
+        )
 
         logger.debug(
             "tick bid=%.5f ask=%.5f spread=%.5f | bb_lower=%.5f bb_upper=%.5f rsi=%.2f"

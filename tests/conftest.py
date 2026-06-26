@@ -107,6 +107,7 @@ def make_params_v2():
             "adx_period": 14,
             "adx_threshold": 25.0,
             # strategy-safeguards defaults (off by default in tests)
+            "enabled": True,
             "session_filter_enabled": False,
             "session_filter_start_utc": 0,
             "session_filter_end_utc": 7,

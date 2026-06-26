@@ -1,5 +1,6 @@
 {
   "epic": "IX.D.SPTRD.IFMM.IP",
+  "enabled": true,
 
   "api_mode": "streaming",
   "candle_frequency": "5min",

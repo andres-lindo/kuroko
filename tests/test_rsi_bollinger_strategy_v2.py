@@ -99,6 +99,7 @@ class TestLoadParams:
         """a well-formed V2 JSON file loads successfully."""
         data = {
             "epic": "IX.D.SPTRD.IFMM.IP",
+            "enabled": True,
             "api_mode": "streaming",
             "operation_mode": "candle",
             "candle_frequency": "5min",
@@ -1924,6 +1925,7 @@ class TestValidateParamsBranches:
         """An int value for a float key (e.g. take_profit_ticks=240) is accepted."""
         data = {
             "epic": "IX.D.SPTRD.IFMM.IP",
+            "enabled": True,
             "api_mode": "streaming",
             "operation_mode": "candle",
             "candle_frequency": "5min",
@@ -2089,6 +2091,7 @@ class TestValidateParamsBranches:
 # Minimal valid V2 JSON data used across hot-reload tests
 _HOT_RELOAD_BASE_PARAMS = {
     "epic": "IX.D.SPTRD.IFMM.IP",
+    "enabled": True,
     "api_mode": "streaming",
     "operation_mode": "candle",
     "candle_frequency": "5min",
@@ -2441,6 +2444,7 @@ class TestHotReloadRoundTrip:
 
         base_data = {
             "epic": "IX.D.SPTRD.IFMM.IP",
+            "enabled": True,
             "api_mode": "streaming",
             "operation_mode": "candle",
             "candle_frequency": "5min",
@@ -5882,3 +5886,49 @@ class TestDailyCircuitBreaker:
             "circuit" in m.lower() or "limit" in m.lower() or "trade" in m.lower()
             for m in warning_msgs
         )
+
+
+# --------------------------------------------------------------------------- #
+# enabled parameter — master entry switch                                      #
+# --------------------------------------------------------------------------- #
+
+
+class TestEnabledParameter:
+    """enabled=False blocks all new entries without stopping position management."""
+
+    def test_entries_blocked_when_disabled(self, make_strategy_v2, make_params_v2):
+        """When enabled=False, open_position must NOT be called for either longs or shorts."""
+        params = make_params_v2(enabled=False)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+
+        # Long entry conditions are met
+        long_indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
+        )
+        strat._manage_longs(long_indicators)
+
+        # Short entry conditions are met
+        short_indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=100.0, rsi=75.0, close=105.0
+        )
+        strat._manage_shorts(short_indicators)
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_entries_allowed_when_enabled(self, make_strategy_v2, make_params_v2):
+        """When enabled=True, entry proceeds normally for valid signals."""
+        params = make_params_v2(enabled=True)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "ENABLED_DEAL_123",
+        }
+
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=95.0
+        )
+        strat._manage_longs(indicators)
+
+        mock_ig.open_position.assert_called_once()
+        call_kwargs = mock_ig.open_position.call_args.kwargs
+        assert call_kwargs["side"] == "BUY"
