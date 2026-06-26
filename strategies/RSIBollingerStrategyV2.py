@@ -876,10 +876,9 @@ class RSIBollingerStrategyV2:
                     return True
             except Exception as e:
                 logger.warning(
-                    f"[CIRCUIT BREAKER] Balance check failed — blocking entries "
-                    f"as safety precaution: {e}"
+                    f"[CIRCUIT BREAKER] Balance check unavailable — "
+                    f"trade-count limit still enforced: {e}"
                 )
-                return True
         return False
 
     def _check_daily_reset(self, balance: float | None = None) -> None:

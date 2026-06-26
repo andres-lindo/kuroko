@@ -283,3 +283,27 @@ def make_strategy_v2(make_params_v2, make_trading_config):
         return strat, mock_ig, mock_streaming
 
     return _factory
+
+
+@pytest.fixture(autouse=True)
+def _pin_friday_guard_to_wednesday(monkeypatch):
+    """Prevent _is_long_entry_allowed from depending on wall-clock day.
+
+    The Friday guard calls datetime.now() when invoked without an explicit
+    timestamp. Tests that exercise the guard directly pass ts=... and bypass
+    datetime.now entirely, so this patch only affects indirect callers
+    (e.g. _manage_longs) and prevents 18 tests from failing every Friday.
+    """
+    from datetime import datetime as real_datetime
+    from zoneinfo import ZoneInfo
+
+    wednesday = real_datetime(2026, 1, 7, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+
+    class _PinnedDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is not None and str(tz) == "America/New_York":
+                return wednesday
+            return real_datetime.now(tz)
+
+    monkeypatch.setattr("strategies.RSIBollingerStrategyV2.datetime", _PinnedDatetime)

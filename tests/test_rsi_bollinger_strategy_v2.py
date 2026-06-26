@@ -5842,10 +5842,10 @@ class TestDailyCircuitBreaker:
 
         assert strat._daily_trade_count == 4
 
-    def test_entries_blocked_when_rest_exception(
+    def test_entries_allowed_when_rest_exception(
         self, make_strategy_v2, make_params_v2
     ):
-        """_is_daily_limit_reached returns True (fail-closed) when REST call raises."""
+        """Balance check failure degrades to trade-count-only — does not block entries."""
         params = make_params_v2(
             enable_daily_circuit_breaker=True,
             max_trades_per_day=15,
@@ -5856,7 +5856,7 @@ class TestDailyCircuitBreaker:
         strat._daily_trade_count = 0
         mock_ig.get_account_summary.side_effect = RuntimeError("connection failed")
 
-        assert strat._is_daily_limit_reached() is True
+        assert strat._is_daily_limit_reached() is False
 
     def test_circuit_breaker_logs_warning_on_trip(
         self, make_strategy_v2, make_params_v2, caplog
