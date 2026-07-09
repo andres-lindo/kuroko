@@ -18,6 +18,7 @@ to IGStreamingClient.
 import logging
 import queue
 import threading
+import time
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -131,20 +132,39 @@ class _CandleSubscriptionListener:
     completed candles (CONS_END=1) onto the provided queue. All other
     updates are silently discarded.
 
+    Any unexpected exception in onItemUpdate is caught and logged at ERROR
+    level with traceback — the listener never terminates due to a single
+    bad update (GAP-1).
+
+    When a mid-session subscription error occurs and setup_complete_check
+    returns True, onSubscriptionError enqueues a reconnect sentinel (GAP-2).
+
     Attributes:
-        _q: The queue onto which completed candle dicts are placed.
-        item_name: The Lightstreamer item name this listener handles.
+        _q: The queue onto which completed candle dicts and reconnect sentinels
+            are placed.
+        _item_name: The Lightstreamer item name this listener handles.
+        _setup_complete_check: Optional callable; see constructor for details.
     """
 
-    def __init__(self, item_name: str, candle_queue: queue.Queue):
+    def __init__(
+        self,
+        item_name: str,
+        candle_queue: queue.Queue,
+        setup_complete_check: Optional[Callable[[], bool]] = None,
+    ):
         """Initialise the listener with a target item name and delivery queue.
 
         Args:
             item_name: Lightstreamer item identifier (e.g. 'CHART:epic:5MINUTE').
             candle_queue: Queue onto which completed candle payloads are placed.
+            setup_complete_check: Optional callable that returns True when the
+                streaming client has completed initial setup. When not None and
+                returning True, onSubscriptionError enqueues a reconnect sentinel.
+                When None or returning False, onSubscriptionError only logs.
         """
         self._item_name = item_name
         self._q = candle_queue
+        self._setup_complete_check = setup_complete_check
 
     # NOTE: The Lightstreamer Python client library (lightstreamer-client-lib) uses
     # camelCase callback names that mirror the Java SubscriptionListener interface:
@@ -157,45 +177,54 @@ class _CandleSubscriptionListener:
 
         Called by the Lightstreamer library dispatcher (camelCase required).
         Enqueues a completed candle dict when CONS_END is '1'. Ignores all
-        other updates (CONS_END=0 or missing).
+        other updates (CONS_END=0 or missing). Any unexpected exception is
+        caught, logged at ERROR level with traceback, and processing continues
+        (GAP-1: broad exception catch).
 
         Args:
             update: Lightstreamer ItemUpdate object. Use update.getValue("FIELD")
                 to retrieve field values; returns str or None.
         """
-        cons_end = update.getValue("CONS_END")
-        if cons_end != "1":
-            return
-
         try:
-            utm_ms = int(update.getValue("UTM") or "0")
-            timestamp = datetime.fromtimestamp(utm_ms / 1000.0, tz=timezone.utc)
-        except (ValueError, TypeError):
-            timestamp = datetime.now(tz=timezone.utc)
+            cons_end = update.getValue("CONS_END")
+            if cons_end != "1":
+                return
 
-        try:
-            bid_close = float(update.getValue("BID_CLOSE") or "0")
-            ofr_close = float(update.getValue("OFR_CLOSE") or "0")
             try:
-                volume = int(update.getValue("LTV") or "0")
+                utm_ms = int(update.getValue("UTM") or "0")
+                timestamp = datetime.fromtimestamp(utm_ms / 1000.0, tz=timezone.utc)
             except (ValueError, TypeError):
-                volume = 0
-            candle = {
-                "type": "candle",
-                "open": float(update.getValue("BID_OPEN") or "0"),
-                "high": float(update.getValue("BID_HIGH") or "0"),
-                "low": float(update.getValue("BID_LOW") or "0"),
-                "close": bid_close,
-                "bid_close": bid_close,
-                "ofr_close": ofr_close,
-                "spread": ofr_close - bid_close,
-                "volume": volume,
-                "timestamp": timestamp,
-            }
-        except (ValueError, TypeError) as e:
-            logger.debug(f"Candle field parse error on {self._item_name}: {e}")
-            return
-        self._q.put(candle)
+                timestamp = datetime.now(tz=timezone.utc)
+
+            try:
+                bid_close = float(update.getValue("BID_CLOSE") or "0")
+                ofr_close = float(update.getValue("OFR_CLOSE") or "0")
+                try:
+                    volume = int(update.getValue("LTV") or "0")
+                except (ValueError, TypeError):
+                    volume = 0
+                candle = {
+                    "type": "candle",
+                    "open": float(update.getValue("BID_OPEN") or "0"),
+                    "high": float(update.getValue("BID_HIGH") or "0"),
+                    "low": float(update.getValue("BID_LOW") or "0"),
+                    "close": bid_close,
+                    "bid_close": bid_close,
+                    "ofr_close": ofr_close,
+                    "spread": ofr_close - bid_close,
+                    "volume": volume,
+                    "timestamp": timestamp,
+                }
+            except (ValueError, TypeError) as e:
+                logger.debug(f"Candle field parse error on {self._item_name}: {e}")
+                return
+            self._q.put(candle)
+        except Exception as e:
+            logger.error(
+                f"Unexpected error in _CandleSubscriptionListener.onItemUpdate "
+                f"on {self._item_name}: {e}",
+                exc_info=True,
+            )
 
     def onSubscription(self) -> None:
         """Called when the subscription is confirmed by the server."""
@@ -204,11 +233,21 @@ class _CandleSubscriptionListener:
     def onSubscriptionError(self, code: int, message: str) -> None:
         """Called when the server reports a subscription error.
 
+        When the streaming client has completed initial setup (setup_complete_check
+        returns True), enqueues a ``{"type": "reconnect"}`` sentinel to trigger
+        reconnection. During initial setup failures, only logs (GAP-2).
+
         Args:
             code: IG/Lightstreamer error code.
             message: Human-readable error description.
         """
         logger.error(f"Subscription error on {self._item_name}: {code} {message}")
+        if self._setup_complete_check is not None and self._setup_complete_check():
+            logger.warning(
+                f"Mid-session subscription error on {self._item_name} — "
+                "enqueuing reconnect sentinel."
+            )
+            self._q.put({"type": "reconnect"})
 
     def onUnsubscription(self) -> None:
         """Called when the subscription is confirmed as removed."""
@@ -223,18 +262,35 @@ class _TickListener:
 
     Attributes:
         _aggregator: The TickAggregator instance processing tick data.
-        item_name: The Lightstreamer item name this listener handles.
+        _item_name: The Lightstreamer item name this listener handles.
+        _q: Queue for enqueuing reconnect sentinels on subscription errors.
+        _setup_complete_check: Optional callable returning True when initial
+            setup is complete. Used by onSubscriptionError for GAP-2.
     """
 
-    def __init__(self, item_name: str, aggregator: "TickAggregator"):
+    def __init__(
+        self,
+        item_name: str,
+        aggregator: "TickAggregator",
+        candle_queue: Optional[queue.Queue] = None,
+        setup_complete_check: Optional[Callable[[], bool]] = None,
+    ):
         """Initialise the tick listener.
 
         Args:
             item_name: Lightstreamer item identifier (e.g. 'CHART:epic:TICK').
             aggregator: TickAggregator instance that builds candles from ticks.
+            candle_queue: Queue onto which reconnect sentinels are placed when
+                a mid-session subscription error occurs. When None,
+                onSubscriptionError only logs.
+            setup_complete_check: Optional callable that returns True when the
+                streaming client has completed initial setup. When not None and
+                returning True, onSubscriptionError enqueues a reconnect sentinel.
         """
         self._item_name = item_name
         self._aggregator = aggregator
+        self._q = candle_queue
+        self._setup_complete_check = setup_complete_check
 
     # NOTE: The Lightstreamer Python client library uses camelCase callback names.
     # onItemUpdate MUST be camelCase — the library dispatches to this exact method name.
@@ -243,6 +299,8 @@ class _TickListener:
         """Forward a tick update to the aggregator.
 
         Called by the Lightstreamer library dispatcher (camelCase required).
+        Any unexpected exception is caught, logged at ERROR level with traceback,
+        and processing continues (GAP-1: broad exception catch).
 
         Args:
             update: Lightstreamer ItemUpdate object. Use update.getValue("FIELD")
@@ -256,6 +314,12 @@ class _TickListener:
             self._aggregator.on_tick(bid=bid, ofr=ofr, utm=utm)
         except (ValueError, TypeError) as e:
             logger.debug(f"Tick parse error on {self._item_name}: {e}")
+        except Exception as e:
+            logger.error(
+                f"Unexpected error in _TickListener.onItemUpdate "
+                f"on {self._item_name}: {e}",
+                exc_info=True,
+            )
 
     def onSubscription(self) -> None:
         """Called when the tick subscription is confirmed by the server."""
@@ -264,11 +328,25 @@ class _TickListener:
     def onSubscriptionError(self, code: int, message: str) -> None:
         """Called when the server reports a tick subscription error.
 
+        When the streaming client has completed initial setup (setup_complete_check
+        returns True), enqueues a ``{"type": "reconnect"}`` sentinel to trigger
+        reconnection. During initial setup failures, only logs (GAP-2).
+
         Args:
             code: Error code from server.
             message: Human-readable error description.
         """
         logger.error(f"Tick subscription error on {self._item_name}: {code} {message}")
+        if (
+            self._q is not None
+            and self._setup_complete_check is not None
+            and self._setup_complete_check()
+        ):
+            logger.warning(
+                f"Mid-session tick subscription error on {self._item_name} — "
+                "enqueuing reconnect sentinel."
+            )
+            self._q.put({"type": "reconnect"})
 
     def onUnsubscription(self) -> None:
         """Called when the tick subscription is removed."""
@@ -355,17 +433,28 @@ class _DirectTickListener:
     Attributes:
         _item_name: The Lightstreamer item name this listener handles.
         _q: The shared queue onto which tick dicts are placed.
+        _setup_complete_check: Optional callable returning True when initial
+            setup is complete. Used by onSubscriptionError for GAP-2.
     """
 
-    def __init__(self, item_name: str, tick_queue: queue.Queue):
+    def __init__(
+        self,
+        item_name: str,
+        tick_queue: queue.Queue,
+        setup_complete_check: Optional[Callable[[], bool]] = None,
+    ):
         """Initialise the listener.
 
         Args:
             item_name: Lightstreamer item identifier (e.g. 'CHART:epic:TICK').
             tick_queue: Shared queue for both candle and tick items.
+            setup_complete_check: Optional callable that returns True when the
+                streaming client has completed initial setup. When not None and
+                returning True, onSubscriptionError enqueues a reconnect sentinel.
         """
         self._item_name = item_name
         self._q = tick_queue
+        self._setup_complete_check = setup_complete_check
 
     # NOTE: The Lightstreamer Python client library uses camelCase callback names.
     # onItemUpdate MUST be camelCase — the library dispatches to this exact method name.
@@ -375,7 +464,9 @@ class _DirectTickListener:
 
         Called by the Lightstreamer library dispatcher (camelCase required).
         The only side effect is a queue.put() call — no strategy attributes
-        are read or written (thread-safety requirement, REQ-12).
+        are read or written (thread-safety requirement, REQ-12). Any unexpected
+        exception is caught, logged at ERROR level with traceback, and processing
+        continues (GAP-1: broad exception catch).
 
         Args:
             update: Lightstreamer ItemUpdate object. Use update.getValue("FIELD")
@@ -388,6 +479,13 @@ class _DirectTickListener:
         except (ValueError, TypeError) as e:
             logger.debug(f"Tick parse error on {self._item_name}: {e}")
             return
+        except Exception as e:
+            logger.error(
+                f"Unexpected error in _DirectTickListener.onItemUpdate "
+                f"on {self._item_name}: {e}",
+                exc_info=True,
+            )
+            return
         self._q.put({"type": "tick", "bid": bid, "ofr": ofr, "utm": utm})
 
     def onSubscription(self) -> None:
@@ -397,6 +495,10 @@ class _DirectTickListener:
     def onSubscriptionError(self, code: int, message: str) -> None:
         """Called when the server reports a subscription error.
 
+        When the streaming client has completed initial setup (setup_complete_check
+        returns True), enqueues a ``{"type": "reconnect"}`` sentinel to trigger
+        reconnection. During initial setup failures, only logs (GAP-2).
+
         Args:
             code: Error code from server.
             message: Human-readable error description.
@@ -404,6 +506,12 @@ class _DirectTickListener:
         logger.error(
             f"Direct tick subscription error on {self._item_name}: {code} {message}"
         )
+        if self._setup_complete_check is not None and self._setup_complete_check():
+            logger.warning(
+                f"Mid-session direct tick subscription error on {self._item_name} — "
+                "enqueuing reconnect sentinel."
+            )
+            self._q.put({"type": "reconnect"})
 
     def onUnsubscription(self) -> None:
         """Called when the tick subscription is removed."""
@@ -633,6 +741,16 @@ class IGStreamingClient:
         _worker: Background thread that dequeues and dispatches candles.
         _stop_event: Event signalling the worker thread to terminate.
         _active_subscription: The current subscription wrapper (native or tick).
+        _setup_complete: True after start() or _restart_streaming() completes
+            successfully; False initially, during stop(), and at the entry of
+            _restart_streaming(). Used by listeners to distinguish mid-session
+            subscription errors from initial-setup failures (GAP-2).
+        _last_data_ts: Monotonic timestamp of the last candle or tick dispatched
+            to the callback. Updated after every successful queue.get(). Used
+            by the watchdog in the queue.Empty branch (GAP-3).
+        _watchdog_timeout_s: Number of seconds without data before the watchdog
+            enqueues a reconnect sentinel. Computed as
+            ``max(resolution_minutes * 3, 15) * 60`` (GAP-3).
     """
 
     def __init__(self, ig_service, epic: str, resolution: str = "5MINUTE"):
@@ -655,6 +773,10 @@ class IGStreamingClient:
         self._stop_event: threading.Event = threading.Event()
         self._active_subscription = None
         self._using_tick_fallback: bool = False
+        self._setup_complete: bool = False
+        self._last_data_ts: float = time.monotonic()
+        resolution_minutes = _resolution_to_minutes(resolution)
+        self._watchdog_timeout_s: float = max(resolution_minutes * 3, 15) * 60.0
 
     def start(
         self,
@@ -750,6 +872,10 @@ class IGStreamingClient:
             self.stop()
             raise
 
+        # Mark setup complete so mid-session subscription errors (GAP-2) trigger
+        # a reconnect sentinel rather than being silently swallowed.
+        self._setup_complete = True
+
     def _subscribe_native(self, on_candle: Callable[[dict], None]) -> None:
         """Attempt to subscribe to native 5-minute candle items.
 
@@ -759,7 +885,11 @@ class IGStreamingClient:
             on_candle: Candle delivery callback (passed through for fallback).
         """
         item_name = f"CHART:{self._epic}:{self._resolution}"
-        listener = _CandleSubscriptionListener(item_name, self._candle_queue)
+        listener = _CandleSubscriptionListener(
+            item_name,
+            self._candle_queue,
+            setup_complete_check=lambda: self._setup_complete,
+        )
         sub = _make_native_subscription(self._epic, self._resolution, listener)
 
         try:
@@ -785,7 +915,11 @@ class IGStreamingClient:
         candle subscription — not instead of it.
         """
         item_name = f"CHART:{self._epic}:TICK"
-        listener = _DirectTickListener(item_name, self._candle_queue)
+        listener = _DirectTickListener(
+            item_name,
+            self._candle_queue,
+            setup_complete_check=lambda: self._setup_complete,
+        )
         sub = _make_tick_subscription(self._epic, listener)
         self._stream_svc.subscribe(sub)
         logger.info(f"Direct tick subscription created: {item_name}")
@@ -798,7 +932,12 @@ class IGStreamingClient:
             resolution_minutes=_resolution_to_minutes(self._resolution),
             on_candle=lambda candle: self._candle_queue.put(candle),
         )
-        listener = _TickListener(item_name, aggregator)
+        listener = _TickListener(
+            item_name,
+            aggregator,
+            candle_queue=self._candle_queue,
+            setup_complete_check=lambda: self._setup_complete,
+        )
         sub = _make_tick_subscription(self._epic, listener)
 
         self._stream_svc.subscribe(sub)
@@ -858,11 +997,23 @@ class IGStreamingClient:
                 item = self._candle_queue.get(timeout=0.05)
                 try:
                     _dispatch(item)
+                    # Update last-data timestamp after every successful dispatch (GAP-3).
+                    self._last_data_ts = time.monotonic()
                 except Exception as e:
                     logger.error(f"Error in callback: {e}", exc_info=True)
                 finally:
                     self._candle_queue.task_done()
             except queue.Empty:
+                # GAP-3: Candle watchdog — detect data drought and enqueue reconnect.
+                elapsed = time.monotonic() - self._last_data_ts
+                if elapsed > self._watchdog_timeout_s:
+                    logger.warning(
+                        f"Candle watchdog triggered: no data for {elapsed:.0f}s "
+                        f"(threshold={self._watchdog_timeout_s:.0f}s). "
+                        "Enqueuing reconnect sentinel."
+                    )
+                    self._candle_queue.put({"type": "reconnect"})
+                    self._last_data_ts = time.monotonic()
                 continue
 
         # Drain remaining items so in-flight items are not lost on shutdown.
@@ -930,6 +1081,10 @@ class IGStreamingClient:
             SystemExit: ``trading_ig`` calls ``sys.exit(1)`` on auth failure
                 inside ``create_session()``. The caller must catch this.
         """
+        # Reset setup flag at entry — listeners created during this restart will not
+        # enqueue reconnect sentinels until setup completes (GAP-2).
+        self._setup_complete = False
+
         # Disconnect old service — best-effort, ignore errors
         if self._stream_svc is not None:
             try:
@@ -955,7 +1110,17 @@ class IGStreamingClient:
         # can detect terminal disconnects again.
         self._stream_svc.add_client_listener(_ConnectionListener(self._candle_queue))
 
+        # Mark setup complete after successful re-subscription (GAP-2).
+        self._setup_complete = True
         logger.info("_restart_streaming completed — new Lightstreamer session active.")
+
+    def is_worker_alive(self) -> bool:
+        """Check whether the internal worker thread is running.
+
+        Returns:
+            True if the worker thread exists and is alive, False otherwise.
+        """
+        return self._worker is not None and self._worker.is_alive()
 
     def stop(self) -> None:
         """Disconnect the Lightstreamer session and shut down the worker thread.
@@ -987,4 +1152,5 @@ class IGStreamingClient:
 
         self._active_subscription = None
         self._using_tick_fallback = False
+        self._setup_complete = False
         logger.info("IGStreamingClient stopped.")

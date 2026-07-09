@@ -306,6 +306,8 @@ class RSIBollingerStrategyV2:
             f"stop_loss_ticks={params.stop_loss_ticks}"
         )
 
+        self._liveness_poll_s: float = 30.0
+
         # Spread is calculated dynamically from each candle's OFR_CLOSE - BID_CLOSE.
         # Stored for logging/debugging; None until the first candle is processed.
         self._current_spread: float | None = None
@@ -1921,7 +1923,10 @@ class RSIBollingerStrategyV2:
         Registers _on_candle as the callback directly with the streaming client
         and calls start(). The IGStreamingClient's own worker thread delivers
         candles to _on_candle — no intermediate re-queuing in this class.
-        run() then blocks on _stop_event until stop() is called.
+        run() then polls _stop_event with a 30-second timeout and checks worker
+        liveness on each iteration. If the worker thread dies unexpectedly,
+        a CRITICAL log is emitted and the stop event is set for a clean exit
+        (GAP-4: worker liveness check).
         """
         logger.info("RSIBollingerStrategyV2 starting.")
         self._stop_event.clear()
@@ -1936,8 +1941,16 @@ class RSIBollingerStrategyV2:
         self.streaming_client.start(
             self._on_candle, on_tick=on_tick, on_reconnect=self._on_reconnect
         )
-        logger.debug("Streaming client started — blocking on stop event.")
-        self._stop_event.wait()
+        logger.debug("Streaming client started — polling stop event (30s timeout).")
+        # GAP-4: Poll with timeout so worker liveness is checked regularly.
+        while not self._stop_event.wait(timeout=self._liveness_poll_s):
+            if not self.streaming_client.is_worker_alive():
+                logger.critical(
+                    "Streaming worker thread is no longer alive. "
+                    "Initiating graceful shutdown."
+                )
+                self._stop_event.set()
+                break
         logger.info("RSIBollingerStrategyV2 stopped.")
 
     def stop(self) -> None:

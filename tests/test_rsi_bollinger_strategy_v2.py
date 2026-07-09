@@ -6362,3 +6362,93 @@ class TestBBEntryOffset:
         strat._reload_params_if_changed()
 
         assert strat.params.bb_entry_offset_ticks == 8.0
+
+
+# ---------------------------------------------------------------------------
+# GAP-4: Worker Liveness Check in run() (RED tests — tasks 3.12–3.14)
+# ---------------------------------------------------------------------------
+
+
+class TestWorkerLivenessCheck:
+    """GAP-4: run() must poll with 30s timeout and detect dead worker threads."""
+
+    def test_dead_worker_sets_stop_event_and_logs_critical(
+        self, make_strategy_v2, caplog
+    ):
+        """When the streaming worker dies unexpectedly, run() sets stop_event and logs CRITICAL."""
+        import logging
+
+        strat, _mock_ig, _mock_streaming = make_strategy_v2()
+        strat._liveness_poll_s = 0.01
+
+        # Arrange: start() is a no-op so run() won't block on streaming setup
+        strat.streaming_client.start = MagicMock()
+        # Mock is_worker_alive to report dead worker
+        strat.streaming_client.is_worker_alive = MagicMock(return_value=False)
+
+        # run() should detect dead worker in its poll loop and set stop_event
+        with caplog.at_level(logging.CRITICAL):
+            strat.run()  # must NOT block indefinitely
+
+        assert (
+            strat._stop_event.is_set()
+        ), "stop_event must be set after dead worker detected"
+        critical_messages = [
+            r.message for r in caplog.records if r.levelno == logging.CRITICAL
+        ]
+        assert any(
+            "worker" in m.lower() for m in critical_messages
+        ), f"Expected CRITICAL log about worker, got: {critical_messages}"
+
+    def test_external_stop_event_exits_run_without_critical_log(
+        self, make_strategy_v2, caplog
+    ):
+        """When stop_event is set externally, run() exits without logging CRITICAL."""
+        import logging
+
+        strat, _mock_ig, _mock_streaming = make_strategy_v2()
+        strat._liveness_poll_s = 0.01
+        # Mock is_worker_alive to report healthy worker
+        strat.streaming_client.is_worker_alive = MagicMock(return_value=True)
+
+        strat.streaming_client.start = MagicMock()
+
+        # Set the stop event before streaming.start() returns
+        def start_and_stop(on_candle, on_tick=None, on_reconnect=None):
+            strat._stop_event.set()
+
+        strat.streaming_client.start.side_effect = start_and_stop
+
+        with caplog.at_level(logging.CRITICAL):
+            strat.run()
+
+        critical_messages = [
+            r.message for r in caplog.records if r.levelno == logging.CRITICAL
+        ]
+        assert (
+            len(critical_messages) == 0
+        ), f"Must not log CRITICAL when stop is external: {critical_messages}"
+
+    def test_healthy_worker_does_not_trigger_stop(self, make_strategy_v2):
+        """When worker is alive and stop event is not set, run() keeps polling."""
+        strat, _mock_ig, _mock_streaming = make_strategy_v2()
+        strat._liveness_poll_s = 0.01
+
+        call_count = 0
+
+        def is_alive():
+            nonlocal call_count
+            call_count += 1
+            if call_count >= 2:
+                # After one liveness check passes, set stop externally
+                strat._stop_event.set()
+            return True  # always alive
+
+        strat.streaming_client.is_worker_alive = is_alive
+        strat.streaming_client.start = MagicMock()
+
+        strat.run()
+
+        assert strat._stop_event.is_set(), "stop_event should be set (externally)"
+        # The strategy itself should NOT have set stop_event due to dead worker
+        # (i.e., is_worker_alive was always True, so the CRITICAL path was not taken)

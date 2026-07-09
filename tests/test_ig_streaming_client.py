@@ -1477,3 +1477,321 @@ class TestRestartStreaming:
         listener_arg = new_svc.add_client_listener.call_args[0][0]
         assert isinstance(listener_arg, _ConnectionListener)
         assert listener_arg._fired is False
+
+
+# ---------------------------------------------------------------------------
+# GAP-2: Subscription Error Reconnect Sentinel (RED tests — tasks 3.1–3.2)
+# ---------------------------------------------------------------------------
+
+
+class TestSubscriptionErrorReconnectSentinel:
+    """GAP-2: onSubscriptionError enqueues reconnect sentinel when setup is complete."""
+
+    def test_candle_listener_on_subscription_error_enqueues_sentinel_when_setup_complete(
+        self,
+    ):
+        """onSubscriptionError on _CandleSubscriptionListener enqueues sentinel when
+        setup_complete_check returns True."""
+        q = queue.Queue()
+        listener = _CandleSubscriptionListener(
+            item_name="CHART:EPIC:5MINUTE",
+            candle_queue=q,
+            setup_complete_check=lambda: True,
+        )
+        listener.onSubscriptionError(code=17, message="Subscription refused")
+        assert not q.empty(), "Expected reconnect sentinel in queue"
+        item = q.get_nowait()
+        assert item == {"type": "reconnect"}
+
+    def test_candle_listener_on_subscription_error_does_not_enqueue_during_setup(
+        self,
+    ):
+        """onSubscriptionError on _CandleSubscriptionListener does NOT enqueue sentinel
+        when setup_complete_check returns False (initial setup phase)."""
+        q = queue.Queue()
+        listener = _CandleSubscriptionListener(
+            item_name="CHART:EPIC:5MINUTE",
+            candle_queue=q,
+            setup_complete_check=lambda: False,
+        )
+        listener.onSubscriptionError(code=17, message="Subscription refused")
+        assert q.empty(), "Sentinel must NOT be enqueued during initial setup"
+
+    def test_tick_listener_on_subscription_error_enqueues_sentinel_when_setup_complete(
+        self,
+    ):
+        """onSubscriptionError on _TickListener enqueues sentinel when setup complete."""
+        q = queue.Queue()
+        aggregator = MagicMock()
+        listener = _TickListener(
+            item_name="CHART:EPIC:TICK",
+            aggregator=aggregator,
+            candle_queue=q,
+            setup_complete_check=lambda: True,
+        )
+        listener.onSubscriptionError(code=22, message="Bad subscription")
+        assert not q.empty(), "Expected reconnect sentinel in queue"
+        item = q.get_nowait()
+        assert item == {"type": "reconnect"}
+
+    def test_tick_listener_on_subscription_error_does_not_enqueue_during_setup(
+        self,
+    ):
+        """onSubscriptionError on _TickListener does NOT enqueue during initial setup."""
+        q = queue.Queue()
+        aggregator = MagicMock()
+        listener = _TickListener(
+            item_name="CHART:EPIC:TICK",
+            aggregator=aggregator,
+            candle_queue=q,
+            setup_complete_check=lambda: False,
+        )
+        listener.onSubscriptionError(code=22, message="Bad subscription")
+        assert q.empty(), "Sentinel must NOT be enqueued during initial setup"
+
+    def test_direct_tick_listener_on_subscription_error_enqueues_sentinel_when_setup_complete(
+        self,
+    ):
+        """onSubscriptionError on _DirectTickListener enqueues sentinel when setup complete."""
+        q = queue.Queue()
+        listener = _DirectTickListener(
+            item_name="CHART:EPIC:TICK",
+            tick_queue=q,
+            setup_complete_check=lambda: True,
+        )
+        listener.onSubscriptionError(code=22, message="Bad subscription")
+        assert not q.empty(), "Expected reconnect sentinel in queue"
+        item = q.get_nowait()
+        assert item == {"type": "reconnect"}
+
+    def test_direct_tick_listener_on_subscription_error_does_not_enqueue_during_setup(
+        self,
+    ):
+        """onSubscriptionError on _DirectTickListener does NOT enqueue during initial setup."""
+        q = queue.Queue()
+        listener = _DirectTickListener(
+            item_name="CHART:EPIC:TICK",
+            tick_queue=q,
+            setup_complete_check=lambda: False,
+        )
+        listener.onSubscriptionError(code=22, message="Bad subscription")
+        assert q.empty(), "Sentinel must NOT be enqueued during initial setup"
+
+
+# ---------------------------------------------------------------------------
+# GAP-3: Candle Watchdog (RED tests — tasks 3.4–3.7)
+# ---------------------------------------------------------------------------
+
+
+class TestCandleWatchdog:
+    """GAP-3: Worker loop watchdog detects data drought and enqueues reconnect."""
+
+    def test_watchdog_fires_after_elapsed_exceeds_threshold(self):
+        """Watchdog enqueues reconnect sentinel when monotonic elapsed > threshold.
+
+        Exercises the real _worker_loop method on IGStreamingClient rather than
+        re-implementing the watchdog logic inline (follows the pattern of
+        test_watchdog_fires_via_worker_loop_on_drought).
+        """
+        import time
+
+        sentinel_q = queue.Queue()
+
+        def on_reconnect():
+            sentinel_q.put("reconnect_called")
+
+        client = IGStreamingClient(MagicMock(), "IX.D.SPTRD.IFMM.IP")
+
+        # Set threshold to near-zero so the test fires immediately
+        client._watchdog_timeout_s = 0.0
+        # Set _last_data_ts far in the past so elapsed >> threshold
+        client._last_data_ts = time.monotonic() - 10
+
+        # Run _worker_loop on a background thread; it will fire the watchdog,
+        # enqueue and dispatch the reconnect sentinel, then we stop it.
+        worker = threading.Thread(
+            target=client._worker_loop,
+            args=(MagicMock(), None, on_reconnect),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            result = sentinel_q.get(timeout=2.0)
+        finally:
+            client._stop_event.set()
+            worker.join(timeout=2.0)
+
+        assert result == "reconnect_called"
+
+    def test_watchdog_does_not_fire_before_threshold(self):
+        """Watchdog does NOT enqueue sentinel when elapsed <= threshold.
+
+        Exercises the real _worker_loop method on IGStreamingClient rather than
+        re-implementing the watchdog logic inline. Runs the worker loop briefly
+        with a recent _last_data_ts and the default large threshold, then asserts
+        that no reconnect sentinel was dispatched.
+        """
+        import time
+
+        on_reconnect = MagicMock()
+        client = IGStreamingClient(MagicMock(), "IX.D.SPTRD.IFMM.IP")
+
+        # Keep the default (large) threshold so elapsed is always below it
+        # Set _last_data_ts to now so elapsed is tiny
+        client._last_data_ts = time.monotonic()
+
+        # Run _worker_loop on a background thread for a short time, then stop
+        worker = threading.Thread(
+            target=client._worker_loop,
+            args=(MagicMock(), None, on_reconnect),
+            daemon=True,
+        )
+        worker.start()
+        # Let the loop run a few iterations (each waits 0.05s on queue.get)
+        time.sleep(0.2)
+        client._stop_event.set()
+        worker.join(timeout=2.0)
+
+        on_reconnect.assert_not_called()
+
+    def test_watchdog_threshold_floor_for_1_minute_period(self):
+        """candle_period_minutes=1 → threshold must be max(1*3, 15)*60 = 900 s."""
+        mock_ig_service = MagicMock()
+        # 1MINUTE resolution
+        client = IGStreamingClient(
+            mock_ig_service, "IX.D.SPTRD.IFMM.IP", resolution="1MINUTE"
+        )
+        expected = max(1 * 3, 15) * 60  # 15 * 60 = 900
+        assert client._watchdog_timeout_s == expected
+
+    def test_watchdog_threshold_scales_with_10_minute_period(self):
+        """candle_period_minutes=10 → threshold must be max(10*3, 15)*60 = 1800 s."""
+        mock_ig_service = MagicMock()
+        # 10MINUTE resolution
+        client = IGStreamingClient(
+            mock_ig_service, "IX.D.SPTRD.IFMM.IP", resolution="10MINUTE"
+        )
+        expected = max(10 * 3, 15) * 60  # 30 * 60 = 1800
+        assert client._watchdog_timeout_s == expected
+
+    def test_watchdog_fires_via_worker_loop_on_drought(
+        self, mock_ig_stream_service, mock_ig_service
+    ):
+        """Integration: worker loop enqueues reconnect when data drought exceeds threshold."""
+        import time
+
+        sentinel_q = queue.Queue()
+
+        def on_reconnect():
+            sentinel_q.put("reconnect_called")
+
+        with patch(
+            "ig_streaming_client.IGStreamService", return_value=mock_ig_stream_service
+        ):
+            client = IGStreamingClient(mock_ig_service, EPIC)
+            # Lower threshold to near-zero so the test doesn't wait 15 minutes
+            client._watchdog_timeout_s = 0.0
+            client._last_data_ts = time.monotonic() - 10  # already in the past
+            client.start(on_candle=MagicMock(), on_reconnect=on_reconnect)
+            # Give the worker a moment to fire watchdog
+            try:
+                result = sentinel_q.get(timeout=2.0)
+            finally:
+                client.stop()
+        assert result == "reconnect_called"
+
+
+# ---------------------------------------------------------------------------
+# GAP-1: Broad Exception Catch in Listeners (RED tests — tasks 3.9–3.10)
+# ---------------------------------------------------------------------------
+
+
+class TestBroadExceptionCatchInListeners:
+    """GAP-1: onItemUpdate must catch all Exception subclasses and log them."""
+
+    def test_candle_listener_on_item_update_catches_runtime_error(self):
+        """_CandleSubscriptionListener.onItemUpdate must not propagate RuntimeError."""
+        q = queue.Queue()
+        listener = _CandleSubscriptionListener(
+            item_name="CHART:EPIC:5MINUTE",
+            candle_queue=q,
+        )
+        bad_update = MagicMock()
+        bad_update.getValue.side_effect = RuntimeError("simulated LS error")
+
+        # Must not raise
+        listener.onItemUpdate(bad_update)
+        # Queue should still be empty (no candle built)
+        assert q.empty()
+
+    def test_candle_listener_on_item_update_catches_value_error_and_continues(self):
+        """_CandleSubscriptionListener.onItemUpdate catches ValueError and remains callable."""
+        q = queue.Queue()
+        listener = _CandleSubscriptionListener(
+            item_name="CHART:EPIC:5MINUTE",
+            candle_queue=q,
+        )
+        bad_update = MagicMock()
+        bad_update.getValue.side_effect = ValueError("bad field")
+
+        listener.onItemUpdate(bad_update)
+        # Listener is still callable after catching
+        assert callable(listener.onItemUpdate)
+
+    def test_tick_listener_on_item_update_catches_runtime_error(self):
+        """_TickListener.onItemUpdate must not propagate RuntimeError."""
+        aggregator = MagicMock()
+        q = queue.Queue()
+        listener = _TickListener(
+            item_name="CHART:EPIC:TICK",
+            aggregator=aggregator,
+            candle_queue=q,
+        )
+        bad_update = MagicMock()
+        bad_update.getValue.side_effect = RuntimeError("simulated error")
+
+        listener.onItemUpdate(bad_update)
+        # Listener remains callable
+        assert callable(listener.onItemUpdate)
+
+    def test_tick_listener_on_item_update_catches_value_error(self):
+        """_TickListener.onItemUpdate catches ValueError without propagating."""
+        aggregator = MagicMock()
+        q = queue.Queue()
+        listener = _TickListener(
+            item_name="CHART:EPIC:TICK",
+            aggregator=aggregator,
+            candle_queue=q,
+        )
+        bad_update = MagicMock()
+        bad_update.getValue.side_effect = ValueError("bad value")
+
+        listener.onItemUpdate(bad_update)
+        assert callable(listener.onItemUpdate)
+
+    def test_direct_tick_listener_on_item_update_catches_runtime_error(self):
+        """_DirectTickListener.onItemUpdate must not propagate RuntimeError."""
+        q = queue.Queue()
+        listener = _DirectTickListener(
+            item_name="CHART:EPIC:TICK",
+            tick_queue=q,
+        )
+        bad_update = MagicMock()
+        bad_update.getValue.side_effect = RuntimeError("simulated error")
+
+        listener.onItemUpdate(bad_update)
+        # Queue still empty — no crash
+        assert q.empty()
+
+    def test_direct_tick_listener_on_item_update_catches_attribute_error(self):
+        """_DirectTickListener.onItemUpdate catches AttributeError without propagating."""
+        q = queue.Queue()
+        listener = _DirectTickListener(
+            item_name="CHART:EPIC:TICK",
+            tick_queue=q,
+        )
+        bad_update = MagicMock()
+        bad_update.getValue.side_effect = AttributeError("missing attr")
+
+        listener.onItemUpdate(bad_update)
+        assert callable(listener.onItemUpdate)
