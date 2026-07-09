@@ -128,6 +128,7 @@ class TestLoadParams:
             "enable_daily_circuit_breaker": False,
             "daily_loss_limit_usd": -50.0,
             "max_trades_per_day": 15,
+            "bb_entry_offset_ticks": 3.0,
         }
         path = tmp_path / "RSIBollingerStrategyV2.json"
         path.write_text(json.dumps(data))
@@ -1954,6 +1955,7 @@ class TestValidateParamsBranches:
             "enable_daily_circuit_breaker": False,
             "daily_loss_limit_usd": -50.0,
             "max_trades_per_day": 15,
+            "bb_entry_offset_ticks": 3.0,
         }
         path = tmp_path / "v2.json"
         path.write_text(json.dumps(data))
@@ -2120,6 +2122,7 @@ _HOT_RELOAD_BASE_PARAMS = {
     "enable_daily_circuit_breaker": False,
     "daily_loss_limit_usd": -50.0,
     "max_trades_per_day": 15,
+    "bb_entry_offset_ticks": 3.0,
 }
 
 
@@ -2473,6 +2476,7 @@ class TestHotReloadRoundTrip:
             "enable_daily_circuit_breaker": False,
             "daily_loss_limit_usd": -50.0,
             "max_trades_per_day": 15,
+            "bb_entry_offset_ticks": 3.0,
             "test_flag": True,  # valid bool — must pass
         }
         path = tmp_path / "v2.json"
@@ -5932,3 +5936,429 @@ class TestEnabledParameter:
         mock_ig.open_position.assert_called_once()
         call_kwargs = mock_ig.open_position.call_args.kwargs
         assert call_kwargs["side"] == "BUY"
+
+
+# --------------------------------------------------------------------------- #
+# BB Entry Offset — bb_entry_offset_ticks parameter                           #
+# --------------------------------------------------------------------------- #
+
+
+class TestBBEntryOffset:
+    """Tests for bb_entry_offset_ticks parameter (candle-mode and tick-mode entry conditions)."""
+
+    # --- Task 3.1 / 3.2: Candle-mode long entry ---
+
+    def test_candle_long_entry_blocked_inside_offset_gap(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Long entry is blocked when close is between bb_lower-offset and bb_lower.
+
+        Spec scenario: bb_lower=100.0, offset=3.0, close=99.0 → no position.
+        99.0 > 97.0 so condition close < bb_lower - offset is NOT satisfied.
+        """
+        params = make_params_v2(
+            rsi_oversold=30.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+
+        # close=99.0 is inside the gap (97.0 < 99.0 < 100.0) → blocked
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=99.0
+        )
+        strat._manage_longs(indicators)
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_candle_long_entry_fires_beyond_offset(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Long entry fires when close < bb_lower - offset.
+
+        Spec scenario: bb_lower=100.0, offset=3.0, close=96.5 → entry fires.
+        96.5 < 97.0 → condition satisfied.
+        """
+        params = make_params_v2(
+            rsi_oversold=30.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "LONG_OFFSET_001",
+        }
+
+        # close=96.5 is beyond the offset (96.5 < 97.0) → entry fires
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=96.5
+        )
+        strat._manage_longs(indicators)
+
+        mock_ig.open_position.assert_called_once()
+        assert mock_ig.open_position.call_args.kwargs["side"] == "BUY"
+
+    # --- Task 3.3 / 3.4: Candle-mode short entry ---
+
+    def test_candle_short_entry_blocked_inside_offset_gap(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Short entry is blocked when close is between bb_upper and bb_upper+offset.
+
+        Spec scenario: bb_upper=200.0, offset=3.0, close=201.0 → no position.
+        201.0 < 203.0 so condition close > bb_upper + offset is NOT satisfied.
+        """
+        params = make_params_v2(
+            rsi_overbought=70.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+
+        # close=201.0 is inside the gap (200.0 < 201.0 < 203.0) → blocked
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=200.0, rsi=75.0, close=201.0
+        )
+        strat._manage_shorts(indicators)
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_candle_short_entry_fires_beyond_offset(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Short entry fires when close > bb_upper + offset.
+
+        Spec scenario: bb_upper=200.0, offset=3.0, close=203.5 → entry fires.
+        203.5 > 203.0 → condition satisfied.
+        """
+        params = make_params_v2(
+            rsi_overbought=70.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "SHORT_OFFSET_001",
+        }
+
+        # close=203.5 is beyond the offset (203.5 > 203.0) → entry fires
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=200.0, rsi=75.0, close=203.5
+        )
+        strat._manage_shorts(indicators)
+
+        mock_ig.open_position.assert_called_once()
+        assert mock_ig.open_position.call_args.kwargs["side"] == "SELL"
+
+    # --- Task 3.9 / 3.10: Zero-offset backward compat ---
+
+    def test_candle_long_zero_offset_preserves_original_behavior(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Zero offset: close=99.9 < bb_lower=100.0 → entry fires (pre-change behavior).
+
+        Spec scenario: bb_lower=100.0, offset=0.0, close=99.9 → entry fires.
+        """
+        params = make_params_v2(
+            rsi_oversold=30.0,
+            bb_entry_offset_ticks=0.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "ZERO_OFFSET_LONG",
+        }
+
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=99.9
+        )
+        strat._manage_longs(indicators)
+
+        mock_ig.open_position.assert_called_once()
+        assert mock_ig.open_position.call_args.kwargs["side"] == "BUY"
+
+    def test_candle_short_zero_offset_preserves_original_behavior(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Zero offset: close=200.1 > bb_upper=200.0 → entry fires (pre-change behavior).
+
+        Spec scenario: bb_upper=200.0, offset=0.0, close=200.1 → entry fires.
+        """
+        params = make_params_v2(
+            rsi_overbought=70.0,
+            bb_entry_offset_ticks=0.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "ZERO_OFFSET_SHORT",
+        }
+
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=200.0, rsi=75.0, close=200.1
+        )
+        strat._manage_shorts(indicators)
+
+        mock_ig.open_position.assert_called_once()
+        assert mock_ig.open_position.call_args.kwargs["side"] == "SELL"
+
+    # --- Task 3.5 / 3.6: Tick-mode long entry ---
+
+    def test_tick_long_entry_blocked_inside_offset_gap(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick-mode long: blocked when bid is between bb_lower-offset and bb_lower.
+
+        Spec scenario: bb_lower=100.0, offset=3.0, bid=98.5 → no entry.
+        98.5 > 97.0 → blocked.
+        """
+        params = make_params_v2(
+            operation_mode="tick",
+            rsi_oversold=30.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+
+        # Seed cached indicators
+        strat._cached_indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0
+        )
+
+        # bid=98.5 inside the gap → blocked
+        strat._on_tick({"bid": 98.5, "ofr": 98.6, "utm": 0})
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_tick_long_entry_fires_beyond_offset(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick-mode long: fires when bid < bb_lower - offset.
+
+        Spec scenario: bb_lower=100.0, offset=3.0, bid=96.9 → entry fires.
+        96.9 < 97.0 → entry fires.
+        """
+        params = make_params_v2(
+            operation_mode="tick",
+            rsi_oversold=30.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "TICK_LONG_OFFSET",
+        }
+
+        # Seed cached indicators
+        strat._cached_indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0
+        )
+
+        # bid=96.9 beyond offset (96.9 < 97.0) → entry fires
+        strat._on_tick({"bid": 96.9, "ofr": 97.0, "utm": 0})
+
+        mock_ig.open_position.assert_called_once()
+        assert mock_ig.open_position.call_args.kwargs["side"] == "BUY"
+
+    # --- Task 3.7 / 3.8: Tick-mode short entry ---
+
+    def test_tick_short_entry_blocked_inside_offset_gap(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick-mode short: blocked when bid is between bb_upper and bb_upper+offset.
+
+        Spec scenario: bb_upper=200.0, offset=3.0, bid=202.0 → no entry.
+        202.0 < 203.0 → blocked.
+        """
+        params = make_params_v2(
+            operation_mode="tick",
+            rsi_overbought=70.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+
+        # Seed cached indicators
+        strat._cached_indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=200.0, rsi=75.0
+        )
+
+        # bid=202.0 inside the gap → blocked
+        strat._on_tick({"bid": 202.0, "ofr": 202.1, "utm": 0})
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_tick_short_entry_fires_beyond_offset(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick-mode short: fires when bid > bb_upper + offset.
+
+        Spec scenario: bb_upper=200.0, offset=3.0, bid=203.1 → entry fires.
+        203.1 > 203.0 → entry fires.
+        """
+        params = make_params_v2(
+            operation_mode="tick",
+            rsi_overbought=70.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+        mock_ig.open_position.return_value = {
+            "dealStatus": "ACCEPTED",
+            "dealId": "TICK_SHORT_OFFSET",
+        }
+
+        # Seed cached indicators
+        strat._cached_indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=200.0, rsi=75.0
+        )
+
+        # bid=203.1 beyond offset (203.1 > 203.0) → entry fires
+        strat._on_tick({"bid": 203.1, "ofr": 203.2, "utm": 0})
+
+        mock_ig.open_position.assert_called_once()
+        assert mock_ig.open_position.call_args.kwargs["side"] == "SELL"
+
+    # --- Exact boundary tests (JD-003) ---
+
+    def test_candle_long_entry_blocked_at_exact_boundary(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Long entry blocked when close == bb_lower - offset (guard uses >=).
+
+        close=97.0 == bb_lower(100.0) - offset(3.0) → >= threshold → BLOCKED.
+        """
+        params = make_params_v2(
+            rsi_oversold=30.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+
+        indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0, close=97.0
+        )
+        strat._manage_longs(indicators)
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_candle_short_entry_blocked_at_exact_boundary(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Short entry blocked when close == bb_upper + offset (guard uses <=).
+
+        close=203.0 == bb_upper(200.0) + offset(3.0) → <= threshold → BLOCKED.
+        """
+        params = make_params_v2(
+            rsi_overbought=70.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+
+        indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=200.0, rsi=75.0, close=203.0
+        )
+        strat._manage_shorts(indicators)
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_tick_long_entry_blocked_at_exact_boundary(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick-mode long blocked when bid == bb_lower - offset (condition uses strict <).
+
+        bid=97.0 == bb_lower(100.0) - offset(3.0) → not strictly < threshold → BLOCKED.
+        """
+        params = make_params_v2(
+            operation_mode="tick",
+            rsi_oversold=30.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+
+        strat._cached_indicators = _make_indicators(
+            bb_lower=100.0, bb_upper=200.0, rsi=25.0
+        )
+
+        strat._on_tick({"bid": 97.0, "ofr": 97.1, "utm": 0})
+
+        mock_ig.open_position.assert_not_called()
+
+    def test_tick_short_entry_blocked_at_exact_boundary(
+        self, make_strategy_v2, make_params_v2
+    ):
+        """Tick-mode short blocked when bid == bb_upper + offset (condition uses strict >).
+
+        bid=203.0 == bb_upper(200.0) + offset(3.0) → not strictly > threshold → BLOCKED.
+        """
+        params = make_params_v2(
+            operation_mode="tick",
+            rsi_overbought=70.0,
+            bb_entry_offset_ticks=3.0,
+        )
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+
+        strat._cached_indicators = _make_indicators(
+            bb_lower=0.0, bb_upper=200.0, rsi=75.0
+        )
+
+        strat._on_tick({"bid": 203.0, "ofr": 203.1, "utm": 0})
+
+        mock_ig.open_position.assert_not_called()
+
+    # --- Task 3.11: Hot-reload updates offset at runtime ---
+
+    def test_hot_reload_updates_bb_entry_offset(
+        self, make_strategy_v2, make_params_v2, tmp_path
+    ):
+        """Hot-reload applies a new bb_entry_offset_ticks value at runtime.
+
+        Spec scenario: start with 3.0, reload with 8.0, verify next evaluation uses 8.0.
+        """
+        import json
+
+        params = make_params_v2(bb_entry_offset_ticks=3.0)
+        strat, mock_ig, _ = make_strategy_v2(params=params)
+
+        # Build a full valid config dict from the current params namespace
+        config = {
+            "epic": params.epic,
+            "enabled": params.enabled,
+            "api_mode": params.api_mode,
+            "operation_mode": params.operation_mode,
+            "candle_frequency": params.candle_frequency,
+            "bb_period": params.bb_period,
+            "bb_std": params.bb_std,
+            "rsi_period": params.rsi_period,
+            "rsi_oversold": params.rsi_oversold,
+            "rsi_overbought": params.rsi_overbought,
+            "max_long_positions": params.max_long_positions,
+            "max_short_positions": params.max_short_positions,
+            "contract_size": params.contract_size,
+            "min_dist_between_entries_ticks": params.min_dist_between_entries_ticks,
+            "take_profit_ticks": params.take_profit_ticks,
+            "stop_loss_ticks": params.stop_loss_ticks,
+            "close_mode": params.close_mode,
+            "atr_period": params.atr_period,
+            "atr_multiplier_tp": params.atr_multiplier_tp,
+            "atr_multiplier_sl": params.atr_multiplier_sl,
+            "enable_adx_filter": params.enable_adx_filter,
+            "adx_period": params.adx_period,
+            "adx_threshold": params.adx_threshold,
+            "session_filter_enabled": params.session_filter_enabled,
+            "session_filter_start_utc": params.session_filter_start_utc,
+            "session_filter_end_utc": params.session_filter_end_utc,
+            "enable_adx_regime_exit": params.enable_adx_regime_exit,
+            "enable_daily_circuit_breaker": params.enable_daily_circuit_breaker,
+            "daily_loss_limit_usd": params.daily_loss_limit_usd,
+            "max_trades_per_day": params.max_trades_per_day,
+            "bb_entry_offset_ticks": 8.0,
+        }
+
+        params_file = tmp_path / "RSIBollingerStrategyV2.json"
+        params_file.write_text(json.dumps(config))
+
+        # Wire the params_path so hot-reload knows where to look
+        strat._params_path = str(params_file)
+        strat._params_mtime = 0.0  # force mtime check to detect the "change"
+
+        assert strat.params.bb_entry_offset_ticks == 3.0
+
+        # Trigger hot-reload via _reload_params_if_changed
+        strat._reload_params_if_changed()
+
+        assert strat.params.bb_entry_offset_ticks == 8.0

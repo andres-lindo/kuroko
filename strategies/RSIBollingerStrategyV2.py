@@ -62,6 +62,8 @@ _PARAMS_SCHEMA: dict[str, type | tuple[type, ...]] = {
     "enable_daily_circuit_breaker": bool,
     "daily_loss_limit_usd": (int, float),
     "max_trades_per_day": int,
+    # entry offset
+    "bb_entry_offset_ticks": (int, float),
 }
 
 
@@ -135,6 +137,16 @@ def _validate_params(data: dict, path: str, *, fatal: bool = True) -> None:
         else:
             logger.error(msg)
             raise ValueError(msg)
+
+    # Semantic warnings (non-fatal) — values that are technically valid but
+    # likely indicate a configuration mistake.
+    offset = data.get("bb_entry_offset_ticks")
+    if offset is not None and isinstance(offset, (int, float)) and offset < 0:
+        logger.warning(
+            f"bb_entry_offset_ticks={offset} is negative — this makes entries "
+            f"EASIER (closer to the band) instead of harder. "
+            f"Set to 0 to disable the offset or use a positive value."
+        )
 
 
 def load_params(
@@ -217,6 +229,7 @@ class RSIBollingerStrategyV2:
             "enable_daily_circuit_breaker",
             "daily_loss_limit_usd",
             "max_trades_per_day",
+            "bb_entry_offset_ticks",
         }
     )
 
@@ -928,10 +941,11 @@ class RSIBollingerStrategyV2:
     def _manage_longs(self, indicators: dict, *, can_enter: bool = True) -> None:
         """Evaluate long entry conditions using the latest indicators.
 
-        Entry condition: price STRICTLY < BB_lower AND RSI STRICTLY < rsi_oversold
+        Entry condition: price STRICTLY < BB_lower - bb_entry_offset_ticks
+                         AND RSI STRICTLY < rsi_oversold
                          AND longs < max_long_positions
                          AND distance from last entry >= min_dist_between_entries_ticks.
-            (price == BB_lower does NOT trigger entry)
+            (price == BB_lower - offset does NOT trigger entry)
 
         Exits are handled exclusively by broker TP/SL orders set at position open.
 
@@ -966,10 +980,14 @@ class RSIBollingerStrategyV2:
         if not self._is_long_entry_allowed():
             logger.info("[GUARD] Long entry skipped — Friday after 14:00 NY")
             return
-        if close >= bb_lower or rsi >= self.params.rsi_oversold:
+        if (
+            close >= bb_lower - self.params.bb_entry_offset_ticks
+            or rsi >= self.params.rsi_oversold
+        ):
             logger.debug(
                 f"Long entry skipped — signal not met: "
                 f"close={close:.2f} bb_lower={bb_lower:.2f} "
+                f"bb_lower_adj={bb_lower - self.params.bb_entry_offset_ticks:.2f} "
                 f"rsi={rsi:.2f} rsi_oversold={self.params.rsi_oversold}"
             )
             return
@@ -1054,10 +1072,11 @@ class RSIBollingerStrategyV2:
     def _manage_shorts(self, indicators: dict, *, can_enter: bool = True) -> None:
         """Evaluate short entry conditions using the latest indicators.
 
-        Entry condition: price STRICTLY > BB_upper AND RSI STRICTLY > rsi_overbought
+        Entry condition: price STRICTLY > BB_upper + bb_entry_offset_ticks
+                         AND RSI STRICTLY > rsi_overbought
                          AND shorts < max_short_positions
                          AND distance from last entry >= min_dist_between_entries_ticks.
-            (price == BB_upper does NOT trigger entry)
+            (price == BB_upper + offset does NOT trigger entry)
 
         Exits are handled exclusively by broker TP/SL orders set at position open.
 
@@ -1089,10 +1108,14 @@ class RSIBollingerStrategyV2:
             f"spread={spread:.4f} open_shorts={len(self._short_positions)}"
         )
 
-        if close <= bb_upper or rsi <= self.params.rsi_overbought:
+        if (
+            close <= bb_upper + self.params.bb_entry_offset_ticks
+            or rsi <= self.params.rsi_overbought
+        ):
             logger.debug(
                 f"Short entry skipped — signal not met: "
                 f"close={close:.2f} bb_upper={bb_upper:.2f} "
+                f"bb_upper_adj={bb_upper + self.params.bb_entry_offset_ticks:.2f} "
                 f"rsi={rsi:.2f} rsi_overbought={self.params.rsi_overbought}"
             )
             return
@@ -1735,7 +1758,7 @@ class RSIBollingerStrategyV2:
         elif not self._is_long_entry_allowed():
             logger.debug("tick long_entry: skipped (guardrail) Friday after 14:00 NY")
         elif (
-            bid < bb_lower
+            bid < bb_lower - self.params.bb_entry_offset_ticks
             and rsi < self.params.rsi_oversold
             and not self._tick_long_in_flight
             and len(self._long_positions) < self.params.max_long_positions
@@ -1770,7 +1793,7 @@ class RSIBollingerStrategyV2:
         if not can_enter:
             pass  # already gated above — skip short direction too
         elif (
-            bid > bb_upper
+            bid > bb_upper + self.params.bb_entry_offset_ticks
             and rsi > self.params.rsi_overbought
             and not self._tick_short_in_flight
             and len(self._short_positions) < self.params.max_short_positions

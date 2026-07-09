@@ -204,7 +204,7 @@ ensuring all indicators are computed from a full dataset.
 A long position is opened when ALL of the following are true on the most
 recently closed candle:
 
-- `close < bb_lower` — price has closed below the lower Bollinger Band
+- `close < bb_lower - bb_entry_offset_ticks` — price has closed sufficiently below the lower Bollinger Band (offset shifts the threshold deeper; at `0.0` this is identical to `close < bb_lower`)
 - `rsi < rsi_oversold` — RSI is in oversold territory
 - Current number of open long positions < `max_long_positions`
 - Distance from the last long entry price >= `min_dist_between_entries_ticks`
@@ -219,7 +219,7 @@ the moment the tick fires (not the candle close). The distance check compares
 
 A short position is opened when ALL of the following are true:
 
-- `close > bb_upper` — price has closed above the upper Bollinger Band
+- `close > bb_upper + bb_entry_offset_ticks` — price has closed sufficiently above the upper Bollinger Band (offset shifts the threshold deeper; at `0.0` this is identical to `close > bb_upper`)
 - `rsi > rsi_overbought` — RSI is in overbought territory
 - Current number of open short positions < `max_short_positions`
 - Distance from the last short entry price >= `min_dist_between_entries_ticks`
@@ -691,6 +691,7 @@ loaded at startup into a `types.SimpleNamespace` via `load_params()`.
 | `enable_daily_circuit_breaker` | bool | `true` | Enables the daily circuit breaker. When `true`, new entries are blocked for the rest of the UTC day once either `max_trades_per_day` or `daily_loss_limit_usd` is reached. Counters reset at midnight UTC. Hot-safe. |
 | `daily_loss_limit_usd` | float | `-50.0` | Maximum daily realized loss (USD, negative value). Circuit breaker trips when `current_balance - session_start_balance < daily_loss_limit_usd`. Hot-safe. |
 | `max_trades_per_day` | int | `15` | Maximum number of `open_position` calls per UTC day. Circuit breaker trips immediately when this count is reached. Hot-safe. |
+| `bb_entry_offset_ticks` | float | `3.0` | Extra distance beyond the Bollinger Band required before an entry fires (points/ticks). Longs require `close < bb_lower - offset`; shorts require `close > bb_upper + offset`. At `0.0` the behavior is identical to the original condition. Hot-safe. |
 
 Infrastructure parameters (`leverage`, `initial_cash_balance`,
 `demo_starting_balance`) come from `config.json["trading"]`. `epic` is stored
@@ -750,7 +751,9 @@ in the strategy JSON (`strategies/RSIBollingerStrategyV2.json`).
   "enable_adx_regime_exit": true,
   "enable_daily_circuit_breaker": true,
   "daily_loss_limit_usd": -50.0,
-  "max_trades_per_day": 15
+  "max_trades_per_day": 15,
+
+  "bb_entry_offset_ticks": 3.0
 }
 ```
 
@@ -813,6 +816,7 @@ The strategy can apply changes to `strategies/RSIBollingerStrategyV2.json` at ru
 | `enable_daily_circuit_breaker` | Enable/disable daily circuit breaker |
 | `daily_loss_limit_usd` | Maximum daily loss threshold |
 | `max_trades_per_day` | Maximum trades per UTC day |
+| `bb_entry_offset_ticks` | Extra distance beyond the Bollinger Band required before entry |
 
 ### Restart-required parameters (change is logged but NOT applied)
 

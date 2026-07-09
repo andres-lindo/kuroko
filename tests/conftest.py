@@ -115,6 +115,7 @@ def make_params_v2():
             "enable_daily_circuit_breaker": False,
             "daily_loss_limit_usd": -50.0,
             "max_trades_per_day": 15,
+            "bb_entry_offset_ticks": 3.0,
         }
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)
